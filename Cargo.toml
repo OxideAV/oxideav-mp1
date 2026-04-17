@@ -13,5 +13,5 @@ keywords = ["multimedia", "audio", "mpeg", "mp1", "codec"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
-oxideav-core = "0.0.3"
-oxideav-codec = "0.0.3"
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
