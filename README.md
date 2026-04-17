@@ -1,8 +1,7 @@
 # oxideav-mp1
 
-Pure-Rust **MPEG-1 Audio Layer I** codec — decoder + encoder. Covers
-every bitrate (32–448 kbit/s) and every sample rate (32 / 44.1 / 48
-kHz) the Layer-I spec defines. Zero C dependencies.
+Pure-Rust **MPEG-1 Audio Layer I** codec — decoder + encoder. Zero C
+dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -19,7 +18,7 @@ oxideav-mp1 = "0.0"
 ## Quick use
 
 MP1 frames are self-contained — each input packet is one MPEG-1 Layer I
-frame (384 samples × channels). Output is interleaved S16 PCM.
+frame (384 samples per channel). Decoder output is interleaved S16 PCM.
 
 ```rust
 use oxideav_codec::CodecRegistry;
@@ -39,21 +38,54 @@ let Frame::Audio(a) = dec.receive_frame()? else { unreachable!() };
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-Encoder:
+Encoder (CBR, takes interleaved S16 PCM, emits one Layer I frame per
+384 samples per channel):
 
 ```rust
 let mut params = CodecParameters::audio(CodecId::new("mp1"));
 params.sample_rate = Some(44_100);
 params.channels = Some(2);
-params.bit_rate = Some(192_000);            // bitrate-to-emit
+params.bit_rate = Some(192_000);            // bits per second
 let mut enc = reg.make_encoder(&params)?;
-enc.send_frame(&Frame::Audio(pcm_frame))?;  // 384 × 2 S16 samples
+enc.send_frame(&Frame::Audio(pcm_frame))?;  // 384 * 2 S16 samples
 let pkt = enc.receive_packet()?;            // one Layer-I frame
 ```
 
+### Supported features
+
+Decoder:
+
+- MPEG-1 only (MPEG-2 LSF / 2.5 rejected).
+- Sample rates: 32 000, 44 100, 48 000 Hz.
+- Bitrates: 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384,
+  416, 448 kbit/s (every Layer I index 1..=14). Free format (index 0)
+  is not supported.
+- Channel modes: single-channel (mono), stereo, dual-channel,
+  joint-stereo (all four `mode_extension` bounds: 4 / 8 / 12 / 16).
+  Layer I joint stereo is M/S-style sample sharing above the bound;
+  there is no intensity-stereo scaling in Layer I.
+- Header fields parsed: `protection_bit`, `padding`, `private`,
+  `mode`, `mode_extension`, `copyright`, `original`, `emphasis`. CRC
+  payload is skipped rather than verified.
+
+Encoder (CBR):
+
+- MPEG-1 only.
+- Sample rates: 32 000, 44 100, 48 000 Hz.
+- Bitrates: every Layer I rate from 32 to 448 kbit/s (the 14 values
+  above).
+- Channel modes: mono (single-channel) or stereo. No joint-stereo, no
+  dual-channel output.
+- No CRC emitted (`protection_bit = 1`).
+- Bit allocation is a greedy energy-per-bit heuristic — no
+  psychoacoustic model. Adequate for high bitrates / test signals;
+  not competitive with a proper masked-noise allocator at low bitrates.
+- `private`, `copyright`, `original`, `emphasis` are all emitted as 0.
+
 ### Codec IDs
 
-- `"mp1"` (alias: `"mpa1"`)
+- `"mp1"` (registered under this ID; aliases are handled by the
+  aggregator crate).
 
 ## License
 

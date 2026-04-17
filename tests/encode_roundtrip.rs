@@ -191,3 +191,84 @@ fn roundtrip_mono_44k_silence() {
     println!("silence max |s| post-warmup: {max_abs}");
     assert!(max_abs < 32, "silence should stay near zero, got {max_abs}");
 }
+
+#[test]
+fn roundtrip_stereo_48k_1khz_tone() {
+    // Stereo encode at 48 kHz / 256 kbps. Both channels carry the same
+    // tone, so both decoded channels must reconstruct it well.
+    let sr = 48_000u32;
+    let freq = 1000.0f32;
+    let pcm = make_tone(0.5, sr, 2, freq);
+    let encoded = encode_all(&pcm, sr, 2, 256);
+    assert!(!encoded.is_empty(), "encoder produced no data");
+    let (decoded, dec_sr, dec_ch) = decode_all(&encoded);
+    assert_eq!(dec_sr, sr);
+    assert_eq!(dec_ch, 2);
+    assert!(
+        decoded.len() > 20_000,
+        "decoded too few samples: {}",
+        decoded.len()
+    );
+
+    // Split decoded interleaved into per-channel, compare against the
+    // mono reference tone we fed into both channels.
+    let ref_mono: Vec<i16> = {
+        let mono = make_tone(0.5, sr, 1, freq);
+        mono.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    let mut left: Vec<i16> = Vec::with_capacity(decoded.len() / 2);
+    let mut right: Vec<i16> = Vec::with_capacity(decoded.len() / 2);
+    for pair in decoded.chunks_exact(2) {
+        left.push(pair[0]);
+        right.push(pair[1]);
+    }
+
+    for (name, chan) in [("L", &left), ("R", &right)] {
+        let mut best = -1000.0f64;
+        for offset in 0..1500 {
+            let p = psnr_db(&ref_mono, chan, offset);
+            if p > best {
+                best = p;
+            }
+        }
+        println!("roundtrip PSNR (stereo/{name}, 48k, 256kbps, 1kHz): {best:.2} dB");
+        assert!(best >= 28.0, "{name} PSNR too low: {best:.2} dB");
+    }
+}
+
+#[test]
+fn roundtrip_mono_32k_multiple_bitrates() {
+    // Walk several points on the bitrate ladder at 32 kHz to confirm
+    // every listed bitrate actually encodes + decodes a clean tone.
+    let sr = 32_000u32;
+    let freq = 800.0f32;
+    let pcm = make_tone(0.5, sr, 1, freq);
+    let ref_samples: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    for br in [32u32, 96, 192, 320, 448] {
+        let encoded = encode_all(&pcm, sr, 1, br);
+        assert!(!encoded.is_empty(), "no data at {br} kbps");
+        let (decoded, dec_sr, dec_ch) = decode_all(&encoded);
+        assert_eq!(dec_sr, sr);
+        assert_eq!(dec_ch, 1);
+        let mut best = -1000.0f64;
+        for offset in 0..1500 {
+            let p = psnr_db(&ref_samples, &decoded, offset);
+            if p > best {
+                best = p;
+            }
+        }
+        println!("roundtrip PSNR (mono, 32k, {br}kbps, 800Hz): {best:.2} dB");
+        // Lower bitrates have lower PSNR; only require a minimum at the
+        // bottom of the ladder so we still catch hard failures.
+        let floor = if br <= 64 { 18.0 } else { 28.0 };
+        assert!(
+            best >= floor,
+            "PSNR at {br} kbps too low: {best:.2} (floor {floor})"
+        );
+    }
+}
