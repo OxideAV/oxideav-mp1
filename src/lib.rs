@@ -37,7 +37,7 @@ pub mod header;
 pub mod synthesis;
 pub mod window;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
 
 pub const CODEC_ID_STR: &str = "mp1";
@@ -48,7 +48,12 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(true)
         .with_max_channels(2)
         .with_max_sample_rate(48_000);
-    reg.register_both(CodecId::new(CODEC_ID_STR), caps, make_decoder, make_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder),
+    );
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
