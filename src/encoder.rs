@@ -35,8 +35,8 @@ use oxideav_core::{
 
 use crate::analysis::{analyze_frame, AnalysisState, SAMPLES_PER_FRAME};
 use crate::bitalloc::{bits_per_sample, scale_table, SBLIMIT};
-use crate::bitwriter::BitWriter;
 use crate::CODEC_ID_STR;
+use oxideav_core::bits::BitWriter;
 
 /// Number of subband-sample blocks per Layer I frame (12 × 32 = 384 PCM).
 const BLOCKS_PER_FRAME: usize = 12;

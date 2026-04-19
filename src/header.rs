@@ -25,7 +25,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use oxideav_core::bits::BitReader;
 
 /// MPEG-1 Layer I bitrates (kbps), indexed by `bitrate_index`. Index 0 = free
 /// format (variable), index 15 = forbidden.

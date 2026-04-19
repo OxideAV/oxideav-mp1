@@ -31,8 +31,6 @@
 
 pub mod analysis;
 pub mod bitalloc;
-pub mod bitreader;
-pub mod bitwriter;
 pub mod decoder;
 pub mod encoder;
 pub mod header;

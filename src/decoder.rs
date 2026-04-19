@@ -31,9 +31,9 @@ use oxideav_core::{
 };
 
 use crate::bitalloc::{bits_per_sample, dequant_table, SAMPLES_PER_SUBBAND, SBLIMIT};
-use crate::bitreader::BitReader;
 use crate::header::FrameHeader;
 use crate::synthesis::SynthesisState;
+use oxideav_core::bits::BitReader;
 
 /// Maximum PCM channels (Layer I is stereo at most).
 const MAX_CH: usize = 2;
