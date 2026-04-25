@@ -25,7 +25,7 @@
 //! is read and duplicated to both output channels (M/S-style shared
 //! stream; intensity-stereo scaling is not part of Layer I).
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
