@@ -154,16 +154,9 @@ impl Mp1Encoder {
     }
 
     fn ingest(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != self.channels || frame.sample_rate != self.sample_rate {
-            return Err(Error::invalid(
-                "MP1 encoder: frame channel/sample-rate mismatch",
-            ));
-        }
-        if frame.format != SampleFormat::S16 {
-            return Err(Error::invalid(
-                "MP1 encoder: input frames must be S16 interleaved",
-            ));
-        }
+        // Stream-level validation (channel count, sample rate, S16
+        // sample format) is owned by the factory at construction —
+        // see `make_encoder`. The slim AudioFrame doesn't carry them.
         let data = frame
             .data
             .first()
@@ -556,12 +549,8 @@ mod tests {
             data.extend_from_slice(&0i16.to_le_bytes());
         }
         let frame = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 44_100,
             samples: n as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 44_100),
             data: vec![data],
         };
         enc.send_frame(&CoreFrame::Audio(frame)).unwrap();

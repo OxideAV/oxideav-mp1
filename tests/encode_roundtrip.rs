@@ -39,12 +39,8 @@ fn encode_all(pcm: &[u8], sample_rate: u32, channels: u16, bitrate_kbps: u32) ->
 
     let total_samples = (pcm.len() / (2 * channels as usize)) as u32;
     let frame = AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate,
         samples: total_samples,
         pts: Some(0),
-        time_base: TimeBase::new(1, sample_rate as i64),
         data: vec![pcm.to_vec()],
     };
     enc.send_frame(&Frame::Audio(frame)).expect("send_frame");
@@ -85,9 +81,17 @@ fn decode_all(data: &[u8]) -> (Vec<i16>, u32, u16) {
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     let mut dec = make_decoder(&params).expect("build decoder");
     let mut samples: Vec<i16> = Vec::new();
+    // Source stream-level rate/channels from the first frame's MP1
+    // header (slim AudioFrame doesn't carry these per-frame).
     let mut sr = 0u32;
     let mut ch = 0u16;
     for fr in split_frames(data) {
+        if sr == 0 {
+            if let Ok(h) = FrameHeader::parse(fr) {
+                sr = h.sample_rate;
+                ch = h.mode.channel_count() as u16;
+            }
+        }
         let pkt = Packet {
             stream_index: 0,
             time_base: TimeBase::new(1, 48_000),
@@ -99,8 +103,6 @@ fn decode_all(data: &[u8]) -> (Vec<i16>, u32, u16) {
         };
         dec.send_packet(&pkt).expect("send_packet");
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            sr = a.sample_rate;
-            ch = a.channels;
             let bytes = &a.data[0];
             for chunk in bytes.chunks_exact(2) {
                 samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));

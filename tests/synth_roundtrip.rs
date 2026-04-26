@@ -29,6 +29,7 @@
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_mp1::bitalloc::{dequant_table, SAMPLES_PER_SUBBAND, SBLIMIT};
 use oxideav_mp1::decoder::make_decoder;
+use oxideav_mp1::header::FrameHeader;
 use oxideav_mp1::CODEC_ID_STR;
 
 /// Minimal MP1 writer: encode 32-bit header + (no CRC) + allocation
@@ -189,17 +190,22 @@ fn build_mp1_frame(
 fn decode_frame(frame_bytes: Vec<u8>) -> (Vec<f32>, u16, u32) {
     let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     let mut dec = make_decoder(&params).unwrap();
+    // Stream-level rate/channels come from the MP1 frame header; the
+    // slim AudioFrame doesn't carry them per-frame.
+    let hdr = FrameHeader::parse(&frame_bytes).expect("parse frame header");
+    let channels = hdr.mode.channel_count();
+    let sample_rate = hdr.sample_rate;
     let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame_bytes);
     dec.send_packet(&pkt).expect("send_packet");
     let f = dec.receive_frame().expect("receive_frame");
     match f {
         Frame::Audio(a) => {
-            let mut pcm = Vec::with_capacity(a.samples as usize * a.channels as usize);
+            let mut pcm = Vec::with_capacity(a.samples as usize * channels as usize);
             for chunk in a.data[0].chunks_exact(2) {
                 let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
                 pcm.push(s);
             }
-            (pcm, a.channels, a.sample_rate)
+            (pcm, channels, sample_rate)
         }
         _ => panic!("not audio"),
     }
@@ -322,7 +328,8 @@ fn decode_stereo_both_channels_have_energy() {
         dec.send_packet(&pkt).unwrap();
         let f = dec.receive_frame().unwrap();
         if let Frame::Audio(a) = f {
-            assert_eq!(a.channels, 2);
+            // Encoded as stereo (channels=2 in build_mp1_frame); 4 bytes per
+            // interleaved S16 L/R sample.
             for chunk in a.data[0].chunks_exact(4) {
                 let l = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
                 let r = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0;
@@ -353,9 +360,9 @@ fn decode_all_three_sample_rates() {
         dec.send_packet(&pkt).unwrap();
         let f = dec.receive_frame().unwrap();
         if let Frame::Audio(a) = f {
-            assert_eq!(a.sample_rate, sr);
+            // Stream-level rate/channels are now sourced from the MP1 frame
+            // header (parse upfront via FrameHeader::parse if needed).
             assert_eq!(a.samples, 384);
-            assert_eq!(a.channels, 2);
         } else {
             panic!("expected audio");
         }
@@ -458,7 +465,7 @@ fn decode_joint_stereo() {
         dec.send_packet(&pkt).unwrap();
         let f = dec.receive_frame().unwrap();
         if let Frame::Audio(a) = f {
-            assert_eq!(a.channels, 2);
+            // Encoded as stereo (channels=2 above); 4 bytes per L/R sample.
             for chunk in a.data[0].chunks_exact(4) {
                 let l = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
                 let r = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0;

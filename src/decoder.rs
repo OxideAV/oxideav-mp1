@@ -27,7 +27,7 @@
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat,
 };
 
 use crate::bitalloc::{bits_per_sample, dequant_table, SAMPLES_PER_SUBBAND, SBLIMIT};
@@ -41,7 +41,6 @@ const MAX_CH: usize = 2;
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Mp1Decoder {
         codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
         pending: None,
         synth_state: [SynthesisState::new(), SynthesisState::new()],
         eof: false,
@@ -50,7 +49,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 
 struct Mp1Decoder {
     codec_id: CodecId,
-    time_base: TimeBase,
     pending: Option<Packet>,
     synth_state: [SynthesisState; MAX_CH],
     eof: bool,
@@ -104,8 +102,6 @@ impl Mp1Decoder {
         if data.len() < payload_start {
             return Err(Error::NeedMore);
         }
-
-        self.time_base = TimeBase::new(1, hdr.sample_rate as i64);
 
         // Bitstream body.
         let mut br = BitReader::new(&data[payload_start..]);
@@ -222,12 +218,8 @@ impl Mp1Decoder {
         }
 
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: channels as u16,
-            sample_rate: hdr.sample_rate,
             samples: samples_per_frame,
             pts: pkt.pts,
-            time_base: self.time_base,
             data: vec![out_bytes],
         }))
     }
@@ -236,6 +228,7 @@ impl Mp1Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxideav_core::TimeBase;
 
     /// Smoke test: build the decoder (should succeed) and feed a trivial
     /// frame with all-zero subband data (everything nb=0) — output must
@@ -270,9 +263,8 @@ mod tests {
         let f = dec.receive_frame().unwrap();
         match f {
             Frame::Audio(a) => {
-                assert_eq!(a.sample_rate, 32_000);
+                // Stream-level rate/channels live in the MP1 frame header.
                 assert_eq!(a.samples, 384);
-                assert_eq!(a.channels, 2);
                 // Silence in → silence out (synthesis state was already
                 // zero; the filter just settles).
                 for chunk in a.data[0].chunks_exact(2) {
