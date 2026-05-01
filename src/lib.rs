@@ -11,9 +11,18 @@
 //!   (ISO/IEC 11172-3 Table 3-B.1).
 //! - 32-band polyphase synthesis filter per Annex B / Annex D.
 //!
-//! Encoder: minimum-viable CBR Layer I output, mirror of the decode path.
-//! No psychoacoustic model — greedy energy-per-bit allocation. Mono or
-//! plain stereo only, no joint stereo, no CRC. See [`encoder`].
+//! Encoder: CBR or VBR Layer I output, mirror of the decode path.
+//!
+//! - **CBR**: greedy energy-per-bit allocation against a fixed slot
+//!   from the standard ladder.
+//! - **VBR**: per-frame masking-driven allocation (`crate::psy`)
+//!   followed by an energy-per-bit target-fill phase capped by a
+//!   rolling-average controller. Per-frame `bitrate_index` floats
+//!   over the standard slots; the long-term average converges on the
+//!   user-supplied `vbr_target_kbps`.
+//!
+//! Mono or plain stereo only, no joint stereo, no CRC. See
+//! [`encoder`] for the `vbr_quality` / `vbr_target_kbps` options.
 //!
 //! Not in scope (either direction): CRC verification, free-format frames
 //! (bitrate index 0), intensity-stereo scaling.
@@ -34,6 +43,7 @@ pub mod bitalloc;
 pub mod decoder;
 pub mod encoder;
 pub mod header;
+pub mod psy;
 pub mod synthesis;
 pub mod window;
 

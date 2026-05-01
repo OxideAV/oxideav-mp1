@@ -89,7 +89,7 @@ fn decode_all(data: &[u8]) -> (Vec<i16>, u32, u16) {
         if sr == 0 {
             if let Ok(h) = FrameHeader::parse(fr) {
                 sr = h.sample_rate;
-                ch = h.mode.channel_count() as u16;
+                ch = h.mode.channel_count();
             }
         }
         let pkt = Packet {

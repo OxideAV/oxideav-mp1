@@ -51,6 +51,24 @@ enc.send_frame(&Frame::Audio(pcm_frame))?;  // 384 * 2 S16 samples
 let pkt = enc.receive_packet()?;            // one Layer-I frame
 ```
 
+VBR mode is selected by setting either `vbr_target_kbps` (the average
+target bitrate, in kbps) or `vbr_quality` (0..=9, lower = stricter
+masking). The per-frame `bitrate_index` then floats over the standard
+Layer I ladder (32..=448 kbps); the long-term average converges on
+the target via a rolling-average controller.
+
+```rust
+use oxideav_core::options::CodecOptions;
+
+let mut params = CodecParameters::audio(CodecId::new("mp1"));
+params.sample_rate = Some(44_100);
+params.channels = Some(2);
+params.options = CodecOptions::new()
+    .set("vbr_target_kbps", "192")          // average target
+    .set("vbr_quality", "3");               // mask strictness 0..=9
+let mut enc = reg.make_encoder(&params)?;
+```
+
 ### Supported features
 
 Decoder:
@@ -68,7 +86,7 @@ Decoder:
   `mode`, `mode_extension`, `copyright`, `original`, `emphasis`. CRC
   payload is skipped rather than verified.
 
-Encoder (CBR):
+Encoder (CBR + VBR):
 
 - MPEG-1 only.
 - Sample rates: 32 000, 44 100, 48 000 Hz.
@@ -77,9 +95,17 @@ Encoder (CBR):
 - Channel modes: mono (single-channel) or stereo. No joint-stereo, no
   dual-channel output.
 - No CRC emitted (`protection_bit = 1`).
-- Bit allocation is a greedy energy-per-bit heuristic — no
-  psychoacoustic model. Adequate for high bitrates / test signals;
-  not competitive with a proper masked-noise allocator at low bitrates.
+- CBR allocator: greedy energy-per-bit heuristic — no psymodel.
+  Adequate for high bitrates / test signals; not competitive with a
+  proper masked-noise allocator at low bitrates.
+- VBR allocator: per-subband masking model (energy-based threshold
+  with one-tap inter-band spreading + ATH boost above 12 kHz, see
+  `psy.rs`) drives a two-phase iteration — Phase 1 fills until every
+  band's quantisation noise sits below its mask threshold, Phase 2
+  spends any remaining headroom up to a quality-scaled fraction of
+  the rolling per-frame target. Per-frame `bitrate_index` is picked
+  from the standard ladder; the long-term average converges on
+  `vbr_target_kbps`.
 - `private`, `copyright`, `original`, `emphasis` are all emitted as 0.
 
 ### Codec IDs

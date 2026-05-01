@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- VBR (variable bit-rate) encoder mode driven by a per-subband
+  masking model (`psy::SubbandMask`). Two-phase allocator: mask-driven
+  upgrades until every band is masked, then quality-scaled target-fill
+  bounded by a rolling-average controller against `vbr_target_kbps`.
+  Per-frame `bitrate_index` floats over the standard Layer I ladder;
+  the long-term average converges on the user-supplied target.
+  Selected via `vbr_target_kbps` and/or `vbr_quality` (0..=9) on
+  `CodecParameters::options`. ffmpeg cross-decode interop verified.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-mp1/compare/v0.0.3...v0.0.4) - 2026-04-25
 
 ### Other
