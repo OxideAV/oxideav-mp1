@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-mp1/compare/v0.0.4...v0.0.5) - 2026-05-02
+
+### Other
+
+- migrate to centralized OxideAV/.github reusable workflows
+- add VBR mode driven by per-subband masking
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - VBR (variable bit-rate) encoder mode driven by a per-subband
