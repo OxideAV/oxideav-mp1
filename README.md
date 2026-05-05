@@ -21,17 +21,16 @@ MP1 frames are self-contained — each input packet is one MPEG-1 Layer I
 frame (384 samples per channel). Decoder output is interleaved S16 PCM.
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, RuntimeContext, TimeBase};
 
-let mut reg = CodecRegistry::new();
-oxideav_mp1::register(&mut reg);
+let mut ctx = RuntimeContext::new();
+oxideav_mp1::register(&mut ctx);
 
 // The decoder reads sample_rate / channels from the frame header, so
 // params can be minimal.
 let params = CodecParameters::audio(CodecId::new("mp1"));
 
-let mut dec = reg.make_decoder(&params)?;
+let mut dec = ctx.codecs.make_decoder(&params)?;
 dec.send_packet(&Packet::new(0, TimeBase::new(1, 44_100), mp1_frame))?;
 let Frame::Audio(a) = dec.receive_frame()? else { unreachable!() };
 // `a.data[0]` is 384 * a.channels S16 samples at a.sample_rate Hz.
