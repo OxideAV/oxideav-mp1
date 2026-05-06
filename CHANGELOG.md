@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mp1/compare/v0.0.5...v0.0.6) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-mp1/pull/502))
+- replace never-match regex with semver_check = false
+
 ### Changed
 
 - **`register` entry point unified on `RuntimeContext`** (task #502).
