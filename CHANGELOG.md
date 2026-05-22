@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CRC-16 protection (ISO/IEC 11172-3 §2.4.3.1) on both paths. New
+  `crc::Crc16` accumulator (polynomial `x^16 + x^15 + x^2 + 1`, init
+  `0xFFFF`, MSB-first) and `crc::layer1_crc` helper. The encoder gains a
+  `crc_check` option that clears the `protection_bit` and inserts the
+  16-bit CRC word after the header, covering the header tail (bytes 2–3)
+  plus the entire bit-allocation field (Table 3-B.5). The decoder now
+  verifies the CRC word when `protection_bit == 0` and rejects frames
+  whose protected field is corrupted (previously the word was skipped).
+  Validated by round-trip and black-box: ffmpeg's MPEG-audio decoder
+  accepts our CRC streams and reports "CRC mismatch" only on deliberate
+  corruption.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-mp1/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other

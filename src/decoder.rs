@@ -31,6 +31,7 @@ use oxideav_core::{
 };
 
 use crate::bitalloc::{bits_per_sample, dequant_table, SAMPLES_PER_SUBBAND, SBLIMIT};
+use crate::crc::Crc16;
 use crate::header::FrameHeader;
 use crate::synthesis::SynthesisState;
 use oxideav_core::bits::BitReader;
@@ -96,11 +97,26 @@ impl Mp1Decoder {
         let channels = hdr.mode.channel_count() as usize;
         let bound = hdr.bound() as usize;
 
-        // Header + optional CRC (we don't verify; we just skip past it).
+        // Header + optional CRC. When the protection bit is 0
+        // (`hdr.protection == true`) a 16-bit CRC-check word sits in
+        // frame bytes 4..6 (ISO/IEC 11172-3 §2.4.3.1).
         let crc_bytes = if hdr.protection { 2 } else { 0 };
         let payload_start = 4 + crc_bytes;
         if data.len() < payload_start {
             return Err(Error::NeedMore);
+        }
+        let stored_crc = if hdr.protection {
+            Some(u16::from_be_bytes([data[4], data[5]]))
+        } else {
+            None
+        };
+        // The CRC covers the last two header bytes plus the entire
+        // bit-allocation field (Table 3-B.5). Seed it with the header
+        // tail now and fold in allocation bits as they are read.
+        let mut crc = Crc16::new();
+        if stored_crc.is_some() {
+            crc.push_byte(data[2]);
+            crc.push_byte(data[3]);
         }
 
         // Bitstream body.
@@ -111,21 +127,39 @@ impl Mp1Decoder {
         let mut alloc = [[0u8; SBLIMIT]; MAX_CH];
         for sb in 0..bound {
             for ch in 0..channels {
-                let a = br.read_u32(4)? as u8;
+                let a = br.read_u32(4)?;
+                if stored_crc.is_some() {
+                    crc.push_bits(a, 4);
+                }
                 if a == 15 {
                     return Err(Error::invalid("MP1: forbidden allocation code 15"));
                 }
-                alloc[ch][sb] = a;
+                alloc[ch][sb] = a as u8;
             }
         }
         for sb in bound..SBLIMIT {
-            let a = br.read_u32(4)? as u8;
+            let a = br.read_u32(4)?;
+            if stored_crc.is_some() {
+                crc.push_bits(a, 4);
+            }
             if a == 15 {
                 return Err(Error::invalid("MP1: forbidden allocation code 15"));
             }
-            alloc[0][sb] = a;
+            alloc[0][sb] = a as u8;
             if channels == 2 {
-                alloc[1][sb] = a;
+                alloc[1][sb] = a as u8;
+            }
+        }
+
+        // Verify the CRC-check word once the protected field is fully
+        // consumed. A mismatch means the protected field (header tail or
+        // bit allocation) was corrupted in transit.
+        if let Some(expected) = stored_crc {
+            let computed = crc.value();
+            if computed != expected {
+                return Err(Error::invalid(format!(
+                    "MP1: CRC-16 mismatch (header says {expected:#06x}, computed {computed:#06x})"
+                )));
             }
         }
 

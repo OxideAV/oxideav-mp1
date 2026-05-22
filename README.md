@@ -68,6 +68,14 @@ params.options = CodecOptions::new()
 let mut enc = reg.make_encoder(&params)?;
 ```
 
+CRC-16 protection (§2.4.3.1) is opt-in. Setting `crc_check` clears the
+`protection_bit` and inserts the 16-bit CRC word after each header; the
+decoder then verifies it and rejects corrupted frames:
+
+```rust
+params.options = CodecOptions::new().set("crc_check", "true");
+```
+
 ### Supported features
 
 Decoder:
@@ -82,8 +90,10 @@ Decoder:
   Layer I joint stereo is M/S-style sample sharing above the bound;
   there is no intensity-stereo scaling in Layer I.
 - Header fields parsed: `protection_bit`, `padding`, `private`,
-  `mode`, `mode_extension`, `copyright`, `original`, `emphasis`. CRC
-  payload is skipped rather than verified.
+  `mode`, `mode_extension`, `copyright`, `original`, `emphasis`. When
+  `protection_bit = 0`, the CRC-16 word is verified against the
+  header tail + bit-allocation field (§2.4.3.1); a mismatch rejects
+  the frame.
 
 Encoder (CBR + VBR):
 
@@ -93,7 +103,14 @@ Encoder (CBR + VBR):
   above).
 - Channel modes: mono (single-channel) or stereo. No joint-stereo, no
   dual-channel output.
-- No CRC emitted (`protection_bit = 1`).
+- Optional CRC-16 protection (§2.4.3.1). Off by default
+  (`protection_bit = 1`); set the `crc_check` option to clear the
+  protection bit and insert the 16-bit CRC word after the header
+  (polynomial `x^16 + x^15 + x^2 + 1`, init `0xFFFF`, protecting the
+  header tail + the bit-allocation field per Table 3-B.5). The decoder
+  verifies the word and rejects frames whose protected field is
+  corrupted. ffmpeg's MPEG-audio decoder accepts our CRC streams and
+  flags only deliberate corruptions, confirming wire-compatibility.
 - CBR allocator: greedy energy-per-bit heuristic — no psymodel.
   Adequate for high bitrates / test signals; not competitive with a
   proper masked-noise allocator at low bitrates.

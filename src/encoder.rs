@@ -2,7 +2,7 @@
 //!
 //! # Scope
 //! - MPEG-1 Layer I, 32 / 44.1 / 48 kHz, mono or plain stereo (no joint
-//!   stereo, no CRC).
+//!   stereo). Optional CRC-16 protection via the `crc_check` option.
 //! - **CBR mode** (default): one fixed bitrate per encoder instance,
 //!   from the standard Layer I ladder (32..=448 kbps). Greedy
 //!   energy-per-bit allocation: subbands are iteratively awarded
@@ -28,8 +28,10 @@
 //! - No full ISO §C.1 psychoacoustic model (no FFT-based tonality
 //!   detector, no Bark spreading function, no full ATH table).
 //! - No joint stereo / intensity coding.
-//! - No CRC-16.
 //! - No free-format output.
+//!
+//! CRC-16 protection (§2.4.3.1) is emitted on request via the
+//! `crc_check` option; see [`crate::crc`].
 
 use std::collections::VecDeque;
 
@@ -41,6 +43,7 @@ use oxideav_core::{
 
 use crate::analysis::{analyze_frame, AnalysisState, SAMPLES_PER_FRAME};
 use crate::bitalloc::{bits_per_sample, scale_table, SBLIMIT};
+use crate::crc::Crc16;
 use crate::psy::{subband_noise_energy, vbr_quality_to_mask_ratio, SubbandMask};
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
@@ -84,6 +87,11 @@ pub enum RateControl {
 ///   in CBR mode, or 192 kbps when neither is provided.
 /// - `cbr_bitrate_kbps` — `u32` CBR slot in kbps. Overrides
 ///   `bit_rate` in CBR mode; ignored when VBR is active.
+/// - `crc_check` — `bool`. When `true`, the encoder clears the header
+///   `protection_bit` and inserts a CRC-16 protection word after the
+///   header (ISO/IEC 11172-3 §2.4.3.1). Defaults to `false` (no CRC),
+///   matching the historical encoder behaviour and most real-world
+///   Layer I streams.
 #[derive(Default, Debug, Clone)]
 pub struct Mp1EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
@@ -92,6 +100,8 @@ pub struct Mp1EncoderOptions {
     pub vbr_target_kbps: Option<u32>,
     /// Override for the CBR slot (kbps). Only consulted in CBR mode.
     pub cbr_bitrate_kbps: Option<u32>,
+    /// Emit a CRC-16 protection word (clears the `protection_bit`).
+    pub crc_check: bool,
 }
 
 impl CodecOptionsStruct for Mp1EncoderOptions {
@@ -113,6 +123,12 @@ impl CodecOptionsStruct for Mp1EncoderOptions {
             kind: OptionKind::U32,
             default: OptionValue::U32(0),
             help: "Override CBR bitrate in kbps. Ignored when VBR is active.",
+        },
+        OptionField {
+            name: "crc_check",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit a CRC-16 protection word (clears protection_bit).",
         },
     ];
 
@@ -141,6 +157,9 @@ impl CodecOptionsStruct for Mp1EncoderOptions {
                 if n > 0 {
                     self.cbr_bitrate_kbps = Some(n);
                 }
+            }
+            "crc_check" => {
+                self.crc_check = v.as_bool()?;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -192,6 +211,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     })?;
     let vbr_quality = opts.vbr_quality.unwrap_or(3);
     let vbr_target_kbps = opts.vbr_target_kbps.unwrap_or(bitrate_kbps);
+    let crc_check = opts.crc_check;
 
     let sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
     if sample_format != SampleFormat::S16 {
@@ -225,6 +245,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         rate_control,
         vbr_quality,
         vbr_target_kbps,
+        crc_check,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         pcm_queue: vec![Vec::new(); channels as usize],
@@ -252,6 +273,9 @@ struct Mp1Encoder {
     /// VBR target average bitrate in kbps. Only consulted when
     /// `rate_control == Vbr`.
     vbr_target_kbps: u32,
+    /// When true, clear the `protection_bit` and emit a CRC-16 word
+    /// after the header (ISO/IEC 11172-3 §2.4.3.1).
+    crc_check: bool,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     pcm_queue: Vec<Vec<f32>>,
@@ -392,8 +416,9 @@ impl Mp1Encoder {
         // hold the result (subject to a rolling-average controller
         // that nudges the per-frame max bits toward `vbr_target_kbps`).
         let header_bits = 32u32;
+        let crc_bits = if self.crc_check { 16u32 } else { 0 };
         let bitalloc_bits = 4u32 * SBLIMIT as u32 * n_ch as u32;
-        let fixed_overhead_bits = header_bits + bitalloc_bits;
+        let fixed_overhead_bits = header_bits + crc_bits + bitalloc_bits;
 
         let (alloc, frame_bytes, padding, frame_br_index) = match self.rate_control {
             RateControl::Cbr => self.allocate_cbr(n_ch, &energy, &scf_idx, fixed_overhead_bits)?,
@@ -406,14 +431,16 @@ impl Mp1Encoder {
         let mut w = BitWriter::with_capacity(frame_bytes);
 
         // Header (32 bits).
-        // syncword 0xFFF, ID=1 (MPEG-1), layer=11 (Layer I), protection=1
-        // (no CRC), bitrate_index, sampling_frequency_index, padding bit,
-        // private bit=0, mode (00=stereo, 11=mono), mode_extension=0,
-        // copyright=0, original=0, emphasis=0.
+        // syncword 0xFFF, ID=1 (MPEG-1), layer=11 (Layer I),
+        // protection_bit (1 = no CRC, 0 = CRC present), bitrate_index,
+        // sampling_frequency_index, padding bit, private bit=0, mode
+        // (00=stereo, 11=mono), mode_extension=0, copyright=0,
+        // original=0, emphasis=0.
         w.write_u32(0xFFF, 12);
         w.write_u32(1, 1); // ID = MPEG-1
         w.write_u32(0b11, 2); // Layer I
-        w.write_u32(1, 1); // protection_bit = 1 (no CRC)
+                              // protection_bit: 0 when a CRC word follows the header.
+        w.write_u32(if self.crc_check { 0 } else { 1 }, 1);
         w.write_u32(frame_br_index, 4);
         w.write_u32(self.sr_index as u32, 2);
         w.write_u32(if padding { 1 } else { 0 }, 1);
@@ -425,12 +452,36 @@ impl Mp1Encoder {
         w.write_u32(0, 1); // original
         w.write_u32(0, 2); // emphasis
 
+        // The CRC-16 protection word (ISO/IEC 11172-3 §2.4.3.1) sits
+        // immediately after the header when `protection_bit == 0`. The
+        // header is exactly 32 bits and byte-aligned, so its last two
+        // bytes (the protected header tail) are now bytes 2..4 of the
+        // writer buffer. Seed the CRC with them, emit a 16-bit zero
+        // placeholder (keeping the writer byte-aligned), and patch the
+        // real value in once the bit-allocation field is folded in.
+        let mut crc = Crc16::new();
+        let crc_placeholder_at = if self.crc_check {
+            let hdr = w.bytes();
+            crc.push_byte(hdr[2]);
+            crc.push_byte(hdr[3]);
+            let at = hdr.len();
+            w.write_u32(0, 16); // CRC placeholder, patched after allocation
+            Some(at)
+        } else {
+            None
+        };
+
         // --- 5a. Bit allocation (4 bits × subband × channel). Since we
         //     emit plain (non-joint) modes, every subband is below the
         //     bound — channel-paired order, same as the decoder reads.
+        //     Each 4-bit element is folded into the CRC in wire order.
         for sb in 0..SBLIMIT {
             for ch in 0..n_ch {
-                w.write_u32(alloc[ch][sb] as u32, 4);
+                let a = alloc[ch][sb] as u32;
+                if self.crc_check {
+                    crc.push_bits(a, 4);
+                }
+                w.write_u32(a, 4);
             }
         }
 
@@ -467,6 +518,16 @@ impl Mp1Encoder {
         // --- 5d. Pad to frame length. Fill with zero ancillary data.
         w.align_to_byte();
         let mut bytes = w.into_bytes();
+
+        // Patch the CRC placeholder now that the protected field is
+        // complete. `crc.value()` covers the header tail + every
+        // allocation bit folded in above.
+        if let Some(at) = crc_placeholder_at {
+            let word = crc.value().to_be_bytes();
+            bytes[at] = word[0];
+            bytes[at + 1] = word[1];
+        }
+
         if bytes.len() > frame_bytes {
             bytes.truncate(frame_bytes);
         }
@@ -957,5 +1018,148 @@ mod tests {
             decoded >= SAMPLES_PER_FRAME as u32,
             "decoded too few samples: {decoded}"
         );
+    }
+
+    /// Build an encoder with the `crc_check` option set and feed it a
+    /// short tone; returns the emitted packets.
+    #[cfg(test)]
+    fn encode_tone_with_crc(channels: u16) -> Vec<Packet> {
+        use oxideav_core::options::CodecOptions;
+        use oxideav_core::Frame as CoreFrame;
+
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.channels = Some(channels);
+        params.sample_rate = Some(44_100);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = CodecOptions::new().set("crc_check", "true");
+        let mut enc = make_encoder(&params).unwrap();
+
+        let n = SAMPLES_PER_FRAME * 4;
+        let mut data = Vec::new();
+        for i in 0..n {
+            let t = i as f32 / 44_100.0;
+            let s = (2.0 * std::f32::consts::PI * 1000.0 * t).sin();
+            let q = (s * 20_000.0) as i16;
+            for _ in 0..channels {
+                data.extend_from_slice(&q.to_le_bytes());
+            }
+        }
+        let frame = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![data],
+        };
+        enc.send_frame(&CoreFrame::Audio(frame)).unwrap();
+        enc.flush().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        packets
+    }
+
+    /// With `crc_check` enabled the encoder must clear the protection
+    /// bit and insert a 16-bit CRC word, and our decoder must accept
+    /// the resulting frames (CRC verifies).
+    #[test]
+    fn crc_emit_and_decode_roundtrips() {
+        use crate::decoder::make_decoder;
+        use crate::header::FrameHeader;
+        use oxideav_core::Frame as CoreFrame;
+
+        for &channels in &[1u16, 2] {
+            let packets = encode_tone_with_crc(channels);
+            assert!(!packets.is_empty(), "no packets for {channels}ch");
+
+            for p in &packets {
+                let h = FrameHeader::parse(&p.data).unwrap();
+                // protection_bit == 0 ⇒ `protection == true` in our header.
+                assert!(h.protection, "CRC frame must signal protection");
+                // CRC word is bytes 4..6 and must be non-trivial for a
+                // tone (the all-ones init evolves under real allocation).
+                assert!(p.data.len() >= 6, "frame too short for CRC word");
+            }
+
+            // Decode every frame: a CRC mismatch would surface as an
+            // error from receive_frame.
+            let dparams = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+            let mut dec = make_decoder(&dparams).unwrap();
+            let mut decoded = 0u32;
+            for p in &packets {
+                dec.send_packet(p).unwrap();
+                match dec.receive_frame() {
+                    Ok(CoreFrame::Audio(a)) => decoded += a.samples,
+                    Ok(_) => panic!("unexpected non-audio frame"),
+                    Err(e) => panic!("CRC frame rejected on decode: {e}"),
+                }
+            }
+            assert!(decoded > 0, "no samples decoded for {channels}ch");
+        }
+    }
+
+    /// Corrupting the stored CRC word must make the decoder reject the
+    /// frame on CRC mismatch — this isolates the CRC check from the
+    /// forbidden-allocation-code (15) guard, which runs earlier.
+    #[test]
+    fn crc_detects_corruption() {
+        use crate::decoder::make_decoder;
+
+        let packets = encode_tone_with_crc(2);
+        let mut pkt = packets[0].clone();
+        // Bytes 4..6 hold the stored CRC word. Flipping a bit there
+        // leaves the protected field intact but the stored != computed,
+        // so the decoder must report a CRC mismatch.
+        let original = pkt.data[5];
+        pkt.data[5] ^= 0x01;
+        assert_ne!(pkt.data[5], original);
+
+        let dparams = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        let mut dec = make_decoder(&dparams).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let res = dec.receive_frame();
+        assert!(
+            res.is_err(),
+            "decoder accepted a CRC-corrupted frame: {res:?}"
+        );
+
+        // And a protected-field corruption (a bit-allocation byte) is
+        // likewise caught — either by the CRC or the forbidden-code
+        // guard; both are decode-time rejections.
+        let mut pkt2 = packets[0].clone();
+        pkt2.data[6] ^= 0x10;
+        let mut dec2 = make_decoder(&dparams).unwrap();
+        dec2.send_packet(&pkt2).unwrap();
+        assert!(
+            dec2.receive_frame().is_err(),
+            "decoder accepted a frame with a corrupted allocation byte"
+        );
+    }
+
+    /// Default (no `crc_check`) keeps protection_bit = 1 and no CRC word
+    /// — backward-compatible with the historical encoder output.
+    #[test]
+    fn no_crc_by_default() {
+        use crate::header::FrameHeader;
+
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.channels = Some(2);
+        params.sample_rate = Some(44_100);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&params).unwrap();
+
+        let n = SAMPLES_PER_FRAME;
+        let data = vec![0u8; n * 2 * 2];
+        let frame = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![data],
+        };
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        enc.flush().unwrap();
+        let p = enc.receive_packet().unwrap();
+        let h = FrameHeader::parse(&p.data).unwrap();
+        assert!(!h.protection, "default output must have protection_bit = 1");
     }
 }

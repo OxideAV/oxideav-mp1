@@ -21,11 +21,13 @@
 //!   over the standard slots; the long-term average converges on the
 //!   user-supplied `vbr_target_kbps`.
 //!
-//! Mono or plain stereo only, no joint stereo, no CRC. See
-//! [`encoder`] for the `vbr_quality` / `vbr_target_kbps` options.
+//! Mono or plain stereo only, no joint stereo. Optional CRC-16
+//! protection (`crc_check` option) is emitted by the encoder and
+//! verified by the decoder — see [`crc`]. See [`encoder`] for the
+//! `vbr_quality` / `vbr_target_kbps` options.
 //!
-//! Not in scope (either direction): CRC verification, free-format frames
-//! (bitrate index 0), intensity-stereo scaling.
+//! Not in scope (either direction): free-format frames (bitrate index
+//! 0), intensity-stereo scaling.
 //!
 //! See [`decoder::make_decoder`] / [`encoder::make_encoder`] for entry
 //! points and [`crate::bitalloc`] for the requantization math.
@@ -40,6 +42,7 @@
 
 pub mod analysis;
 pub mod bitalloc;
+pub mod crc;
 pub mod decoder;
 pub mod encoder;
 pub mod header;
