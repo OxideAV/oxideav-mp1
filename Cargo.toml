@@ -1,0 +1,16 @@
+[package]
+name = "oxideav-mp1"
+version = "0.0.6"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust MPEG-1 Audio Layer I codec — decoder + encoder"
+repository = "https://github.com/OxideAV/oxideav-mp1"
+homepage = "https://github.com/OxideAV/oxideav-mp1"
+readme = "README.md"
+keywords = ["multimedia", "audio", "mpeg", "mp1", "codec"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
