@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Joint-stereo encode (ISO/IEC 11172-3 §2.4.2.3 / §2.4.1.5). New
+  `joint_stereo` (bool) and `js_bound` (4 / 8 / 12 / 16) encoder
+  options. When enabled on a stereo input the encoder emits
+  `mode = 01` (joint_stereo) with a `mode_extension` selecting the
+  `bound`, and shares the upper subbands `[bound..32)` between the two
+  channels: one allocation field + one quantised sample stream per
+  shared subband, but a scalefactor per channel. The shared stream is
+  the per-sample mid `M = (L + R) / 2`, so the decoder reconstructs
+  `L = R = M` above the bound (Layer I has no intensity scaling). The
+  CBR/VBR allocators are now bound-aware (`upgrade_cost_bits_bound`):
+  a shared subband's 0 → non-zero transition pays one scalefactor per
+  channel on top of one shared 12-sample stream, and the freed
+  upper-band bits are redistributed to the loudest below-bound bands.
+  Validated black-box: ffmpeg's MPEG-audio decoder accepts our
+  joint-stereo streams (74 dB tone SNR) and the self-roundtrip keeps
+  bit-identical L/R for identical input.
 - CRC-16 protection (ISO/IEC 11172-3 §2.4.3.1) on both paths. New
   `crc::Crc16` accumulator (polynomial `x^16 + x^15 + x^2 + 1`, init
   `0xFFFF`, MSB-first) and `crc::layer1_crc` helper. The encoder gains a

@@ -76,6 +76,22 @@ decoder then verifies it and rejects corrupted frames:
 params.options = CodecOptions::new().set("crc_check", "true");
 ```
 
+Joint stereo (§2.4.2.3 / §2.4.1.5) is opt-in for stereo input. Setting
+`joint_stereo` emits `mode = 01` and shares the upper subbands
+`[bound..32)` between the two channels — one allocation + one quantised
+sample stream (the per-sample mid `M = (L + R) / 2`), but a scalefactor
+per channel, so the decoder reconstructs `L = R = M` above the bound.
+Layer I has no intensity scaling, so this M/S-style mid sharing is the
+full extent of Layer I joint stereo. `js_bound` selects the bound
+(`4`/`8`/`12`/`16`, mapping to `mode_extension` 0/1/2/3; default 8). The
+freed upper-band bits are redistributed to the loudest below-bound bands:
+
+```rust
+params.options = CodecOptions::new()
+    .set("joint_stereo", "true")
+    .set("js_bound", "8");                   // bound 8 → mode_extension 1
+```
+
 ### Supported features
 
 Decoder:
@@ -101,8 +117,16 @@ Encoder (CBR + VBR):
 - Sample rates: 32 000, 44 100, 48 000 Hz.
 - Bitrates: every Layer I rate from 32 to 448 kbit/s (the 14 values
   above).
-- Channel modes: mono (single-channel) or stereo. No joint-stereo, no
-  dual-channel output.
+- Channel modes: mono (single-channel), plain stereo, or joint stereo
+  (`joint_stereo` option). Joint stereo shares the upper subbands
+  `[bound..32)` as one allocation + one quantised sample stream (the
+  per-sample mid `M = (L + R) / 2`) with a per-channel scalefactor, so
+  the decoder reconstructs `L = R = M` above the bound; `js_bound`
+  picks 4/8/12/16 (`mode_extension` 0/1/2/3, §2.4.2.3). Layer I has no
+  intensity scaling, so this M/S-style mid sharing is the full extent
+  of Layer I joint stereo. ffmpeg's MPEG-audio decoder accepts our
+  joint-stereo streams and recovers the tone cleanly. No dual-channel
+  output.
 - Optional CRC-16 protection (§2.4.3.1). Off by default
   (`protection_bit = 1`); set the `crc_check` option to clear the
   protection bit and insert the 16-bit CRC word after the header

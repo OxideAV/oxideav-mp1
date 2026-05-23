@@ -21,13 +21,16 @@
 //!   over the standard slots; the long-term average converges on the
 //!   user-supplied `vbr_target_kbps`.
 //!
-//! Mono or plain stereo only, no joint stereo. Optional CRC-16
+//! Mono, plain stereo, or joint stereo (`joint_stereo` option:
+//! M/S-style mid sharing of the upper subbands above a 4/8/12/16
+//! `bound`; Layer I has no intensity scaling). Optional CRC-16
 //! protection (`crc_check` option) is emitted by the encoder and
 //! verified by the decoder — see [`crc`]. See [`encoder`] for the
-//! `vbr_quality` / `vbr_target_kbps` options.
+//! `vbr_quality` / `vbr_target_kbps` / `joint_stereo` / `js_bound`
+//! options.
 //!
 //! Not in scope (either direction): free-format frames (bitrate index
-//! 0), intensity-stereo scaling.
+//! 0), intensity-stereo scaling, dual-channel output.
 //!
 //! See [`decoder::make_decoder`] / [`encoder::make_encoder`] for entry
 //! points and [`crate::bitalloc`] for the requantization math.

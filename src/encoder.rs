@@ -1,8 +1,8 @@
 //! MPEG-1 Audio Layer I encoder — CBR or VBR.
 //!
 //! # Scope
-//! - MPEG-1 Layer I, 32 / 44.1 / 48 kHz, mono or plain stereo (no joint
-//!   stereo). Optional CRC-16 protection via the `crc_check` option.
+//! - MPEG-1 Layer I, 32 / 44.1 / 48 kHz, mono, plain stereo, or
+//!   joint-stereo. Optional CRC-16 protection via the `crc_check` option.
 //! - **CBR mode** (default): one fixed bitrate per encoder instance,
 //!   from the standard Layer I ladder (32..=448 kbps). Greedy
 //!   energy-per-bit allocation: subbands are iteratively awarded
@@ -24,11 +24,26 @@
 //!   PCM → polyphase analysis → per-subband scalefactor extraction →
 //!   bit allocation → sample quantisation → bit packing.
 //!
+//! # Joint stereo (`joint_stereo` option)
+//! - When enabled on a stereo input the encoder sets `mode = 01`
+//!   (joint_stereo) and a `mode_extension` selecting the `bound`
+//!   (4 / 8 / 12 / 16 — Table in §2.4.2.3). Subbands `[0..bound)`
+//!   stay per-channel; subbands `[bound..32)` carry one shared
+//!   allocation and one shared quantised sample stream (§2.4.1.5
+//!   `audio_data()` for Layer I). The shared stream is the per-sample
+//!   mid signal `M = (L + R) / 2`; both channels still carry their own
+//!   6-bit scalefactor, so the decoder reconstructs `L = R = M` above
+//!   the bound. Layer I has no intensity scaling (§2.4.2.3), so this
+//!   M/S-style sharing is the full extent of Layer I joint stereo.
+//!   This saves the upper-subband allocation + sample bits, which the
+//!   allocator redistributes to the loudest below-bound bands.
+//!
 //! # What is NOT implemented
 //! - No full ISO §C.1 psychoacoustic model (no FFT-based tonality
 //!   detector, no Bark spreading function, no full ATH table).
-//! - No joint stereo / intensity coding.
+//! - No intensity-stereo scaling (Layer I has none — §2.4.2.3).
 //! - No free-format output.
+//! - No dual-channel output.
 //!
 //! CRC-16 protection (§2.4.3.1) is emitted on request via the
 //! `crc_check` option; see [`crate::crc`].
@@ -44,6 +59,7 @@ use oxideav_core::{
 use crate::analysis::{analyze_frame, AnalysisState, SAMPLES_PER_FRAME};
 use crate::bitalloc::{bits_per_sample, scale_table, SBLIMIT};
 use crate::crc::Crc16;
+use crate::header::ChannelMode;
 use crate::psy::{subband_noise_energy, vbr_quality_to_mask_ratio, SubbandMask};
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
@@ -92,7 +108,15 @@ pub enum RateControl {
 ///   header (ISO/IEC 11172-3 §2.4.3.1). Defaults to `false` (no CRC),
 ///   matching the historical encoder behaviour and most real-world
 ///   Layer I streams.
-#[derive(Default, Debug, Clone)]
+/// - `joint_stereo` — `bool`. Only meaningful for 2-channel input.
+///   When `true`, the encoder emits `mode = 01` (joint_stereo) and
+///   shares the upper-subband allocation + sample stream between the
+///   two channels (M/S-style mid sharing above the `bound`).
+/// - `js_bound` — `u32` in `{4, 8, 12, 16}`. Selects the joint-stereo
+///   `bound`: subbands `[bound..32)` are shared. Maps to the
+///   `mode_extension` field (4→0, 8→1, 12→2, 16→3). Only consulted
+///   when `joint_stereo` is set. Defaults to 8 (`mode_extension = 1`).
+#[derive(Debug, Clone)]
 pub struct Mp1EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
     pub vbr_quality: Option<u8>,
@@ -102,6 +126,23 @@ pub struct Mp1EncoderOptions {
     pub cbr_bitrate_kbps: Option<u32>,
     /// Emit a CRC-16 protection word (clears the `protection_bit`).
     pub crc_check: bool,
+    /// Emit joint-stereo (`mode = 01`) for 2-channel input.
+    pub joint_stereo: bool,
+    /// Joint-stereo bound (4 / 8 / 12 / 16). Only when `joint_stereo`.
+    pub js_bound: u8,
+}
+
+impl Default for Mp1EncoderOptions {
+    fn default() -> Self {
+        Self {
+            vbr_quality: None,
+            vbr_target_kbps: None,
+            cbr_bitrate_kbps: None,
+            crc_check: false,
+            joint_stereo: false,
+            js_bound: 8,
+        }
+    }
 }
 
 impl CodecOptionsStruct for Mp1EncoderOptions {
@@ -129,6 +170,18 @@ impl CodecOptionsStruct for Mp1EncoderOptions {
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
             help: "Emit a CRC-16 protection word (clears protection_bit).",
+        },
+        OptionField {
+            name: "joint_stereo",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit joint-stereo (mode=01) for 2-channel input.",
+        },
+        OptionField {
+            name: "js_bound",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(8),
+            help: "Joint-stereo bound: 4, 8, 12, or 16 (default 8).",
         },
     ];
 
@@ -160,6 +213,20 @@ impl CodecOptionsStruct for Mp1EncoderOptions {
             }
             "crc_check" => {
                 self.crc_check = v.as_bool()?;
+            }
+            "joint_stereo" => {
+                self.joint_stereo = v.as_bool()?;
+            }
+            "js_bound" => {
+                let n = v.as_u32()?;
+                match n {
+                    4 | 8 | 12 | 16 => self.js_bound = n as u8,
+                    _ => {
+                        return Err(Error::invalid(format!(
+                            "MP1 encoder: js_bound must be 4/8/12/16, got {n}"
+                        )));
+                    }
+                }
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -213,6 +280,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let vbr_target_kbps = opts.vbr_target_kbps.unwrap_or(bitrate_kbps);
     let crc_check = opts.crc_check;
 
+    // Joint stereo is only meaningful for two channels. Silently fall
+    // back to plain stereo / mono when the option is set on a 1-channel
+    // stream (the mode field would otherwise be inconsistent with the
+    // channel count). `js_bound` maps to the 2-bit `mode_extension`.
+    let joint_stereo = opts.joint_stereo && channels == 2;
+    let (channel_mode, mode_extension, js_bound) = if joint_stereo {
+        let me = match opts.js_bound {
+            4 => 0u8,
+            8 => 1,
+            12 => 2,
+            16 => 3,
+            _ => 1, // unreachable: validated in apply()
+        };
+        (ChannelMode::JointStereo, me, opts.js_bound as usize)
+    } else if channels == 2 {
+        (ChannelMode::Stereo, 0, SBLIMIT)
+    } else {
+        (ChannelMode::SingleChannel, 0, SBLIMIT)
+    };
+
     let sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
     if sample_format != SampleFormat::S16 {
         return Err(Error::unsupported(format!(
@@ -246,6 +333,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         vbr_quality,
         vbr_target_kbps,
         crc_check,
+        channel_mode,
+        mode_extension,
+        js_bound,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         pcm_queue: vec![Vec::new(); channels as usize],
@@ -276,6 +366,13 @@ struct Mp1Encoder {
     /// When true, clear the `protection_bit` and emit a CRC-16 word
     /// after the header (ISO/IEC 11172-3 §2.4.3.1).
     crc_check: bool,
+    /// Header `mode` field: Stereo / JointStereo / SingleChannel.
+    channel_mode: ChannelMode,
+    /// Header `mode_extension` field (joint-stereo bound selector).
+    mode_extension: u8,
+    /// Joint-stereo bound: subbands `[js_bound..32)` are channel-shared.
+    /// Equals `SBLIMIT` (32) for mono and plain stereo (nothing shared).
+    js_bound: usize,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     pcm_queue: Vec<Vec<f32>>,
@@ -379,6 +476,25 @@ impl Mp1Encoder {
             analyze_frame(&mut self.analysis_state[ch], &pcm_in[ch], &mut sub[ch]);
         }
 
+        // --- 1a. Joint-stereo mid-down above the bound ---
+        // For subbands [bound..32) Layer I joint stereo carries a single
+        // shared sample stream (§2.4.1.5 audio_data). We collapse both
+        // channels to the per-sample mid `M = (L + R) / 2` so the shared
+        // quantised level reconstructs `L = R = M` at the decoder (Layer
+        // I has no intensity scaling — §2.4.2.3). Below the bound the
+        // channels stay independent. `js_bound == SBLIMIT` for mono /
+        // plain stereo, so this loop is a no-op there.
+        let bound = self.js_bound.min(SBLIMIT);
+        if n_ch == 2 && bound < SBLIMIT {
+            for sb in bound..SBLIMIT {
+                for i in 0..12 {
+                    let m = 0.5 * (sub[0][sb][i] + sub[1][sb][i]);
+                    sub[0][sb][i] = m;
+                    sub[1][sb][i] = m;
+                }
+            }
+        }
+
         // --- 2. Scalefactor pick: one 6-bit SF index per subband per
         //     channel. Peak over all 12 samples in the subband. ---
         let mut scf_idx = vec![[0u8; 32]; n_ch];
@@ -417,13 +533,17 @@ impl Mp1Encoder {
         // that nudges the per-frame max bits toward `vbr_target_kbps`).
         let header_bits = 32u32;
         let crc_bits = if self.crc_check { 16u32 } else { 0 };
-        let bitalloc_bits = 4u32 * SBLIMIT as u32 * n_ch as u32;
+        // Bit-allocation field: 4 bits per (subband, channel) below the
+        // bound, plus 4 bits per shared subband above it (§2.4.1.5).
+        let bitalloc_bits = 4u32 * (bound as u32 * n_ch as u32 + (SBLIMIT - bound) as u32);
         let fixed_overhead_bits = header_bits + crc_bits + bitalloc_bits;
 
         let (alloc, frame_bytes, padding, frame_br_index) = match self.rate_control {
-            RateControl::Cbr => self.allocate_cbr(n_ch, &energy, &scf_idx, fixed_overhead_bits)?,
+            RateControl::Cbr => {
+                self.allocate_cbr(n_ch, bound, &energy, &scf_idx, fixed_overhead_bits)?
+            }
             RateControl::Vbr => {
-                self.allocate_vbr(n_ch, &sub, &energy, &scf_idx, fixed_overhead_bits)?
+                self.allocate_vbr(n_ch, bound, &sub, &energy, &scf_idx, fixed_overhead_bits)?
             }
         };
 
@@ -445,9 +565,16 @@ impl Mp1Encoder {
         w.write_u32(self.sr_index as u32, 2);
         w.write_u32(if padding { 1 } else { 0 }, 1);
         w.write_u32(0, 1); // private
-        let mode_bits = if n_ch == 1 { 0b11u32 } else { 0b00u32 };
+                           // mode: 00 stereo, 01 joint_stereo, 11 single_channel (§2.4.2.3).
+        let mode_bits = match self.channel_mode {
+            ChannelMode::SingleChannel => 0b11u32,
+            ChannelMode::JointStereo => 0b01,
+            _ => 0b00, // Stereo
+        };
         w.write_u32(mode_bits, 2);
-        w.write_u32(0, 2); // mode_extension
+        // mode_extension carries the joint-stereo bound selector; 0 in
+        // every other mode (§2.4.2.3).
+        w.write_u32(self.mode_extension as u32, 2);
         w.write_u32(0, 1); // copyright
         w.write_u32(0, 1); // original
         w.write_u32(0, 2); // emphasis
@@ -471,11 +598,13 @@ impl Mp1Encoder {
             None
         };
 
-        // --- 5a. Bit allocation (4 bits × subband × channel). Since we
-        //     emit plain (non-joint) modes, every subband is below the
-        //     bound — channel-paired order, same as the decoder reads.
-        //     Each 4-bit element is folded into the CRC in wire order.
-        for sb in 0..SBLIMIT {
+        // --- 5a. Bit allocation (§2.4.1.5 audio_data). Channel-paired
+        //     for subbands [0..bound), then one shared element for each
+        //     subband in [bound..32). For joint stereo the allocator has
+        //     already mirrored alloc[0][sb] into alloc[1][sb] above the
+        //     bound, so we emit alloc[0][sb] there. Each 4-bit element is
+        //     folded into the CRC in wire order.
+        for sb in 0..bound {
             for ch in 0..n_ch {
                 let a = alloc[ch][sb] as u32;
                 if self.crc_check {
@@ -484,24 +613,41 @@ impl Mp1Encoder {
                 w.write_u32(a, 4);
             }
         }
+        for sb in bound..SBLIMIT {
+            let a = alloc[0][sb] as u32;
+            if self.crc_check {
+                crc.push_bits(a, 4);
+            }
+            w.write_u32(a, 4);
+        }
 
         // --- 5b. Scalefactors (6 bits per subband-per-channel with
         //     allocation != 0). Layer I has no SCFSI. Order: by subband,
-        //     then by channel.
+        //     then by channel — and §2.4.1.5 keeps scalefactors PER
+        //     channel even for shared (above-bound) subbands. Above the
+        //     bound both channels carry the same mid signal, so their
+        //     scalefactors are equal, but both are still written.
         for sb in 0..SBLIMIT {
             for ch in 0..n_ch {
-                if alloc[ch][sb] != 0 {
+                let a = if sb < bound {
+                    alloc[ch][sb]
+                } else {
+                    alloc[0][sb]
+                };
+                if a != 0 {
                     w.write_u32(scf_idx[ch][sb] as u32, 6);
                 }
             }
         }
 
-        // --- 5c. Sample payload. 12 blocks, each block visits every
-        //     subband × channel in order. One sample per subband per
-        //     channel per block.
+        // --- 5c. Sample payload. 12 blocks. For each block: one sample
+        //     per (subband, channel) below the bound, then one shared
+        //     sample per subband above it (§2.4.1.5). The shared sample
+        //     is the mid signal stored in channel 0; the decoder applies
+        //     each channel's own scalefactor to it.
         let sc = scale_table();
         for block in 0..BLOCKS_PER_FRAME {
-            for sb in 0..SBLIMIT {
+            for sb in 0..bound {
                 for ch in 0..n_ch {
                     let a = alloc[ch][sb];
                     if a == 0 {
@@ -512,6 +658,18 @@ impl Mp1Encoder {
                     let raw = quantise_sample(sub[ch][sb][block], sf_mag, nb);
                     w.write_u32(raw, nb as u32);
                 }
+            }
+            for sb in bound..SBLIMIT {
+                let a = alloc[0][sb];
+                if a == 0 {
+                    continue;
+                }
+                let nb = bits_per_sample(a).unwrap();
+                // Quantise the shared mid sample against channel 0's
+                // scalefactor; the decoder rescales per channel.
+                let sf_mag = sc[scf_idx[0][sb] as usize];
+                let raw = quantise_sample(sub[0][sb][block], sf_mag, nb);
+                w.write_u32(raw, nb as u32);
             }
         }
 
@@ -562,6 +720,7 @@ impl Mp1Encoder {
     fn allocate_cbr(
         &mut self,
         n_ch: usize,
+        bound: usize,
         energy: &[[f32; 32]],
         scf_idx: &[[u8; 32]],
         fixed_overhead_bits: u32,
@@ -575,7 +734,7 @@ impl Mp1Encoder {
             return Err(Error::other("MP1 encoder: frame too small for header"));
         }
 
-        let alloc = greedy_energy_allocator(n_ch, energy, scf_idx, sample_and_scf_budget);
+        let alloc = greedy_energy_allocator(n_ch, bound, energy, scf_idx, sample_and_scf_budget);
         Ok((alloc, frame_bytes, padding, self.br_index))
     }
 
@@ -605,6 +764,7 @@ impl Mp1Encoder {
     fn allocate_vbr(
         &mut self,
         n_ch: usize,
+        bound: usize,
         sub: &[[[f32; 12]; 32]],
         energy: &[[f32; 32]],
         scf_idx: &[[u8; 32]],
@@ -641,6 +801,12 @@ impl Mp1Encoder {
 
             for ch in 0..n_ch {
                 for sb in 0..SBLIMIT {
+                    // Above the bound the two channels share one stream;
+                    // only channel 0 is a candidate (its upgrade is
+                    // mirrored to channel 1 below). See `upgrade_cost`.
+                    if sb >= bound && ch != 0 {
+                        continue;
+                    }
                     let cur = alloc[ch][sb];
                     if cur >= 14 {
                         continue;
@@ -655,7 +821,7 @@ impl Mp1Encoder {
                         continue;
                     }
                     let next = cur + 1;
-                    let cost = upgrade_cost_bits(cur, next);
+                    let cost = upgrade_cost_bits_bound(cur, next, sb, bound, n_ch);
                     if (bits_used + cost as i64) > max_frame_bits {
                         continue;
                     }
@@ -673,6 +839,9 @@ impl Mp1Encoder {
             match best {
                 Some((ch, sb, next, cost)) => {
                     alloc[ch][sb] = next;
+                    if sb >= bound {
+                        alloc[1.min(n_ch - 1)][sb] = next;
+                    }
                     bits_used += cost as i64;
                 }
                 None => break,
@@ -705,6 +874,10 @@ impl Mp1Encoder {
 
             for ch in 0..n_ch {
                 for sb in 0..SBLIMIT {
+                    // Shared subbands: channel 0 is the sole candidate.
+                    if sb >= bound && ch != 0 {
+                        continue;
+                    }
                     let cur = alloc[ch][sb];
                     if cur >= 14 {
                         continue;
@@ -713,7 +886,7 @@ impl Mp1Encoder {
                         continue;
                     }
                     let next = cur + 1;
-                    let cost = upgrade_cost_bits(cur, next);
+                    let cost = upgrade_cost_bits_bound(cur, next, sb, bound, n_ch);
                     if (bits_used + cost as i64) > phase2_cap {
                         continue;
                     }
@@ -734,6 +907,9 @@ impl Mp1Encoder {
             match best {
                 Some((ch, sb, next, cost)) => {
                     alloc[ch][sb] = next;
+                    if sb >= bound {
+                        alloc[1.min(n_ch - 1)][sb] = next;
+                    }
                     bits_used += cost as i64;
                 }
                 None => break,
@@ -824,8 +1000,16 @@ fn pick_vbr_layer1_slot(sample_rate: u32, needed_bits: usize) -> (u8, u32) {
 /// the highest energy-per-bit ratio until no upgrade fits in
 /// `budget_bits`. Skips bands more than 80 dB below the loudest band
 /// (cheap proxy for "no signal here").
+///
+/// `bound` is the joint-stereo bound: for subbands `[bound..32)` the two
+/// channels share one allocation + sample stream (Layer I §2.4.1.5), so
+/// only channel 0 is a candidate there and its grant is mirrored into
+/// channel 1; the cost (one sample stream, two scalefactors) is counted
+/// via [`upgrade_cost_bits_bound`]. `bound == SBLIMIT` for mono / plain
+/// stereo, which reduces this to the original per-channel walk.
 fn greedy_energy_allocator(
     n_ch: usize,
+    bound: usize,
     energy: &[[f32; 32]],
     _scf_idx: &[[u8; 32]],
     budget_bits: i64,
@@ -845,6 +1029,10 @@ fn greedy_energy_allocator(
 
         for ch in 0..n_ch {
             for sb in 0..SBLIMIT {
+                // Shared subbands: channel 0 is the sole candidate.
+                if sb >= bound && ch != 0 {
+                    continue;
+                }
                 let cur = alloc[ch][sb];
                 if cur >= 14 {
                     continue;
@@ -853,7 +1041,7 @@ fn greedy_energy_allocator(
                     continue;
                 }
                 let next = cur + 1;
-                let cost = upgrade_cost_bits(cur, next);
+                let cost = upgrade_cost_bits_bound(cur, next, sb, bound, n_ch);
                 let score = energy[ch][sb] / (cost as f32).max(1.0);
                 if score > best_score && cost as i64 <= remaining {
                     best_score = score;
@@ -865,6 +1053,9 @@ fn greedy_energy_allocator(
         match best {
             Some((ch, sb, next, cost)) => {
                 alloc[ch][sb] = next;
+                if sb >= bound {
+                    alloc[1.min(n_ch - 1)][sb] = next;
+                }
                 remaining -= cost;
             }
             None => break,
@@ -915,6 +1106,30 @@ fn upgrade_cost_bits(cur: u8, next: u8) -> u32 {
     }
 }
 
+/// Bound-aware variant of [`upgrade_cost_bits`]. For a subband below the
+/// joint-stereo `bound` (or in mono / plain stereo where `bound ==
+/// SBLIMIT`) the cost is identical to [`upgrade_cost_bits`]: one sample
+/// stream and one scalefactor. For a subband at or above the bound the
+/// two channels share a single quantised sample stream but still carry
+/// *one scalefactor each* (§2.4.1.5), so the 0 → non-zero transition
+/// pays `n_ch` scalefactors (12 bits for stereo) on top of the 12 shared
+/// sample slots; subsequent upgrades pay only the 12 shared sample-slot
+/// deltas.
+fn upgrade_cost_bits_bound(cur: u8, next: u8, sb: usize, bound: usize, n_ch: usize) -> u32 {
+    debug_assert!(next > cur);
+    if sb < bound {
+        return upgrade_cost_bits(cur, next);
+    }
+    let cur_nb = if cur == 0 { 0 } else { cur as u32 + 1 };
+    let next_nb = next as u32 + 1;
+    let sample_delta = 12 * (next_nb - cur_nb); // one shared stream
+    if cur == 0 {
+        sample_delta + 6 * n_ch as u32 // one scalefactor per channel
+    } else {
+        sample_delta
+    }
+}
+
 /// Quantise a normalised subband sample `s` (in [-1, 1]) for a subband
 /// with scalefactor magnitude `sf_mag` and Layer I allocation `nb` bits.
 ///
@@ -942,6 +1157,30 @@ mod tests {
         assert_eq!(bitrate_to_index(192), Some(6));
         assert_eq!(bitrate_to_index(448), Some(14));
         assert_eq!(bitrate_to_index(999), None);
+    }
+
+    #[test]
+    fn bound_aware_upgrade_cost() {
+        // Below the bound (or mono / plain stereo), the cost matches the
+        // per-channel formula: 12 sample slots + one 6-bit SF on the
+        // 0 → non-zero transition.
+        assert_eq!(
+            upgrade_cost_bits_bound(0, 1, 0, 32, 2),
+            upgrade_cost_bits(0, 1)
+        );
+        assert_eq!(
+            upgrade_cost_bits_bound(3, 4, 0, 8, 2),
+            upgrade_cost_bits(3, 4)
+        );
+        // Above the bound, the 0 → non-zero transition pays one
+        // scalefactor PER channel (12 bits stereo) on top of the single
+        // shared 12-sample stream (alloc 0→1 ⇒ nb 0→2 ⇒ 24 sample bits).
+        assert_eq!(upgrade_cost_bits_bound(0, 1, 16, 8, 2), 12 * 2 + 6 * 2);
+        // A subsequent upgrade above the bound pays only the shared
+        // sample-slot delta (nb 2→3 ⇒ 12 bits), no extra scalefactors.
+        assert_eq!(upgrade_cost_bits_bound(1, 2, 16, 8, 2), 12);
+        // Mono above-bound is a degenerate case (n_ch = 1): one SF.
+        assert_eq!(upgrade_cost_bits_bound(0, 1, 16, 8, 1), 12 * 2 + 6);
     }
 
     #[test]
