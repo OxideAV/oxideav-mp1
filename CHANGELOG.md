@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Clean-room MPEG-1 Audio **Layer I** frame-header foundation, derived
+  solely from ISO/IEC 11172-3 (1993):
+  - `header::FrameHeader` typed struct with all thirteen §2.4.1.3 /
+    §2.4.2.3 header fields, and `FrameHeader::parse` for the 32-bit
+    big-endian header word (syncword check, Layer I selector,
+    forbidden / reserved value rejection, free-format recognition).
+  - The §2.4.2.3 Layer I `bitrate_index` ladder and
+    `sampling_frequency` table, read only from the standard.
+  - `header::find_sync` frame synchronization (§2.4.3.1) and
+    `FrameHeader::frame_length_bytes` / `slot_count` frame-length
+    computation (§2.4.2.1 / §2.4.2.3 / §2.4.3.1).
+  - Structural wiring for the optional 16-bit CRC `error_check()`
+    (§2.4.1.4): `FrameHeader::has_crc` / `read_crc` and `CrcStatus`.
+    CRC *verification* is deferred — see "Spec gaps" in the README.
+  - 22 unit tests built from locally-constructed header bytes.
+
 ### Erased
 
 - Prior master history was force-erased on **2026-05-24** under
