@@ -11,22 +11,35 @@
 //! MPEG-1 audio standard, with every numeric table read only from the
 //! standard.
 //!
-//! This first foundation layer implements the MPEG-1 Audio **Layer I**
-//! frame header (§2.4.1.3 / §2.4.2.3), frame sync and frame-length
+//! This foundation implements the MPEG-1 Audio **Layer I** frame
+//! header (§2.4.1.3 / §2.4.2.3), frame sync and frame-length
 //! computation (§2.4.2.1 / §2.4.3.1), and the structural wiring for the
-//! optional 16-bit CRC `error_check()` (§2.4.1.4). See [`header`].
+//! optional 16-bit CRC `error_check()` (§2.4.1.4) — see [`header`] —
+//! and the Layer I **audio-data decode** up to requantized subband
+//! samples (§2.4.1.5 / §2.4.2.5 / §2.4.3.2) — see [`decode`].
 //!
-//! The audio-data decode (bit allocation, scalefactors, subband
-//! synthesis — §2.4.2.5 / §2.4.3.2) is **not** implemented yet, so the
-//! crate registers no [`Decoder`](oxideav_core::Decoder) into the
-//! runtime context. [`register`] is a no-op until a decoder is wired.
+//! [`decode::decode_audio_data`] reads the per-subband 4-bit bit
+//! allocation, the 6-bit scalefactor indices, and the per-sample
+//! requantization, producing the 32 × 12 requantized subband samples
+//! per channel for one frame (mono, stereo, dual-channel, and
+//! joint-stereo upper-band sharing). The final rescale by the
+//! Annex B Table 3-B.1 scalefactor multiplier and the polyphase
+//! synthesis filterbank are **not** implemented yet (see the README
+//! "Spec gaps" note for why Table 3-B.1 is unavailable), so the crate
+//! registers no [`Decoder`](oxideav_core::Decoder) into the runtime
+//! context. [`register`] is a no-op until a decoder is wired.
 
 #![warn(missing_debug_implementations)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod decode;
 pub mod header;
 
+pub use decode::{
+    allocation_bits, decode_audio_data, requantize, BitReader, DecodeError, Subband,
+    SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS,
+};
 pub use header::{
     find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader, HeaderError, Id, Mode, ModeExtension,
 };

@@ -19,8 +19,9 @@ the MPEG-1 audio standard.
 
 ## What works today
 
-The first foundation layer parses the MPEG-1 Audio **Layer I** frame
-header and computes frame geometry, all from ISO/IEC 11172-3:
+The crate parses the MPEG-1 Audio **Layer I** frame header, computes
+frame geometry, and decodes the Layer I audio data up to requantized
+subband samples — all from ISO/IEC 11172-3:
 
 - **32-bit frame header** (§2.4.1.3 / §2.4.2.3): all thirteen fields —
   syncword, `ID`, `layer`, `protection_bit`, `bitrate_index`,
@@ -39,37 +40,64 @@ header and computes frame geometry, all from ISO/IEC 11172-3:
 - **CRC `error_check()` wiring** (§2.4.1.4): `protection_bit` drives
   whether a 16-bit CRC word follows the header; `read_crc` returns it
   as a `PresentUnverified` value (see "Spec gaps").
+- **Layer I audio-data decode** (§2.4.1.5 / §2.4.2.5 / §2.4.3.2):
+  `decode::decode_audio_data` reads the per-subband 4-bit bit
+  allocation (mapped to 0/2..15 bits/sample via the §2.4.2.5 table,
+  rejecting the invalid `0b1111`), the 6-bit scalefactor index per
+  allocated subband, and the per-sample requantization (read `nb`
+  bits, invert the MSB, treat as a two's-complement fraction, apply
+  the §2.4.3.2 linear formula). It produces the **32 × 12 requantized
+  subband samples** per channel ([`SubbandSamples`]) for mono,
+  stereo, dual-channel, and joint-stereo — the joint-stereo upper
+  band `[bound, 32)` shares one allocation and one sample stream that
+  is copied to both channels (intensity_stereo).
 
-22 unit tests cover the whole bitrate ladder, every sampling rate,
+38 unit tests cover the whole bitrate ladder, every sampling rate,
 every mode / mode_extension / emphasis code, both padding cases at
-44.1 kHz, sync recovery, and the CRC-presence paths. Test bytes are
-constructed locally from the §2.4.1.3 field layout — no external
-fixtures.
+44.1 kHz, sync recovery, the CRC-presence paths, the §2.4.2.5
+allocation→bits table, the MSB-first bit reader, the §2.4.3.2
+requantization formula at several widths, and mono / stereo /
+joint-stereo audio-data decode. Test bytes are constructed locally
+from the §2.4.1 field layouts — no external fixtures.
 
 ## Not yet implemented
 
-Audio-data decode (bit allocation, scalefactors, requantization,
-subband synthesis — §2.4.2.5 / §2.4.3.2) is **not** wired up, so the
-crate registers no decoder into the runtime context yet. `register` is
-a no-op until a `Decoder` lands in a later round.
+- The **final rescale by the Annex B Table 3-B.1 scalefactor
+  multiplier** (see "Spec gaps") — the decode stops at the §2.4.3.2
+  requantized value `s''` and stores the raw 6-bit scalefactor index.
+- The **polyphase synthesis filterbank** (§2.4.3.2 "Synthesis subband
+  filter", with the Annex B Table 3-B.3 window coefficients), which
+  turns the 32 × 12 subband samples into 384 PCM samples.
+
+Because the decode does not yet reach PCM, the crate registers no
+decoder into the runtime context. `register` is a no-op until a
+`Decoder` lands in a later round.
 
 ## Spec gaps (DOCS-GAP)
 
-In the staged `ISO_IEC_11172-3-MP3-1993.pdf`, two §2.4.3.1 display
-equations are rendered as missing glyphs and could not be read:
+The staged `ISO_IEC_11172-3-MP3-1993.pdf` is **missing its normative
+Tables annex** and several display equations:
 
-1. The **CRC-16 generator polynomial** `G(X)`, plus Annex B
-   Table 3-B.5 (the set of header/side-info bits fed into the check)
-   and Annex A Figure 3-A.9 (the shift-register diagram). The CRC is
-   therefore wired structurally (presence/absence from `protection_bit`,
-   the stored word read MSB-first) but **not yet verified**. The
-   polynomial must be supplied from the spec before verification can be
-   implemented clean-room.
-2. The display form of the Layer I frame-length equation. Its content
-   was recoverable from the §2.4.2.3 padding-method prose
-   (`dif = (12 · bitrate) % sampling_frequency`) plus the §2.4.2.1 slot
-   definition, so frame-length computation is complete despite the
-   blank display line.
+1. **3-Annex B (normative) Tables is absent.** The 46-page document
+   body ends mid-§2.4.3.4 with no Annex pages; every "3-Annex B"
+   reference is a cross-reference, never the table itself. In
+   particular **Table 3-B.1 "LAYER I, II SCALEFACTORS"** (the 64-entry
+   scalefactor multiplier table) and Table 3-B.3 (synthesis-window
+   coefficients) cannot be read. The audio-data decode therefore
+   stores the 6-bit scalefactor *index* and exposes the requantized
+   `s''`; the final `s' = s'' · scalefactor[index]` rescale and the
+   synthesis filterbank are blocked until Annex B is staged.
+2. The **§2.4.3.2 requantization linear formula** and the rescale
+   formula are rendered as blank image regions in the PDF. The
+   requantization formula
+   `s'' = (2^nb / (2^nb − 1)) · (s''' + 2^(−nb+1))` was supplied in
+   the round brief and is corroborated by the §2.4.3.2 prose
+   (invert MSB → two's-complement fraction → linear formula).
+3. The **CRC-16 generator polynomial** `G(X)`, plus Annex B
+   Table 3-B.5 and Annex A Figure 3-A.9 — CRC remains wired
+   structurally but unverified (carried over from the header round).
+4. The display form of the Layer I frame-length equation, recovered
+   from the §2.4.2.3 padding-method prose.
 
 ## License
 

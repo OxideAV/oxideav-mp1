@@ -22,7 +22,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   - Structural wiring for the optional 16-bit CRC `error_check()`
     (§2.4.1.4): `FrameHeader::has_crc` / `read_crc` and `CrcStatus`.
     CRC *verification* is deferred — see "Spec gaps" in the README.
-  - 22 unit tests built from locally-constructed header bytes.
+  - Layer I **audio-data decode** up to requantized subband samples
+    (§2.4.1.5 / §2.4.2.5 / §2.4.3.2) in the new `decode` module:
+    `decode_audio_data` reads the per-subband 4-bit bit allocation
+    (`allocation_bits` maps it to 0/2..15 bits/sample, rejecting the
+    invalid `0b1111`), the 6-bit scalefactor index per allocated
+    subband, and the per-sample `requantize` (read `nb` bits, invert
+    the MSB, two's-complement fraction, §2.4.3.2 linear formula). It
+    produces the 32 × 12 requantized subband samples per channel
+    (`SubbandSamples` / `Subband`) for mono, stereo, dual-channel,
+    and joint-stereo (upper-band intensity_stereo sharing). A
+    MSB-first `BitReader` and a `DecodeError` type are also added.
+    The final rescale by the Annex B Table 3-B.1 scalefactor
+    multiplier is deferred — that table is absent from the staged
+    ISO PDF (see "Spec gaps" in the README).
+  - 16 further unit tests (38 total) built from locally-constructed
+    bitstream bytes — allocation table, bit reader, requantization
+    at several widths, and mono / stereo / joint-stereo decode.
 
 ### Erased
 
