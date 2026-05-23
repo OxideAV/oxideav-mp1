@@ -32,9 +32,9 @@ pub use header::{
 };
 
 /// Crate-local error type. Header parsing has its own
-/// [`HeaderError`](header::HeaderError); this variant covers the parts
-/// of the codec (audio-data decode, encode) that the clean-room rebuild
-/// has not reached yet.
+/// [`HeaderError`]; this variant covers the parts of the codec
+/// (audio-data decode, encode) that the clean-room rebuild has not
+/// reached yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The requested decode/encode path is not wired up yet; only the
