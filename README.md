@@ -92,6 +92,17 @@ params.options = CodecOptions::new()
     .set("js_bound", "8");                   // bound 8 → mode_extension 1
 ```
 
+Dual-channel mode (`mode = 10`, §2.4.2.3) is opt-in for stereo input.
+It is wire-equivalent to plain stereo (each channel coded independently
+for all 32 subbands); only the 2-bit `mode` header field changes from
+`00` to `10`. Use it to signal two independent programs (e.g.
+dual-language audio) rather than a stereo pair. `joint_stereo` wins
+if both flags are set.
+
+```rust
+params.options = CodecOptions::new().set("dual_channel", "true");
+```
+
 ### Supported features
 
 Decoder:
@@ -117,16 +128,20 @@ Encoder (CBR + VBR):
 - Sample rates: 32 000, 44 100, 48 000 Hz.
 - Bitrates: every Layer I rate from 32 to 448 kbit/s (the 14 values
   above).
-- Channel modes: mono (single-channel), plain stereo, or joint stereo
-  (`joint_stereo` option). Joint stereo shares the upper subbands
-  `[bound..32)` as one allocation + one quantised sample stream (the
-  per-sample mid `M = (L + R) / 2`) with a per-channel scalefactor, so
-  the decoder reconstructs `L = R = M` above the bound; `js_bound`
-  picks 4/8/12/16 (`mode_extension` 0/1/2/3, §2.4.2.3). Layer I has no
-  intensity scaling, so this M/S-style mid sharing is the full extent
-  of Layer I joint stereo. ffmpeg's MPEG-audio decoder accepts our
-  joint-stereo streams and recovers the tone cleanly. No dual-channel
-  output.
+- Channel modes: mono (single-channel), plain stereo, joint stereo
+  (`joint_stereo` option), or dual-channel (`dual_channel` option).
+  Joint stereo shares the upper subbands `[bound..32)` as one
+  allocation + one quantised sample stream (the per-sample mid
+  `M = (L + R) / 2`) with a per-channel scalefactor, so the decoder
+  reconstructs `L = R = M` above the bound; `js_bound` picks 4/8/12/16
+  (`mode_extension` 0/1/2/3, §2.4.2.3). Layer I has no intensity
+  scaling, so this M/S-style mid sharing is the full extent of Layer I
+  joint stereo. Dual-channel emits `mode = 10` and is wire-equivalent
+  to plain stereo (each channel coded independently for all 32
+  subbands); it signals two independent programs (e.g. dual-language
+  audio) rather than a stereo pair. ffmpeg's MPEG-audio decoder
+  accepts both our joint-stereo and dual-channel streams and recovers
+  per-channel tones cleanly.
 - Optional CRC-16 protection (§2.4.3.1). Off by default
   (`protection_bit = 1`); set the `crc_check` option to clear the
   protection bit and insert the 16-bit CRC word after the header

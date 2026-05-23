@@ -38,12 +38,23 @@
 //!   This saves the upper-subband allocation + sample bits, which the
 //!   allocator redistributes to the loudest below-bound bands.
 //!
+//! # Dual-channel (`dual_channel` option)
+//! - For two-channel input, when `dual_channel` is set (and joint
+//!   stereo is not) the encoder sets `mode = 10` (dual_channel) per
+//!   §2.4.2.3. The wire layout is identical to plain stereo: each
+//!   subband carries its own per-channel allocation, scalefactor, and
+//!   12 quantised samples — only the 2-bit `mode` field changes
+//!   (`00` → `10`). The semantic difference is downstream: the two
+//!   channels represent independent programs (e.g. two languages)
+//!   rather than a stereo pair. The bound is `SBLIMIT = 32` (no
+//!   sharing), so the M/S mid collapse in [`Self::encode_one_frame`]
+//!   is a no-op.
+//!
 //! # What is NOT implemented
 //! - No full ISO §C.1 psychoacoustic model (no FFT-based tonality
 //!   detector, no Bark spreading function, no full ATH table).
 //! - No intensity-stereo scaling (Layer I has none — §2.4.2.3).
 //! - No free-format output.
-//! - No dual-channel output.
 //!
 //! CRC-16 protection (§2.4.3.1) is emitted on request via the
 //! `crc_check` option; see [`crate::crc`].
@@ -116,6 +127,14 @@ pub enum RateControl {
 ///   `bound`: subbands `[bound..32)` are shared. Maps to the
 ///   `mode_extension` field (4→0, 8→1, 12→2, 16→3). Only consulted
 ///   when `joint_stereo` is set. Defaults to 8 (`mode_extension = 1`).
+/// - `dual_channel` — `bool`. Only meaningful for 2-channel input and
+///   only when `joint_stereo` is *not* set. When `true`, the encoder
+///   emits `mode = 10` (dual_channel) per §2.4.2.3. The wire layout is
+///   identical to plain stereo (same per-channel allocations,
+///   scalefactors, and samples for all 32 subbands); only the 2-bit
+///   `mode` field changes from `00` to `10`. The semantic difference
+///   is downstream — the channels represent two independent programs
+///   rather than a stereo pair.
 #[derive(Debug, Clone)]
 pub struct Mp1EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
@@ -130,6 +149,9 @@ pub struct Mp1EncoderOptions {
     pub joint_stereo: bool,
     /// Joint-stereo bound (4 / 8 / 12 / 16). Only when `joint_stereo`.
     pub js_bound: u8,
+    /// Emit dual-channel (`mode = 10`) for 2-channel input. Ignored
+    /// when `joint_stereo` is set (joint_stereo wins).
+    pub dual_channel: bool,
 }
 
 impl Default for Mp1EncoderOptions {
@@ -141,6 +163,7 @@ impl Default for Mp1EncoderOptions {
             crc_check: false,
             joint_stereo: false,
             js_bound: 8,
+            dual_channel: false,
         }
     }
 }
@@ -182,6 +205,13 @@ impl CodecOptionsStruct for Mp1EncoderOptions {
             kind: OptionKind::U32,
             default: OptionValue::U32(8),
             help: "Joint-stereo bound: 4, 8, 12, or 16 (default 8).",
+        },
+        OptionField {
+            name: "dual_channel",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit dual-channel (mode=10) for 2-channel input. \
+                   Ignored if joint_stereo is also set.",
         },
     ];
 
@@ -227,6 +257,9 @@ impl CodecOptionsStruct for Mp1EncoderOptions {
                         )));
                     }
                 }
+            }
+            "dual_channel" => {
+                self.dual_channel = v.as_bool()?;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -284,7 +317,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // back to plain stereo / mono when the option is set on a 1-channel
     // stream (the mode field would otherwise be inconsistent with the
     // channel count). `js_bound` maps to the 2-bit `mode_extension`.
+    //
+    // Dual-channel is also only meaningful for two channels; joint
+    // stereo wins if both flags are set (since joint stereo materially
+    // changes the bit allocation, while dual-channel only relabels the
+    // 2-bit mode field). See §2.4.2.3.
     let joint_stereo = opts.joint_stereo && channels == 2;
+    let dual_channel = !joint_stereo && opts.dual_channel && channels == 2;
     let (channel_mode, mode_extension, js_bound) = if joint_stereo {
         let me = match opts.js_bound {
             4 => 0u8,
@@ -294,6 +333,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             _ => 1, // unreachable: validated in apply()
         };
         (ChannelMode::JointStereo, me, opts.js_bound as usize)
+    } else if dual_channel {
+        // Wire layout identical to plain stereo (bound = SBLIMIT, no
+        // sharing); the mode-field branch below emits 0b10. §2.4.2.3.
+        (ChannelMode::DualChannel, 0, SBLIMIT)
     } else if channels == 2 {
         (ChannelMode::Stereo, 0, SBLIMIT)
     } else {
@@ -565,11 +608,13 @@ impl Mp1Encoder {
         w.write_u32(self.sr_index as u32, 2);
         w.write_u32(if padding { 1 } else { 0 }, 1);
         w.write_u32(0, 1); // private
-                           // mode: 00 stereo, 01 joint_stereo, 11 single_channel (§2.4.2.3).
+                           // mode (§2.4.2.3): 00=stereo, 01=joint_stereo,
+                           // 10=dual_channel, 11=single_channel.
         let mode_bits = match self.channel_mode {
             ChannelMode::SingleChannel => 0b11u32,
             ChannelMode::JointStereo => 0b01,
-            _ => 0b00, // Stereo
+            ChannelMode::DualChannel => 0b10,
+            ChannelMode::Stereo => 0b00,
         };
         w.write_u32(mode_bits, 2);
         // mode_extension carries the joint-stereo bound selector; 0 in

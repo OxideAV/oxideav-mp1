@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dual-channel encode (ISO/IEC 11172-3 §2.4.2.3, `mode = 10`). New
+  `dual_channel` (bool) encoder option, gated on `channels == 2` and
+  ignored when `joint_stereo` is also set (joint wins, since it
+  materially changes the bit allocation while dual-channel only
+  relabels the 2-bit `mode` field). The wire layout is identical to
+  plain stereo — per-channel allocation, scalefactor, and 12-sample
+  payload across all 32 subbands — so the encoder reuses the existing
+  CBR/VBR allocators unchanged and emits the same byte count at the
+  same CBR slot. The semantic difference is downstream: the two
+  channels represent independent programs (e.g. two languages) rather
+  than a stereo pair. Validated black-box: ffmpeg's MPEG-audio decoder
+  accepts our `mode = 10` streams and recovers each program's tone
+  cleanly; the self-roundtrip preserves channel separation (`>= 15 dB`
+  inter-channel SNR delta on uncorrelated tones).
 - Joint-stereo encode (ISO/IEC 11172-3 §2.4.2.3 / §2.4.1.5). New
   `joint_stereo` (bool) and `js_bound` (4 / 8 / 12 / 16) encoder
   options. When enabled on a stereo input the encoder emits
