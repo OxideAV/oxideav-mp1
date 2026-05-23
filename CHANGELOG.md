@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-mp1/compare/v0.0.6...v0.0.7) - 2026-05-23
+
+### Other
+
+- dual-channel mode (mode=10, §2.4.2.3)
+- joint-stereo encode (§2.4.2.3 / §2.4.1.5)
+- CRC-16 protection (§2.4.3.1) on encode + decode
+
 ### Added
 
 - Dual-channel encode (ISO/IEC 11172-3 §2.4.2.3, `mode = 10`). New
