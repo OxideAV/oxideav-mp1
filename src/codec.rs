@@ -6,8 +6,10 @@
 //!
 //! 1. [`FrameHeader::parse`](crate::header::FrameHeader::parse) — the
 //!    §2.4.1.3 32-bit header, plus the optional CRC word (§2.4.1.4),
-//!    skipped (read-but-unverified — the CRC polynomial is a known
-//!    spec gap).
+//!    verified via
+//!    [`FrameHeader::verify_crc`](crate::header::FrameHeader::verify_crc)
+//!    against the §2.4.3.1 polynomial; a mismatch mutes the frame
+//!    (§2.4.3.1 concealment).
 //! 2. [`decode_audio_data`] — the §2.4.1.5 / §2.4.3.2 bit-allocation,
 //!    scalefactor and sample requantization, producing 32 × 12
 //!    requantized subband samples per channel.
@@ -28,7 +30,7 @@ use oxideav_core::{
 
 use crate::decode::{decode_audio_data, SAMPLES_PER_SUBBAND, SUBBANDS};
 use crate::encode::{EncodeParams, Mp1FrameEncoder};
-use crate::header::{find_sync, Bitrate, FrameHeader, Mode};
+use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Mode};
 use crate::synthesis::{to_s16, SynthesisFilter};
 
 /// The canonical codec id for MPEG-1 Audio Layer I.
@@ -91,6 +93,29 @@ impl Mp1Decoder {
         }
         let audio = &frame[audio_start..];
 
+        // §2.4.3.1 error_check(): when the frame is CRC-protected,
+        // verify the stored word over header bits 16…31 + the
+        // bit-allocation field (Table 3-B.5). On a mismatch §2.4.3.1
+        // recommends concealment ("muting of the actual frame or
+        // repetition of the previous frame"); we mute — emit a silent
+        // PCM frame of the right shape — and advance the filterbank
+        // history with zeros so the overlap-add stays continuous.
+        if header.has_crc() {
+            match header.verify_crc(&frame[..4], &frame[4..]) {
+                Some(CrcStatus::Mismatch { .. }) => {
+                    return Ok(self.conceal_muted_frame(nch));
+                }
+                // Ok / Absent: proceed. None means the slice was too
+                // short for the protected field — treat as truncated.
+                None => {
+                    return Err(Error::invalid(
+                        "oxideav-mp1: packet too short for CRC-protected field",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         let subbands = decode_audio_data(&header, audio)
             .map_err(|e| Error::invalid(format!("oxideav-mp1: audio_data: {e}")))?;
 
@@ -123,6 +148,38 @@ impl Mp1Decoder {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         Ok((bytes, total_samples as u32, nch))
+    }
+
+    /// Build a concealment frame for a CRC failure (§2.4.3.1: "muting
+    /// of the actual frame").
+    ///
+    /// Returns `(pcm_bytes, samples_per_channel, channels)` like
+    /// [`decode_frame`](Self::decode_frame). Zero subband samples are
+    /// pushed through each channel's synthesis bank so the overlap-add
+    /// `V` history advances continuously (the previous frame's filter
+    /// tail rings out rather than being cut), giving the standard's
+    /// "mute" behaviour without a discontinuity click.
+    fn conceal_muted_frame(&mut self, nch: usize) -> (Vec<u8>, u32, usize) {
+        while self.filters.len() < nch {
+            self.filters.push(SynthesisFilter::new());
+        }
+        let total_samples = SAMPLES_PER_SUBBAND * 32; // 384 per channel
+        let mut pcm = vec![0i16; total_samples * nch];
+        let zeros = [0.0f64; SUBBANDS];
+        for slot in 0..SAMPLES_PER_SUBBAND {
+            for ch in 0..nch {
+                let out = self.filters[ch].synthesize(&zeros);
+                for (j, &v) in out.iter().enumerate() {
+                    let frame_sample = slot * 32 + j;
+                    pcm[frame_sample * nch + ch] = to_s16(v);
+                }
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        (bytes, total_samples as u32, nch)
     }
 }
 
@@ -603,6 +660,130 @@ mod tests {
             panic!("audio");
         };
         assert_eq!(a.samples, 0);
+    }
+
+    /// Build a CRC-protected (protection_bit == 0) mono Layer I frame:
+    /// header, then the two CRC bytes, then audio data that allocates
+    /// subband 0 (nb=4) with the given scalefactor and 12 sample codes.
+    /// When `corrupt_crc` is set the stored CRC word is deliberately
+    /// wrong so the decoder's §2.4.3.1 concealment path fires.
+    fn build_protected_mono_frame(
+        scf_index: u32,
+        sample_codes: &[u32; 12],
+        corrupt_crc: bool,
+    ) -> Vec<u8> {
+        // protection = 0 -> CRC present (bit 16 cleared vs build_mono).
+        let word: u32 = (0xFFF << 20)
+            | (1 << 19)        // ID = MPEG
+            | (0b11 << 17)     // layer I
+            // protection bit (16) = 0 -> CRC present
+            | (0b1000 << 12)   // bitrate index (256 kbit/s)
+            | (0b01 << 10)     // 48 kHz
+            | (0b11 << 6)      // single_channel
+            | (1 << 2); // original
+        let header = word.to_be_bytes();
+
+        // Build the audio-data bytes (the bit-allocation field is the
+        // CRC-protected part).
+        let mut bw = BitWriter::new();
+        bw.put(0b0011, 4); // sb0 nb=4
+        for _ in 1..32 {
+            bw.put(0b0000, 4);
+        }
+        bw.put(scf_index, 6);
+        for &c in sample_codes {
+            bw.put(c, 4);
+        }
+        let audio = bw.finish();
+
+        // Compute the §2.4.3.1 CRC over header bits 16..31 + the
+        // allocation field via the public encoder-side helper.
+        let h = FrameHeader::parse(&header).unwrap();
+        let mut crc = h.compute_crc(&header, &audio).unwrap();
+        if corrupt_crc {
+            crc ^= 0xFFFF;
+        }
+
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&crc.to_be_bytes());
+        frame.extend_from_slice(&audio);
+        frame
+    }
+
+    #[test]
+    fn crc_protected_frame_decodes_audio_on_match() {
+        // A correctly-CRC'd protected frame decodes its audio (loud
+        // input -> non-silent output once the filter ramps).
+        let codes = [15u32; 12];
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut dec = make_decoder(&params).unwrap();
+        let mut saw_nonzero = false;
+        for _ in 0..4 {
+            let frame = build_protected_mono_frame(0, &codes, false);
+            // Confirm we really built a protected frame.
+            let h = FrameHeader::parse(&frame).unwrap();
+            assert!(h.has_crc());
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            assert_eq!(a.samples, 384);
+            if a.data[0].iter().any(|&b| b != 0) {
+                saw_nonzero = true;
+            }
+        }
+        assert!(saw_nonzero, "valid CRC frame produced only silence");
+    }
+
+    #[test]
+    fn crc_mismatch_is_concealed_as_mute() {
+        // A frame whose stored CRC is wrong must be muted (§2.4.3.1
+        // concealment): the decoder emits a correctly-shaped frame, and
+        // a sequence of corrupt frames with no prior history must be
+        // exact silence (the filter rings out zeros).
+        let codes = [15u32; 12];
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut dec = make_decoder(&params).unwrap();
+        for _ in 0..6 {
+            let frame = build_protected_mono_frame(0, &codes, true);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            assert_eq!(a.samples, 384, "concealment must keep frame shape");
+            assert!(
+                a.data[0].iter().all(|&b| b == 0),
+                "muted concealment frame must be exact silence with no prior history"
+            );
+        }
+    }
+
+    #[test]
+    fn crc_mismatch_after_audio_rings_out_history() {
+        // Decode a few loud valid frames, then a corrupt one: the muted
+        // frame still advances the overlap-add history (the previous
+        // tail rings out) rather than being zeroed hard — so the muted
+        // frame is allowed to be non-silent in its leading samples but
+        // the decoder must not error and must keep the frame shape.
+        let codes = [15u32; 12];
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut dec = make_decoder(&params).unwrap();
+        for _ in 0..3 {
+            let f = build_protected_mono_frame(0, &codes, false);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), f);
+            dec.send_packet(&pkt).unwrap();
+            let _ = dec.receive_frame().unwrap();
+        }
+        let f = build_protected_mono_frame(0, &codes, true);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), f);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        assert_eq!(a.samples, 384);
+        assert_eq!(a.data[0].len(), 384 * 2);
     }
 
     #[test]

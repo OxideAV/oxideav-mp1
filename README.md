@@ -39,9 +39,14 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   (§2.4.2.1 / §2.4.3.1): slot count
   `N = floor(12 · bitrate / sampling_frequency) + padding_bit`, four
   bytes per Layer I slot.
-- **CRC `error_check()` wiring** (§2.4.1.4): `protection_bit` drives
-  whether a 16-bit CRC word follows; `read_crc` returns it as a
-  `PresentUnverified` value (see "Spec gaps").
+- **CRC `error_check()` verification** (§2.4.1.4 / §2.4.3.1):
+  `protection_bit` drives whether a 16-bit CRC word follows;
+  `FrameHeader::verify_crc` computes the CRC-16
+  (`G(X) = X^16 + X^15 + X^2 + 1`, initial state `0xFFFF`) over the
+  Annex B Table 3-B.5 protected fields for Layer I — header bits 16…31
+  plus the bit-allocation field — and compares it with the stored word,
+  returning `CrcStatus::{Absent, Ok, Mismatch}`. On a mismatch the
+  decoder applies the §2.4.3.1 *muting* concealment.
 - **Layer I audio-data decode** (§2.4.1.5 / §2.4.2.5 / §2.4.3.2):
   per-subband 4-bit bit allocation (mapped to 0/2..15 bits/sample,
   rejecting `0b1111`), 6-bit scalefactor index per allocated subband,
@@ -117,10 +122,14 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   can build a Layer I codec object without touching the runtime
   registry, mirroring the rest of the workspace.
 
-92 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+102 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
-padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the
-CRC-presence paths, the §2.4.2.5 allocation→bits table, the MSB-first
+padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
+CRC-16 (polynomial/init constants, known register steps, protected-
+field bit sizing per mode, compute→verify round-trip, corruption
+detection in the header and allocation regions, and decoder-level mute
+concealment on mismatch), the §2.4.2.5 allocation→bits table, the
+MSB-first
 bit reader, the §2.4.3.2 requantization formula at several widths,
 mono / stereo / joint-stereo audio-data decode, the Table 3-B.1
 scalefactor table (spot checks + formula + the 2^-16 quantization of
@@ -148,8 +157,10 @@ external fixtures.
 ## Spec gaps (DOCS-GAP)
 
 The staged `ISO_IEC_11172-3-MP3-1993.pdf` (157-page edition) carries
-Annex B, so the scalefactor and synthesis-window tables are available.
-Two gaps remain, neither blocking decode to PCM:
+Annex B, so the scalefactor and synthesis-window tables are available;
+the §2.4.3.1 CRC-16 polynomial render and Table 3-B.5 protected-field
+listing are likewise staged, so CRC verification is now implemented.
+One gap remains, not blocking decode to PCM:
 
 1. The **§2.4.3.2 requantization linear formula** and the rescale
    formula are rendered as image regions the text layer does not
@@ -157,9 +168,11 @@ Two gaps remain, neither blocking decode to PCM:
    `s'' = (2^nb / (2^nb − 1)) · (s''' + 2^(−nb+1))` is corroborated by
    the §2.4.3.2 prose (invert MSB → two's-complement fraction → linear
    formula) and the rescale is the prose's `s' = scalefactor · s''`.
-2. The **CRC-16 generator polynomial** `G(X)`, plus Annex B
-   Table 3-B.5 and Annex A Figure 3-A.9 — CRC remains wired
-   structurally but unverified.
+
+The CRC-mismatch concealment implemented is *muting* of the offending
+frame; the §2.4.3.1 alternative "repetition of the previous frame" is a
+followup, as is optional CRC emission on the encode side (the encoder
+currently always sets `protection_bit == 1`).
 
 ## License
 

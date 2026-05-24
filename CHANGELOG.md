@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.1 CRC-16 `error_check()` verification**, derived solely from
+  ISO/IEC 11172-3 (1993) §2.4.3.1 + Annex B Table 3-B.5 (the generator
+  polynomial recovered from the page-36 typeset equation render). The
+  previously-deferred CRC spec gap is now closed:
+  - `header::FrameHeader::verify_crc(header_bytes, after_header)`
+    computes the CRC-16 (`G(X) = X^16 + X^15 + X^2 + 1`, initial state
+    `0xFFFF`) over the Table 3-B.5 protected fields for Layer I — header
+    bits 16…31 plus the bit-allocation field — and compares it with the
+    stored word, returning `CrcStatus::{Absent, Ok, Mismatch}`.
+  - `header::FrameHeader::compute_crc(header_bytes, allocation)` exposes
+    the same value an encoder would write (encoder-side CRC emission is
+    a followup; the encoder still always sets `protection_bit == 1`).
+  - `CrcStatus` replaces the old `PresentUnverified` placeholder with a
+    verified `Ok(word)` / `Mismatch { stored, computed }` pair plus an
+    `is_good()` helper.
+  - The `Mp1Decoder` verifies the CRC of every protected frame and, on
+    a mismatch, applies the §2.4.3.1 *muting* concealment: it emits a
+    correctly-shaped frame and rings the synthesis filterbank history
+    out with zeros (no overlap-add discontinuity).
+  - 10 new tests (7 in `header`: polynomial/init constants, known
+    short-vector register steps, allocation-field-bit sizing across
+    modes, compute→verify round-trip, corruption detection in both
+    protected regions, and truncation handling; 3 in `codec`: a
+    protected frame decoding on a CRC match, a corrupt frame muted as
+    silence, and history ring-out after valid frames). 102 tests total
+    (87 unit + 13 integration + 2 doc).
 - **Direct factory API endpoints** (`decoder` / `encoder` modules),
   completing the workspace dual-API convention so the crate exposes both
   the registry path and the historical direct API:

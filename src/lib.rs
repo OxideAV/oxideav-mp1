@@ -12,10 +12,13 @@
 //!
 //! * The §2.4.1.3 / §2.4.2.3 frame **header**, frame sync and
 //!   frame-length computation (§2.4.2.1 / §2.4.3.1), plus the optional
-//!   16-bit CRC `error_check()` field (§2.4.1.4) — see [`header`].
-//!   Both the MPEG-1 sampling-frequency / bitrate tables and the
-//!   13818-3 §2.4.2.3 LSF tables are wired in; the `ID` bit selects
-//!   which pair applies.
+//!   16-bit CRC `error_check()` field (§2.4.1.4), now **verified**
+//!   against the §2.4.3.1 generator polynomial
+//!   `G(X) = X^16 + X^15 + X^2 + 1` (init `0xFFFF`) over the Table
+//!   3-B.5 protected fields (header bits 16…31 + the bit-allocation
+//!   field) — see [`header`]. Both the MPEG-1 sampling-frequency /
+//!   bitrate tables and the 13818-3 §2.4.2.3 LSF tables are wired in;
+//!   the `ID` bit selects which pair applies.
 //! * The §2.4.1.5 / §2.4.3.2 **audio-data decode**: 4-bit bit
 //!   allocation, 6-bit scalefactor indices, and per-sample
 //!   requantization, for all four modes (mono, stereo, dual-channel,
@@ -34,11 +37,13 @@
 //!   trait objects without the registry, mirroring the rest of the
 //!   workspace's dual-API convention.
 //!
-//! Spec gaps that remain (none block decode to PCM): the CRC-16
-//! generator polynomial and Table 3-B.5 bit-coverage are not present
-//! in the staged PDF, so the CRC word is read but not verified
-//! ([`header::CrcStatus::PresentUnverified`]); and a Layer I encoder
-//! is not yet implemented.
+//! Spec gaps that remain (none block decode to PCM): on a CRC
+//! mismatch the §2.4.3.1 concealment applied is *muting* of the
+//! offending frame (the [`oxideav_core::Decoder`] emits a silent
+//! frame and rings out the filterbank history); the alternative
+//! "repetition of the previous frame" concealment is not implemented.
+//! The Layer I **encoder** always emits `protection_bit == 1`
+//! (no CRC) — optional CRC emission is a followup.
 
 #![warn(missing_debug_implementations)]
 

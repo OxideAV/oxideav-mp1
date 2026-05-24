@@ -429,51 +429,195 @@ pub fn find_sync(buf: &[u8]) -> Option<usize> {
     (0..=buf.len() - 4).find(|&i| FrameHeader::parse(&buf[i..i + 4]).is_ok())
 }
 
+/// The §2.4.3.1 CRC-16 generator polynomial, expressed as the 16-bit
+/// feedback mask used by the bit-serial shift register.
+///
+/// §2.4.3.1 specifies `G(X) = X^16 + X^15 + X^2 + 1` (page 36 of the
+/// staged ISO/IEC 11172-3 PDF, recovered from the typeset equation
+/// image). In a 16-bit register the `X^16` term is the bit shifted out
+/// at the top, so the feedback taps below it are `X^15`, `X^2`, `X^0` —
+/// i.e. the mask `0b1000_0000_0000_0101 = 0x8005`.
+const CRC16_POLY: u16 = 0x8005;
+
+/// The §2.4.3.1 CRC-16 shift-register initial state.
+///
+/// §2.4.3.1: "The initial state of the shift register is
+/// '1111 1111 1111 1111'." — numerically `0xFFFF`.
+const CRC16_INIT: u16 = 0xFFFF;
+
+/// Feed `count` bits of `byte` (the most-significant `count` bits,
+/// MSB-first) of each byte of `bytes` through the §2.4.3.1 CRC-16
+/// shift register, returning the updated register value.
+///
+/// The full-byte case (`bit_count` a multiple of 8) is the common one;
+/// the partial trailing byte handles bit-allocation fields whose bit
+/// count is not a whole number of bytes (the Layer I allocation field
+/// is always a whole number of nibbles, hence whole bytes when paired,
+/// but the helper is bit-granular to stay faithful to §2.4.3.1's
+/// bit-serial description).
+///
+/// `reg` is the running register state; the first call passes
+/// [`CRC16_INIT`].
+fn crc16_update_bits(mut reg: u16, bytes: &[u8], bit_count: usize) -> u16 {
+    debug_assert!(bit_count <= bytes.len() * 8, "bit_count past slice end");
+    for i in 0..bit_count {
+        let bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+        // Shift-register step for G(X) = X^16 + X^15 + X^2 + 1:
+        // the bit shifted out of the top (X^16) XORs with the input
+        // bit to decide whether the feedback mask is applied
+        // (§2.4.3.1, figure A.9).
+        let feedback = ((reg >> 15) as u8 & 1) ^ bit;
+        reg <<= 1;
+        if feedback == 1 {
+            reg ^= CRC16_POLY;
+        }
+    }
+    reg
+}
+
+/// The number of bits in the Layer I bit-allocation field for a frame
+/// with the given header (Table 3-B.5 "bit allocation").
+///
+/// §2.4.1.5 serialises four allocation bits per subband per channel,
+/// except that in joint_stereo the subbands at or above the
+/// `bound` (`(mode_extension + 1) × 4`, §2.4.2.3) carry a single
+/// shared 4-bit allocation. So the allocation count is:
+///
+/// * non-joint modes: `channels × 32` allocations;
+/// * joint_stereo: `channels × bound + (32 − bound)` allocations.
+///
+/// Each allocation is four bits, so the bit total is `4 ×`
+/// allocations.
+fn allocation_field_bits(header: &FrameHeader) -> usize {
+    let nch = header.channels() as usize;
+    let allocations = match header.mode {
+        Mode::JointStereo => {
+            let bound = (header.mode_extension.bound() as usize).min(32);
+            nch * bound + (32 - bound)
+        }
+        _ => nch * 32,
+    };
+    allocations * 4
+}
+
 /// Result of a 16-bit `error_check()` CRC verification (§2.4.1.4 /
 /// §2.4.3.1).
 ///
-/// The MPEG-1 audio CRC-16 *generator polynomial* and the §2.4.3.1
-/// shift-register diagram (Figure 3-A.9) are rendered as missing
-/// glyphs in the staged ISO PDF, and the set of bits fed into the
-/// check is defined by Annex B Table 3-B.5 which is likewise not
-/// present in the staged spec. Until those are supplied this remains a
-/// **structural placeholder**: it models the presence/absence of the
-/// CRC field driven by `protection_bit`, without computing the
-/// polynomial. See the crate README "Spec gaps" note.
+/// §2.4.3.1 fully specifies the check: generator polynomial
+/// `G(X) = X^16 + X^15 + X^2 + 1`, initial shift-register state
+/// `0xFFFF`, and the protected-field set from Annex B Table 3-B.5
+/// (Layer I: header bits 16…31 plus the bit-allocation field). The
+/// computed value is compared with the stored CRC word; on a mismatch
+/// §2.4.3.1 recommends concealment (muting the frame or repeating the
+/// previous one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrcStatus {
     /// `protection_bit == 1`: no CRC word is present, so nothing to
     /// check (§2.4.2.3).
     Absent,
-    /// `protection_bit == 0`: a 16-bit CRC word follows the header.
-    /// The carried value is the CRC word read straight from the
-    /// bitstream; it is **not yet verified** because the generator
-    /// polynomial and Table 3-B.5 bit selection are unavailable in
-    /// the staged spec.
-    PresentUnverified(u16),
+    /// `protection_bit == 0`: a 16-bit CRC word follows the header,
+    /// the stored value (`stored`) matched the value computed over the
+    /// protected fields. Carries the (equal) CRC word.
+    Ok(u16),
+    /// `protection_bit == 0`: the stored CRC word did not match the
+    /// value computed over the protected fields. Carries the
+    /// `stored`/`computed` pair so callers can log a diagnostic and
+    /// apply §2.4.3.1 concealment.
+    Mismatch {
+        /// The CRC word read from the bitstream.
+        stored: u16,
+        /// The CRC-16 value computed over the protected fields.
+        computed: u16,
+    },
+}
+
+impl CrcStatus {
+    /// Whether the frame passed (or had no) CRC protection.
+    ///
+    /// [`Absent`](CrcStatus::Absent) and [`Ok`](CrcStatus::Ok) are
+    /// "good"; only a [`Mismatch`](CrcStatus::Mismatch) is not.
+    pub fn is_good(self) -> bool {
+        !matches!(self, CrcStatus::Mismatch { .. })
+    }
 }
 
 impl FrameHeader {
-    /// Read the optional `error_check()` field that follows the header
-    /// (§2.4.1.4). `after_header` is the bitstream slice starting
-    /// immediately after the four header bytes.
+    /// Read **and verify** the optional `error_check()` field that
+    /// follows the header (§2.4.1.4 / §2.4.3.1).
+    ///
+    /// `header_bytes` is the four-byte header this `FrameHeader` was
+    /// parsed from (bits 16…31 of it are part of the protected field —
+    /// Table 3-B.5). `after_header` is the bitstream slice that begins
+    /// immediately after those four header bytes: in a protected frame
+    /// its first two bytes are the stored CRC word (MSB-first, §2.3)
+    /// and the remaining bytes are the audio data, whose leading
+    /// bit-allocation field is the rest of the protected set.
     ///
     /// When [`has_crc`](Self::has_crc) is false this returns
     /// [`CrcStatus::Absent`] without consuming any bytes. When a CRC is
-    /// expected, the next two bytes (MSB-first, §2.3) are read as the
-    /// stored CRC word and returned as
-    /// [`CrcStatus::PresentUnverified`] — verification is deferred (see
-    /// [`CrcStatus`]). Returns `None` if a CRC is expected but fewer
-    /// than two bytes remain.
-    pub fn read_crc(self, after_header: &[u8]) -> Option<CrcStatus> {
+    /// expected the §2.4.3.1 CRC-16 is computed over header bits 16…31
+    /// followed by the bit-allocation field and compared with the
+    /// stored word, returning [`CrcStatus::Ok`] or
+    /// [`CrcStatus::Mismatch`]. Returns `None` if a CRC is expected but
+    /// the slice is too short to hold the CRC word plus the allocation
+    /// field.
+    pub fn verify_crc(self, header_bytes: &[u8], after_header: &[u8]) -> Option<CrcStatus> {
         if !self.has_crc() {
             return Some(CrcStatus::Absent);
         }
-        if after_header.len() < 2 {
+        if header_bytes.len() < 4 || after_header.len() < 2 {
             return None;
         }
-        let crc = u16::from_be_bytes([after_header[0], after_header[1]]);
-        Some(CrcStatus::PresentUnverified(crc))
+        let stored = u16::from_be_bytes([after_header[0], after_header[1]]);
+
+        // The audio data (and thus the bit-allocation field) begins
+        // after the two CRC bytes.
+        let audio = &after_header[2..];
+        let alloc_bits = allocation_field_bits(&self);
+        if audio.len() * 8 < alloc_bits {
+            return None;
+        }
+
+        // Protected fields (Table 3-B.5, Layer I):
+        //   1. bits 16…31 of the header = header_bytes[2..4];
+        //   2. the bit-allocation field at the start of the audio data.
+        let mut reg = crc16_update_bits(CRC16_INIT, &header_bytes[2..4], 16);
+        reg = crc16_update_bits(reg, audio, alloc_bits);
+
+        Some(if reg == stored {
+            CrcStatus::Ok(stored)
+        } else {
+            CrcStatus::Mismatch {
+                stored,
+                computed: reg,
+            }
+        })
+    }
+
+    /// The §2.4.3.1 CRC-16 word for a frame this header describes,
+    /// computed over the protected fields (Table 3-B.5: header bits
+    /// 16…31 + the bit-allocation field).
+    ///
+    /// `header_bytes` is the four-byte header and `allocation` is the
+    /// audio-data slice whose leading bit-allocation field (§2.4.1.5:
+    /// four bits per allocation, shared above the joint-stereo `bound`)
+    /// is the protected part; any trailing bytes are ignored. This is
+    /// the value an encoder writes into the `error_check()` field;
+    /// `verify_crc` recomputes it and compares.
+    ///
+    /// Returns `None` if the slices are too short for the protected
+    /// field.
+    pub fn compute_crc(self, header_bytes: &[u8], allocation: &[u8]) -> Option<u16> {
+        if header_bytes.len() < 4 {
+            return None;
+        }
+        let alloc_bits = allocation_field_bits(&self);
+        if allocation.len() * 8 < alloc_bits {
+            return None;
+        }
+        let mut reg = crc16_update_bits(CRC16_INIT, &header_bytes[2..4], 16);
+        reg = crc16_update_bits(reg, allocation, alloc_bits);
+        Some(reg)
     }
 }
 
@@ -830,24 +974,139 @@ mod tests {
     fn crc_absent_when_protection_set() {
         let h = FrameHeader::parse(&canonical()).unwrap();
         assert!(!h.has_crc());
-        assert_eq!(h.read_crc(&[]), Some(CrcStatus::Absent));
+        assert_eq!(h.verify_crc(&canonical(), &[]), Some(CrcStatus::Absent));
+        assert!(CrcStatus::Absent.is_good());
+    }
+
+    // ---- §2.4.3.1 CRC-16: polynomial + protected field --------
+
+    #[test]
+    fn crc16_poly_and_init_match_spec() {
+        // G(X) = X^16 + X^15 + X^2 + 1 -> feedback mask 0x8005 with the
+        // X^16 term as the bit shifted out of the 16-bit register.
+        assert_eq!(CRC16_POLY, 0x8005);
+        // Initial state '1111 1111 1111 1111' = 0xFFFF (§2.4.3.1).
+        assert_eq!(CRC16_INIT, 0xFFFF);
     }
 
     #[test]
-    fn crc_present_unverified_when_protection_clear() {
-        // protection_bit == 0 -> CRC follows.
-        let bytes = build_header(1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b00, 0, 0, 1, 0);
-        let h = FrameHeader::parse(&bytes).unwrap();
+    fn crc16_known_short_vectors() {
+        // Self-contained checks of the bit-serial register from the
+        // §2.4.3.1 description (init 0xFFFF, poly X^16+X^15+X^2+1).
+        // Empty input: register unchanged.
+        assert_eq!(crc16_update_bits(CRC16_INIT, &[], 0), 0xFFFF);
+        // A single 0 bit: top bit of 0xFFFF is 1, XOR input 0 = 1, so
+        // feedback fires: (0xFFFF << 1) ^ 0x8005 = 0xFFFE ^ 0x8005 =
+        // 0x7FFB.
+        assert_eq!(crc16_update_bits(CRC16_INIT, &[0x00], 1), 0x7FFB);
+        // A single 1 bit: feedback = 1 ^ 1 = 0, no mask: 0xFFFF<<1 =
+        // 0xFFFE.
+        assert_eq!(crc16_update_bits(CRC16_INIT, &[0x80], 1), 0xFFFE);
+    }
+
+    #[test]
+    fn allocation_field_bits_by_mode() {
+        // mono: 1 channel * 32 * 4 = 128 bits.
+        let mono = FrameHeader::parse(&build_header(
+            1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b11, 0, 0, 1, 0,
+        ))
+        .unwrap();
+        assert_eq!(allocation_field_bits(&mono), 128);
+        // stereo: 2 channels * 32 * 4 = 256 bits.
+        let stereo = FrameHeader::parse(&build_header(
+            1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b00, 0, 0, 1, 0,
+        ))
+        .unwrap();
+        assert_eq!(allocation_field_bits(&stereo), 256);
+        // joint_stereo, mode_ext 0b00 -> bound 4: 2*4 + (32-4) = 36
+        // allocations * 4 = 144 bits.
+        let js = FrameHeader::parse(&build_header(
+            1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b01, 0b00, 0, 1, 0,
+        ))
+        .unwrap();
+        assert_eq!(allocation_field_bits(&js), 144);
+        // joint_stereo, mode_ext 0b11 -> bound 16: 2*16 + (32-16) = 48
+        // allocations * 4 = 192 bits.
+        let js2 = FrameHeader::parse(&build_header(
+            1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b01, 0b11, 0, 1, 0,
+        ))
+        .unwrap();
+        assert_eq!(allocation_field_bits(&js2), 192);
+    }
+
+    #[test]
+    fn crc_roundtrip_compute_then_verify_ok() {
+        // protection_bit == 0 -> CRC present. Build a mono frame with a
+        // chosen allocation field, compute the CRC with `compute_crc`,
+        // and confirm `verify_crc` accepts it (Ok) when the same word is
+        // stored in the bitstream.
+        let header = build_header(1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
         assert!(h.has_crc());
-        // Two CRC bytes, MSB-first.
-        let status = h.read_crc(&[0xAB, 0xCD]).unwrap();
-        assert_eq!(status, CrcStatus::PresentUnverified(0xABCD));
+        // Mono allocation field = 128 bits = 16 bytes. Use an arbitrary
+        // but fixed pattern; trailing audio bytes are ignored by the CRC.
+        let mut audio = vec![0u8; 64];
+        for (i, b) in audio.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let crc = h.compute_crc(&header, &audio).expect("compute_crc");
+        // Place the computed CRC word (MSB-first) ahead of the audio.
+        let mut after = crc.to_be_bytes().to_vec();
+        after.extend_from_slice(&audio);
+        assert_eq!(h.verify_crc(&header, &after), Some(CrcStatus::Ok(crc)));
+        assert!(h.verify_crc(&header, &after).unwrap().is_good());
+    }
+
+    #[test]
+    fn crc_detects_corruption_in_protected_field() {
+        let header = build_header(1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        let audio = vec![0xA5u8; 64];
+        let crc = h.compute_crc(&header, &audio).unwrap();
+        let mut after = crc.to_be_bytes().to_vec();
+        after.extend_from_slice(&audio);
+        // Flip a bit inside the bit-allocation field (first audio byte,
+        // which is within the first 128 protected bits): the CRC must
+        // no longer match.
+        after[2] ^= 0x01;
+        match h.verify_crc(&header, &after) {
+            Some(CrcStatus::Mismatch { stored, computed }) => {
+                assert_eq!(stored, crc);
+                assert_ne!(computed, crc);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+        // A flip *past* the allocation field (byte 18, well beyond the
+        // first 16 bytes) leaves the CRC valid — those bits aren't
+        // protected (Table 3-B.5: scalefactors/samples excluded).
+        let mut after2 = crc.to_be_bytes().to_vec();
+        after2.extend_from_slice(&audio);
+        after2[2 + 18] ^= 0xFF;
+        assert_eq!(h.verify_crc(&header, &after2), Some(CrcStatus::Ok(crc)));
+    }
+
+    #[test]
+    fn crc_detects_corruption_in_header_bits_16_31() {
+        // Header bits 16..31 (bytes 2,3) are protected. Two headers that
+        // differ only in those bits (different sampling/bitrate) produce
+        // different CRCs over the same allocation field.
+        let h_a = build_header(1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h_b = build_header(1, 0b11, 0, 0b0100, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let pa = FrameHeader::parse(&h_a).unwrap();
+        let pb = FrameHeader::parse(&h_b).unwrap();
+        let audio = vec![0x3Cu8; 32];
+        let ca = pa.compute_crc(&h_a, &audio).unwrap();
+        let cb = pb.compute_crc(&h_b, &audio).unwrap();
+        assert_ne!(ca, cb, "CRC must cover header bits 16..31");
     }
 
     #[test]
     fn crc_none_when_word_truncated() {
-        let bytes = build_header(1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b00, 0, 0, 1, 0);
-        let h = FrameHeader::parse(&bytes).unwrap();
-        assert_eq!(h.read_crc(&[0xAB]), None); // only one byte available
+        let header = build_header(1, 0b11, 0, 0b1000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        // Only one byte after the header: not even the CRC word fits.
+        assert_eq!(h.verify_crc(&header, &[0xAB]), None);
+        // CRC word present but the allocation field is truncated.
+        assert_eq!(h.verify_crc(&header, &[0xAB, 0xCD, 0x00]), None);
     }
 }
