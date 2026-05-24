@@ -30,22 +30,20 @@
 //! §2.4.3.2 linear formula together with the raw 6-bit scalefactor
 //! **index** for each subband.
 //!
-//! ## Spec gap: the final rescale by Table 3-B.1
+//! ## Final rescale by Table 3-B.1
 //!
 //! The last step of §2.4.3.2 multiplies `s''` by the scalefactor
-//! found in **3-Annex B, Table 3-B.1 "LAYER I, II SCALEFACTORS"**.
-//! That table is part of the normative Tables annex, which is
-//! **absent from the staged ISO PDF** (the document body ends
-//! mid-§2.4.3.4 with no Annex pages; every "3-Annex B" mention is a
-//! cross-reference, never the table itself). Under the clean-room
-//! wall the multiplier values may not be sourced from anywhere
-//! else, so this module decodes *up to* the rescale: it stores the
-//! 6-bit scalefactor index verbatim and exposes the requantized
-//! `s''` value. Applying `s' = s'' · scalefactor[index]` is a
-//! one-line operation deferred until Table 3-B.1 is staged. See the
-//! crate README "Spec gaps" note.
+//! found in **3-Annex B, Table 3-B.1 "LAYER I, II SCALEFACTORS"**:
+//! `s' = scalefactor[index] · s''`. Table 3-B.1 is now staged
+//! (PDF page 51, transcribed into [`crate::tables::SCALEFACTORS`]),
+//! so the per-subband requantized samples carry the index verbatim
+//! ([`Subband::scalefactor_index`]) and the rescaled value is
+//! produced on demand via [`Subband::rescaled_samples`] /
+//! [`SubbandSamples::slot`]. The slot view feeds the §2.4.3.2
+//! synthesis filterbank ([`crate::synthesis`]).
 
 use crate::header::{FrameHeader, Mode};
+use crate::tables::SCALEFACTORS;
 
 /// Number of subbands in a Layer I frame (§2.4.1.5: `sb < 32`).
 pub const SUBBANDS: usize = 32;
@@ -258,6 +256,28 @@ impl Default for Subband {
     }
 }
 
+impl Subband {
+    /// The §2.4.3.2 rescaled samples `s' = scalefactor[index] · s''`,
+    /// applying the Table 3-B.1 multiplier
+    /// ([`crate::tables::SCALEFACTORS`]) to each stored requantized
+    /// value `s''`.
+    ///
+    /// An unallocated subband (no bits) returns all zeros — §2.4.3.2:
+    /// "If a subband has no bits allocated to it, the samples in that
+    /// subband are set to zero".
+    pub fn rescaled_samples(&self) -> [f64; SAMPLES_PER_SUBBAND] {
+        if !self.allocated {
+            return [0.0; SAMPLES_PER_SUBBAND];
+        }
+        let factor = SCALEFACTORS[(self.scalefactor_index as usize) & 0x3F];
+        let mut out = [0.0; SAMPLES_PER_SUBBAND];
+        for (o, &s) in out.iter_mut().zip(self.samples.iter()) {
+            *o = factor * s;
+        }
+        out
+    }
+}
+
 /// The requantized subband samples for one Layer I frame: one
 /// [`Subband`] per (channel, subband), `nch` channels × 32 subbands
 /// (§2.4.1.5 / §2.4.3.2).
@@ -277,6 +297,26 @@ impl SubbandSamples {
             channels,
             subbands: [[Subband::default(); SUBBANDS]; 2],
         }
+    }
+
+    /// The 32 rescaled subband samples `s'` for channel `ch` and
+    /// sample-slot `slot` (`slot < `[`SAMPLES_PER_SUBBAND`]`), laid out
+    /// as `[subband 0 .. subband 31]` ready to feed the §2.4.3.2
+    /// synthesis filterbank ([`crate::synthesis::SynthesisFilter`]).
+    ///
+    /// Each entry applies the Table 3-B.1 rescale (see
+    /// [`Subband::rescaled_samples`]); unallocated subbands contribute
+    /// zero.
+    pub fn slot(&self, ch: usize, slot: usize) -> [f64; SUBBANDS] {
+        let mut out = [0.0f64; SUBBANDS];
+        for (sb, o) in out.iter_mut().enumerate() {
+            let band = &self.subbands[ch][sb];
+            if band.allocated {
+                let factor = SCALEFACTORS[(band.scalefactor_index as usize) & 0x3F];
+                *o = factor * band.samples[slot];
+            }
+        }
+        out
     }
 }
 

@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer I decode to PCM complete**, derived solely from ISO/IEC
+  11172-3 (1993) Annex B (now staged in the 157-page PDF):
+  - `tables::SCALEFACTORS` — the 63 Table 3-B.1 "LAYER I, II
+    SCALEFACTORS" multipliers (PDF page 51), transcribed and
+    cross-checked against the closed-form `2^((3−i)/3)`.
+  - `tables::SYNTHESIS_WINDOW` — the 512 Table 3-B.3 "COEFFICIENTS Di
+    OF THE SYNTHESIS WINDOW" taps (PDF pages 56–58), transcribed
+    verbatim from the table renders.
+  - `Subband::rescaled_samples` / `SubbandSamples::slot` apply the
+    §2.4.3.2 rescale `s' = scalefactor[index] · s''`.
+  - `synthesis::SynthesisFilter` — the §2.4.3.2 polyphase synthesis
+    subband filter (3-Annex A Figure 3-A.2): per-channel 1024-element
+    `V` FIFO with cross-frame overlap-add, 32→64 matrixing
+    (`N_ik = cos[(16+i)(2k+1)π/64]`), the 512-tap `D[]` windowing, and
+    the 16-term summation to 32 PCM samples per slot. `to_s16`
+    converts the reconstruction to clamped S16.
+  - `codec::Mp1Decoder` implements `oxideav_core::Decoder`:
+    packet → 384-sample-per-channel interleaved S16 `AudioFrame`,
+    with `reset` zeroing the filterbank history. `register` installs
+    it under WAVE format tag `0x0050` and Matroska id `A_MPEG/L1`.
+  - 17 further unit tests (55 total): scalefactor table spot-checks +
+    formula + Table 3-B.3 quantization/symmetry, matrixing
+    coefficients, a window overlap-add test, and full frame→PCM smoke
+    tests (mono + stereo + reset).
 - Clean-room MPEG-1 Audio **Layer I** frame-header foundation, derived
   solely from ISO/IEC 11172-3 (1993):
   - `header::FrameHeader` typed struct with all thirteen §2.4.1.3 /
@@ -49,16 +73,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the values were transcribed from an external library's source
   file rather than read solely from the ISO/IEC specification.
 
-### Reset
-
-- Crate reduced to a minimal `oxideav_core::register!` stub. Every
-  public API returns `Error::NotImplemented`. The crates.io version
-  (`0.0.6`) is preserved on the new master to avoid breaking
-  downstream version pins; the published versions on crates.io will
-  be yanked by the maintainer.
-
 ### Next
 
-- Clean-room re-implementation against the staged ISO/IEC 11172-3
-  Layer I specification (numeric tables read only from the standard)
-  in a future round.
+- A Layer I **encoder** (PCM → bitstream).
+- CRC-16 verification, once the generator polynomial / Table 3-B.5 are
+  recoverable from the staged spec (see "Spec gaps" in the README).
