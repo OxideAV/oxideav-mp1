@@ -28,13 +28,40 @@ use oxideav_core::{
     Decoder, Encoder, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::decode::{decode_audio_data, SAMPLES_PER_SUBBAND, SUBBANDS};
+use crate::decode::{decode_audio_data, SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS};
 use crate::encode::{EncodeParams, Mp1FrameEncoder};
 use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Mode};
 use crate::synthesis::{to_s16, SynthesisFilter};
 
 /// The canonical codec id for MPEG-1 Audio Layer I.
 const CODEC_ID: &str = "mp1";
+
+/// The §2.4.3.1 error-concealment strategy applied when a
+/// CRC-protected frame fails its `error_check()`.
+///
+/// §2.4.3.1 recommends, *verbatim*, "application of a concealment
+/// technique, such as **muting of the actual frame** or **repetition
+/// of the previous frame**". Both are implemented here and selectable
+/// at decoder-construction time (or at runtime via
+/// [`Mp1Decoder::set_concealment`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConcealmentMode {
+    /// Mute the offending frame: the decoder emits silence for the
+    /// frame and rings the synthesis filterbank history out with
+    /// zeros (the previous frame's filter tail still decays naturally,
+    /// so there is no hard discontinuity click). This is the default
+    /// and matches the prior crate behaviour.
+    #[default]
+    Mute,
+    /// Repeat the previous frame: the decoder re-uses the last
+    /// successfully-decoded frame's requantized subband samples and
+    /// runs them through the synthesis filterbank again, producing a
+    /// fresh 384-sample PCM frame. If no frame has decoded
+    /// successfully yet (the corrupt frame is the very first one),
+    /// there is nothing to repeat, so this falls back to
+    /// [`ConcealmentMode::Mute`] for that frame only.
+    RepeatPrevious,
+}
 
 /// Build an [`Mp1Decoder`] for the given parameters. The channel count
 /// is taken from the frame headers at decode time, so `params` only
@@ -56,16 +83,54 @@ pub struct Mp1Decoder {
     filters: Vec<SynthesisFilter>,
     pending: Option<Packet>,
     eof: bool,
+    /// The §2.4.3.1 concealment strategy applied on CRC mismatch.
+    concealment: ConcealmentMode,
+    /// The requantized subband samples of the last *successfully*
+    /// decoded frame, kept for [`ConcealmentMode::RepeatPrevious`].
+    /// `None` until a frame has decoded without a CRC failure.
+    last_subbands: Option<SubbandSamples>,
 }
 
 impl Mp1Decoder {
-    fn new(codec_id: CodecId) -> Mp1Decoder {
+    /// Build a Layer I decoder for the given codec id, with the default
+    /// [`ConcealmentMode::Mute`] CRC concealment.
+    ///
+    /// The channel count is taken from the frame headers at decode
+    /// time, so the codec id is the only thing the decoder needs up
+    /// front. Use [`with_concealment`](Self::with_concealment) to pick
+    /// [`ConcealmentMode::RepeatPrevious`] instead.
+    pub fn new(codec_id: CodecId) -> Mp1Decoder {
         Mp1Decoder {
             codec_id,
             filters: Vec::new(),
             pending: None,
             eof: false,
+            concealment: ConcealmentMode::default(),
+            last_subbands: None,
         }
+    }
+
+    /// Set the §2.4.3.1 concealment strategy applied when a
+    /// CRC-protected frame fails verification (builder form).
+    ///
+    /// Defaults to [`ConcealmentMode::Mute`]. Use
+    /// [`ConcealmentMode::RepeatPrevious`] to repeat the previous
+    /// frame's subband samples instead of muting.
+    pub fn with_concealment(mut self, mode: ConcealmentMode) -> Mp1Decoder {
+        self.concealment = mode;
+        self
+    }
+
+    /// Set the §2.4.3.1 concealment strategy at runtime.
+    ///
+    /// Takes effect for every frame decoded after the call.
+    pub fn set_concealment(&mut self, mode: ConcealmentMode) {
+        self.concealment = mode;
+    }
+
+    /// The §2.4.3.1 concealment strategy currently in effect.
+    pub fn concealment(&self) -> ConcealmentMode {
+        self.concealment
     }
 
     /// Decode one Layer I frame found in `data` into interleaved S16
@@ -97,13 +162,12 @@ impl Mp1Decoder {
         // verify the stored word over header bits 16…31 + the
         // bit-allocation field (Table 3-B.5). On a mismatch §2.4.3.1
         // recommends concealment ("muting of the actual frame or
-        // repetition of the previous frame"); we mute — emit a silent
-        // PCM frame of the right shape — and advance the filterbank
-        // history with zeros so the overlap-add stays continuous.
+        // repetition of the previous frame"). Which one is applied is
+        // selected by `self.concealment`.
         if header.has_crc() {
             match header.verify_crc(&frame[..4], &frame[4..]) {
                 Some(CrcStatus::Mismatch { .. }) => {
-                    return Ok(self.conceal_muted_frame(nch));
+                    return Ok(self.conceal_frame(nch));
                 }
                 // Ok / Absent: proceed. None means the slice was too
                 // short for the protected field — treat as truncated.
@@ -119,15 +183,32 @@ impl Mp1Decoder {
         let subbands = decode_audio_data(&header, audio)
             .map_err(|e| Error::invalid(format!("oxideav-mp1: audio_data: {e}")))?;
 
+        let out = self.synthesize_subbands(&subbands, nch);
+        // Remember this good frame's subbands for a future
+        // RepeatPrevious concealment (§2.4.3.1).
+        self.last_subbands = Some(subbands);
+        Ok(out)
+    }
+
+    /// Run the §2.4.3.2 polyphase synthesis filterbank over one frame's
+    /// requantized subband samples and pack the result into interleaved
+    /// S16 PCM.
+    ///
+    /// For each of the 12 slots and each channel, the 32 rescaled
+    /// subband samples are pushed through that channel's bank (the
+    /// overlap-add `V` history persists across calls). Returns
+    /// `(pcm_bytes, samples_per_channel, channels)`.
+    fn synthesize_subbands(
+        &mut self,
+        subbands: &SubbandSamples,
+        nch: usize,
+    ) -> (Vec<u8>, u32, usize) {
         // Ensure we have one synthesis bank per channel (state persists
         // across frames for the overlap-add history).
         while self.filters.len() < nch {
             self.filters.push(SynthesisFilter::new());
         }
 
-        // Run the synthesis filterbank: for each of the 12 slots, for
-        // each channel, push 32 subband samples through the bank to get
-        // 32 PCM samples. Interleave the channels into S16.
         let total_samples = SAMPLES_PER_SUBBAND * 32; // 384 per channel
         let mut pcm = vec![0i16; total_samples * nch];
         for slot in 0..SAMPLES_PER_SUBBAND {
@@ -147,39 +228,55 @@ impl Mp1Decoder {
         for s in pcm {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
-        Ok((bytes, total_samples as u32, nch))
+        (bytes, total_samples as u32, nch)
     }
 
-    /// Build a concealment frame for a CRC failure (§2.4.3.1: "muting
-    /// of the actual frame").
+    /// Apply the selected §2.4.3.1 concealment for a CRC failure.
+    ///
+    /// * [`ConcealmentMode::Mute`] — push zero subband samples through
+    ///   each channel's bank: the frame is silent and the previous
+    ///   frame's filter tail rings out continuously.
+    /// * [`ConcealmentMode::RepeatPrevious`] — re-synthesize the last
+    ///   successfully-decoded frame's requantized subband samples. If
+    ///   no good frame has decoded yet (the corrupt frame is the very
+    ///   first), there is nothing to repeat and this falls back to
+    ///   muting for that frame.
     ///
     /// Returns `(pcm_bytes, samples_per_channel, channels)` like
-    /// [`decode_frame`](Self::decode_frame). Zero subband samples are
-    /// pushed through each channel's synthesis bank so the overlap-add
-    /// `V` history advances continuously (the previous frame's filter
-    /// tail rings out rather than being cut), giving the standard's
-    /// "mute" behaviour without a discontinuity click.
-    fn conceal_muted_frame(&mut self, nch: usize) -> (Vec<u8>, u32, usize) {
-        while self.filters.len() < nch {
-            self.filters.push(SynthesisFilter::new());
-        }
-        let total_samples = SAMPLES_PER_SUBBAND * 32; // 384 per channel
-        let mut pcm = vec![0i16; total_samples * nch];
-        let zeros = [0.0f64; SUBBANDS];
-        for slot in 0..SAMPLES_PER_SUBBAND {
-            for ch in 0..nch {
-                let out = self.filters[ch].synthesize(&zeros);
-                for (j, &v) in out.iter().enumerate() {
-                    let frame_sample = slot * 32 + j;
-                    pcm[frame_sample * nch + ch] = to_s16(v);
+    /// [`decode_frame`](Self::decode_frame). A concealed frame never
+    /// becomes the "previous frame" for a subsequent repeat: only a
+    /// genuinely-decoded frame is stored, so a run of corrupt frames
+    /// repeats the *last good* frame each time rather than chaining
+    /// repeats of repeats.
+    fn conceal_frame(&mut self, nch: usize) -> (Vec<u8>, u32, usize) {
+        match self.concealment {
+            ConcealmentMode::RepeatPrevious => {
+                if let Some(prev) = self.last_subbands.clone() {
+                    // Repeat the previous frame's subband samples,
+                    // honouring the channel count it was decoded with
+                    // (a mid-stream channel change while corrupt is
+                    // exotic; reuse the stored channel count).
+                    let prev_nch = prev.channels.clamp(1, 2);
+                    return self.synthesize_subbands(&prev, prev_nch);
                 }
+                // No previous frame: fall back to muting.
+                self.conceal_muted_frame(nch)
             }
+            ConcealmentMode::Mute => self.conceal_muted_frame(nch),
         }
-        let mut bytes = Vec::with_capacity(pcm.len() * 2);
-        for s in pcm {
-            bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        (bytes, total_samples as u32, nch)
+    }
+
+    /// Build a muted concealment frame (§2.4.3.1: "muting of the actual
+    /// frame").
+    ///
+    /// Zero subband samples are pushed through each channel's synthesis
+    /// bank so the overlap-add `V` history advances continuously (the
+    /// previous frame's filter tail rings out rather than being cut),
+    /// giving the standard's "mute" behaviour without a discontinuity
+    /// click.
+    fn conceal_muted_frame(&mut self, nch: usize) -> (Vec<u8>, u32, usize) {
+        let zeros = SubbandSamples::silent(nch);
+        self.synthesize_subbands(&zeros, nch)
     }
 }
 
@@ -229,6 +326,10 @@ impl Decoder for Mp1Decoder {
     fn reset(&mut self) -> Result<()> {
         self.pending = None;
         self.eof = false;
+        // Drop the repeat-concealment history: after a seek there is no
+        // meaningful "previous frame" to repeat. The concealment *mode*
+        // is a configured policy and is intentionally preserved.
+        self.last_subbands = None;
         for f in &mut self.filters {
             f.reset();
         }
@@ -784,6 +885,193 @@ mod tests {
         };
         assert_eq!(a.samples, 384);
         assert_eq!(a.data[0].len(), 384 * 2);
+    }
+
+    /// Collect a decoder's PCM bytes for one packet (decode + extract).
+    fn decode_pcm(dec: &mut Box<dyn Decoder>, frame: Vec<u8>) -> Vec<u8> {
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        a.data[0].clone()
+    }
+
+    #[test]
+    fn concealment_defaults_to_mute() {
+        let dec = Mp1Decoder::new(CodecId::new("mp1"));
+        assert_eq!(dec.concealment(), ConcealmentMode::Mute);
+        let dec = dec.with_concealment(ConcealmentMode::RepeatPrevious);
+        assert_eq!(dec.concealment(), ConcealmentMode::RepeatPrevious);
+    }
+
+    /// With [`ConcealmentMode::RepeatPrevious`], a CRC-failing frame
+    /// must reproduce exactly the PCM the *previous good frame's*
+    /// subband samples produce when run through the (now-advanced)
+    /// filterbank — i.e. it equals decoding a fresh, valid copy of that
+    /// same frame on a decoder in the identical filter state.
+    #[test]
+    fn repeat_previous_repeats_last_good_subbands() {
+        let codes = [12u32; 12];
+        // Reference decoder: decode a good frame, then decode a *second*
+        // identical good frame. The second frame's PCM is exactly what
+        // "repeating the previous frame" should produce, because the
+        // subband samples are identical and the filter state coming in
+        // is identical.
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut reference = make_decoder(&params).unwrap();
+        let _ = decode_pcm(&mut reference, build_protected_mono_frame(7, &codes, false));
+        let want = decode_pcm(&mut reference, build_protected_mono_frame(7, &codes, false));
+
+        // Subject decoder: same good frame, then a CRC-corrupt frame
+        // with RepeatPrevious. The concealed frame must equal `want`.
+        let mut subject = Box::new(
+            Mp1Decoder::new(CodecId::new("mp1")).with_concealment(ConcealmentMode::RepeatPrevious),
+        ) as Box<dyn Decoder>;
+        let _ = decode_pcm(&mut subject, build_protected_mono_frame(7, &codes, false));
+        let got = decode_pcm(&mut subject, build_protected_mono_frame(7, &codes, true));
+        assert_eq!(
+            got, want,
+            "RepeatPrevious must reproduce the last good frame"
+        );
+        // And it must NOT be silence (the previous frame was loud).
+        assert!(got.iter().any(|&b| b != 0), "repeat produced only silence");
+    }
+
+    /// A run of corrupt frames under RepeatPrevious repeats the *last
+    /// good* frame each time (a concealed frame is never stored as the
+    /// new "previous"), so the second concealed frame differs from the
+    /// first only through the advancing filterbank tail — never by
+    /// chaining a repeat of a repeat. We verify both concealed frames
+    /// match the corresponding reference frames decoded from the same
+    /// good subbands.
+    #[test]
+    fn repeat_previous_does_not_chain_repeats() {
+        let codes = [14u32; 12];
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        // Reference: one good frame, then two more identical good frames.
+        let mut reference = make_decoder(&params).unwrap();
+        let _ = decode_pcm(&mut reference, build_protected_mono_frame(3, &codes, false));
+        let want1 = decode_pcm(&mut reference, build_protected_mono_frame(3, &codes, false));
+        let want2 = decode_pcm(&mut reference, build_protected_mono_frame(3, &codes, false));
+
+        let mut subject = Box::new(
+            Mp1Decoder::new(CodecId::new("mp1")).with_concealment(ConcealmentMode::RepeatPrevious),
+        ) as Box<dyn Decoder>;
+        let _ = decode_pcm(&mut subject, build_protected_mono_frame(3, &codes, false));
+        let got1 = decode_pcm(&mut subject, build_protected_mono_frame(3, &codes, true));
+        let got2 = decode_pcm(&mut subject, build_protected_mono_frame(3, &codes, true));
+        assert_eq!(got1, want1);
+        assert_eq!(got2, want2);
+    }
+
+    /// RepeatPrevious with no prior good frame (the first frame is
+    /// corrupt) falls back to muting: exact silence with no history.
+    #[test]
+    fn repeat_previous_first_frame_falls_back_to_mute() {
+        let codes = [15u32; 12];
+        let mut dec = Box::new(
+            Mp1Decoder::new(CodecId::new("mp1")).with_concealment(ConcealmentMode::RepeatPrevious),
+        ) as Box<dyn Decoder>;
+        let pcm = decode_pcm(&mut dec, build_protected_mono_frame(0, &codes, true));
+        assert!(
+            pcm.iter().all(|&b| b == 0),
+            "first-frame RepeatPrevious must mute (no previous frame)"
+        );
+    }
+
+    /// `set_concealment` switches the strategy at runtime. Start in
+    /// Mute (the default), decode a good frame, then switch to
+    /// RepeatPrevious and confirm the next corrupt frame is non-silent
+    /// (it repeated the previous good loud frame, not muted).
+    #[test]
+    fn set_concealment_switches_at_runtime() {
+        let codes = [13u32; 12];
+
+        // Subject decoder: starts in the Mute default, decodes a good
+        // loud frame, then switches to RepeatPrevious before the corrupt
+        // frame arrives. The corrupt frame must repeat the loud frame
+        // (non-silent).
+        let mut owned = Mp1Decoder::new(CodecId::new("mp1"));
+        assert_eq!(owned.concealment(), ConcealmentMode::Mute);
+        {
+            let pkt = Packet::new(
+                0,
+                TimeBase::new(1, 48_000),
+                build_protected_mono_frame(2, &codes, false),
+            );
+            owned.send_packet(&pkt).unwrap();
+            let _ = owned.receive_frame().unwrap();
+        }
+        owned.set_concealment(ConcealmentMode::RepeatPrevious);
+        assert_eq!(owned.concealment(), ConcealmentMode::RepeatPrevious);
+        let mut subject = Box::new(owned) as Box<dyn Decoder>;
+        let pcm = decode_pcm(&mut subject, build_protected_mono_frame(2, &codes, true));
+        assert!(
+            pcm.iter().any(|&b| b != 0),
+            "after set_concealment(RepeatPrevious) the corrupt frame should repeat the loud previous frame"
+        );
+
+        // Contrast decoder: same good frame, but kept on the Mute
+        // default. Its concealed frame must differ from the repeated one
+        // (it rings the tail out rather than re-driving the loud band).
+        let mut mute = make_decoder(&CodecParameters::audio(CodecId::new("mp1"))).unwrap();
+        let _ = decode_pcm(&mut mute, build_protected_mono_frame(2, &codes, false));
+        let mute_pcm = decode_pcm(&mut mute, build_protected_mono_frame(2, &codes, true));
+        assert_ne!(
+            pcm, mute_pcm,
+            "RepeatPrevious and Mute must produce different concealment PCM"
+        );
+    }
+
+    /// A concealed frame must keep the standard 384-sample shape under
+    /// RepeatPrevious as well.
+    #[test]
+    fn repeat_previous_keeps_frame_shape() {
+        let codes = [10u32; 12];
+        let mut dec = Box::new(
+            Mp1Decoder::new(CodecId::new("mp1")).with_concealment(ConcealmentMode::RepeatPrevious),
+        ) as Box<dyn Decoder>;
+        let _ = decode_pcm(&mut dec, build_protected_mono_frame(5, &codes, false));
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 48_000),
+            build_protected_mono_frame(5, &codes, true),
+        );
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        assert_eq!(a.samples, 384);
+        assert_eq!(a.data[0].len(), 384 * 2);
+    }
+
+    /// After `reset`, RepeatPrevious has no "previous frame" to repeat,
+    /// so the first corrupt frame mutes to exact silence.
+    #[test]
+    fn reset_clears_repeat_history() {
+        let codes = [15u32; 12];
+        let mut owned = Mp1Decoder::new(CodecId::new("mp1"));
+        owned.set_concealment(ConcealmentMode::RepeatPrevious);
+        // A good frame establishes a "previous frame".
+        {
+            let pkt = Packet::new(
+                0,
+                TimeBase::new(1, 48_000),
+                build_protected_mono_frame(0, &codes, false),
+            );
+            owned.send_packet(&pkt).unwrap();
+            let _ = owned.receive_frame().unwrap();
+        }
+        owned.reset().unwrap();
+        // Reset must keep the *mode* but drop the previous-frame state.
+        assert_eq!(owned.concealment(), ConcealmentMode::RepeatPrevious);
+        let mut boxed = Box::new(owned) as Box<dyn Decoder>;
+        let pcm = decode_pcm(&mut boxed, build_protected_mono_frame(0, &codes, true));
+        assert!(
+            pcm.iter().all(|&b| b == 0),
+            "after reset, RepeatPrevious must mute (history dropped)"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! [`CodecRegistry`](oxideav_core::CodecRegistry). It is the exact same
 //! construction the registry path performs in
 //! [`register_codecs`](crate::register_codecs) — both routes end at
-//! [`Mp1Decoder`](crate::codec::Mp1Decoder).
+//! [`Mp1Decoder`].
 //!
 //! ```no_run
 //! use oxideav_core::{CodecId, CodecParameters};
@@ -15,7 +15,9 @@
 //! # let _ = &mut dec;
 //! ```
 
-use oxideav_core::{CodecParameters, Decoder, Error};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error};
+
+use crate::codec::{ConcealmentMode, Mp1Decoder};
 
 /// Build a boxed MPEG-1 Audio Layer I [`Decoder`] from `params`.
 ///
@@ -23,9 +25,29 @@ use oxideav_core::{CodecParameters, Decoder, Error};
 /// `params` only needs to carry the codec id (`"mp1"`). This is the
 /// direct-API twin of the registry decoder factory installed by
 /// [`register_codecs`](crate::register_codecs); both produce an
-/// identical [`Mp1Decoder`](crate::codec::Mp1Decoder).
+/// identical [`Mp1Decoder`] with the default
+/// [`ConcealmentMode::Mute`] CRC concealment.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>, Error> {
     crate::codec::make_decoder(params)
+}
+
+/// Build a boxed Layer I [`Decoder`] from `params` with an explicit
+/// §2.4.3.1 [`ConcealmentMode`].
+///
+/// Identical to [`make_decoder`] but lets the caller pick the CRC-error
+/// concealment strategy up front — pass
+/// [`ConcealmentMode::RepeatPrevious`] to repeat the previous frame's
+/// subband samples instead of muting on a CRC mismatch.
+pub fn make_decoder_with_concealment(
+    params: &CodecParameters,
+    mode: ConcealmentMode,
+) -> Result<Box<dyn Decoder>, Error> {
+    let codec_id = if params.codec_id.as_str().is_empty() {
+        CodecId::new("mp1")
+    } else {
+        params.codec_id.clone()
+    };
+    Ok(Box::new(Mp1Decoder::new(codec_id).with_concealment(mode)))
 }
 
 #[cfg(test)]
@@ -81,6 +103,124 @@ mod tests {
         }
         frame.extend_from_slice(&bytes);
         frame
+    }
+
+    /// Build a CRC-protected mono frame allocating sb0 (nb=4); when
+    /// `corrupt` the stored CRC word is flipped so the decoder's
+    /// §2.4.3.1 concealment path fires.
+    fn build_protected_mono_frame(
+        scf_index: u32,
+        sample_codes: &[u32; 12],
+        corrupt: bool,
+    ) -> Vec<u8> {
+        use crate::header::FrameHeader;
+        // protection bit (16) = 0 -> CRC present.
+        let word: u32 = (0xFFF << 20)
+            | (1 << 19)
+            | (0b11 << 17)
+            | (0b1000 << 12)
+            | (0b01 << 10)
+            | (0b11 << 6)
+            | (1 << 2);
+        let header = word.to_be_bytes();
+
+        let mut bytes = Vec::new();
+        let mut acc = 0u32;
+        let mut nbits = 0u8;
+        put(&mut bytes, &mut acc, &mut nbits, 0b0011, 4); // sb0 nb=4
+        for _ in 1..32 {
+            put(&mut bytes, &mut acc, &mut nbits, 0, 4);
+        }
+        put(&mut bytes, &mut acc, &mut nbits, scf_index, 6);
+        for &c in sample_codes {
+            put(&mut bytes, &mut acc, &mut nbits, c, 4);
+        }
+        if nbits > 0 {
+            acc <<= 8 - nbits;
+            bytes.push(acc as u8);
+        }
+        let audio = bytes;
+
+        let h = FrameHeader::parse(&header).unwrap();
+        let mut crc = h.compute_crc(&header, &audio).unwrap();
+        if corrupt {
+            crc ^= 0xFFFF;
+        }
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&crc.to_be_bytes());
+        frame.extend_from_slice(&audio);
+        frame
+    }
+
+    /// The direct-API `make_decoder_with_concealment` honours the
+    /// requested [`ConcealmentMode`]: a corrupt frame following a good
+    /// loud frame is repeated (non-silent), proving the knob reached
+    /// the boxed `Mp1Decoder`.
+    #[test]
+    fn make_decoder_with_concealment_repeats_previous() {
+        use crate::ConcealmentMode;
+        let codes = [14u32; 12];
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut dec = make_decoder_with_concealment(&params, ConcealmentMode::RepeatPrevious)
+            .expect("make_decoder_with_concealment");
+
+        // Good loud frame establishes the previous frame.
+        let good = build_protected_mono_frame(0, &codes, false);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), good);
+        dec.send_packet(&pkt).unwrap();
+        let _ = dec.receive_frame().unwrap();
+
+        // Corrupt frame -> repeated (non-silent).
+        let bad = build_protected_mono_frame(0, &codes, true);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bad);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        assert_eq!(a.samples, 384);
+        assert!(
+            a.data[0].iter().any(|&b| b != 0),
+            "RepeatPrevious via direct API must repeat the loud previous frame"
+        );
+    }
+
+    /// The default direct-API `make_decoder` keeps the Mute default:
+    /// the same corrupt-after-good sequence differs from RepeatPrevious.
+    #[test]
+    fn make_decoder_defaults_to_mute() {
+        use crate::ConcealmentMode;
+        let codes = [14u32; 12];
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+
+        let mut mute = make_decoder(&params).unwrap();
+        let mut repeat =
+            make_decoder_with_concealment(&params, ConcealmentMode::RepeatPrevious).unwrap();
+
+        for dec in [&mut mute, &mut repeat] {
+            let pkt = Packet::new(
+                0,
+                TimeBase::new(1, 48_000),
+                build_protected_mono_frame(0, &codes, false),
+            );
+            dec.send_packet(&pkt).unwrap();
+            let _ = dec.receive_frame().unwrap();
+        }
+
+        let take = |dec: &mut Box<dyn Decoder>| {
+            let pkt = Packet::new(
+                0,
+                TimeBase::new(1, 48_000),
+                build_protected_mono_frame(0, &codes, true),
+            );
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            a.data[0].clone()
+        };
+        let mute_pcm = take(&mut mute);
+        let repeat_pcm = take(&mut repeat);
+        assert_ne!(mute_pcm, repeat_pcm, "Mute and RepeatPrevious must differ");
     }
 
     #[test]

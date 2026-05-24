@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Selectable §2.4.3.1 CRC-mismatch concealment** (`ConcealmentMode`),
+  derived solely from ISO/IEC 11172-3 (1993) §2.4.3.1, which recommends
+  "muting of the actual frame or repetition of the previous frame".
+  Both strategies are now implemented and chosen by the caller:
+  - `ConcealmentMode::Mute` (default, unchanged behaviour) emits a
+    silent frame and rings the filterbank history out with zeros.
+  - `ConcealmentMode::RepeatPrevious` re-synthesizes the last
+    successfully-decoded frame's requantized subband samples through the
+    advancing synthesis filterbank, reproducing that frame's audio
+    instead of a silence drop-out. A concealed frame is never stored as
+    the new "previous" frame, so a run of corrupt frames repeats the
+    *last good* frame each time (no chaining of repeats-of-repeats); a
+    corrupt first frame falls back to muting (nothing to repeat).
+  - Selection points: `Mp1Decoder::with_concealment` (builder),
+    `Mp1Decoder::set_concealment` (runtime), and the new direct-API
+    `decoder::make_decoder_with_concealment(&CodecParameters, ConcealmentMode)`.
+    `Mp1Decoder::new`, `Mp1Decoder::concealment` and
+    `SubbandSamples::silent` are now public. `reset` drops the repeat
+    history while preserving the configured mode.
+  - 8 new tests (6 in `codec`: default-is-mute + builder, repeat
+    reproduces the last good frame's PCM, no chaining, first-frame
+    fallback to mute, runtime `set_concealment`, frame-shape preserved,
+    reset clears history; 2 in `decoder`: the direct concealment factory
+    repeats, the plain factory keeps the Mute default). 109 tests total
+    (96 unit + 13 integration; doc-tests unchanged).
 - **§2.4.3.1 CRC-16 `error_check()` verification**, derived solely from
   ISO/IEC 11172-3 (1993) §2.4.3.1 + Annex B Table 3-B.5 (the generator
   polynomial recovered from the page-36 typeset equation render). The

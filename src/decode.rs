@@ -299,6 +299,15 @@ impl SubbandSamples {
         }
     }
 
+    /// A silent frame: `channels` channels, every subband unallocated
+    /// (all-zero requantized samples). Feeding this through the
+    /// synthesis filterbank produces silence for the new samples while
+    /// the overlap-add history rings out — the §2.4.3.1 "muting"
+    /// concealment shape.
+    pub fn silent(channels: usize) -> SubbandSamples {
+        SubbandSamples::empty(channels.clamp(1, 2))
+    }
+
     /// The 32 rescaled subband samples `s'` for channel `ch` and
     /// sample-slot `slot` (`slot < `[`SAMPLES_PER_SUBBAND`]`), laid out
     /// as `[subband 0 .. subband 31]` ready to feed the §2.4.3.2

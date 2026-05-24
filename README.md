@@ -46,7 +46,22 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   Annex B Table 3-B.5 protected fields for Layer I — header bits 16…31
   plus the bit-allocation field — and compares it with the stored word,
   returning `CrcStatus::{Absent, Ok, Mismatch}`. On a mismatch the
-  decoder applies the §2.4.3.1 *muting* concealment.
+  decoder applies a **selectable** §2.4.3.1 concealment.
+- **Selectable §2.4.3.1 concealment** (`ConcealmentMode`): the spec
+  recommends, verbatim, "muting of the actual frame or repetition of
+  the previous frame". Both are implemented. `ConcealmentMode::Mute`
+  (the default) emits a silent frame and rings the filterbank history
+  out with zeros; `ConcealmentMode::RepeatPrevious` re-synthesizes the
+  last successfully-decoded frame's requantized subband samples through
+  the (now-advanced) filterbank, reproducing that frame's audio rather
+  than a silence drop-out. A concealed frame is never stored as the new
+  "previous" frame, so a run of corrupt frames repeats the *last good*
+  frame each time instead of chaining repeats-of-repeats; if the very
+  first frame is corrupt, RepeatPrevious falls back to muting (there is
+  nothing to repeat). The mode is chosen at construction
+  (`Mp1Decoder::with_concealment`, `decoder::make_decoder_with_concealment`)
+  or switched at runtime (`Mp1Decoder::set_concealment`); `reset` drops
+  the repeat history but preserves the configured mode.
 - **Layer I audio-data decode** (§2.4.1.5 / §2.4.2.5 / §2.4.3.2):
   per-subband 4-bit bit allocation (mapped to 0/2..15 bits/sample,
   rejecting `0b1111`), 6-bit scalefactor index per allocated subband,
@@ -120,15 +135,23 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   `oxideav_core::Decoder` / `Encoder`. They are thin wrappers over the
   exact construction `register_codecs` performs, so a downstream caller
   can build a Layer I codec object without touching the runtime
-  registry, mirroring the rest of the workspace.
+  registry, mirroring the rest of the workspace. A
+  `decoder::make_decoder_with_concealment(&CodecParameters, ConcealmentMode)`
+  variant builds the boxed decoder with the §2.4.3.1 concealment
+  strategy of the caller's choosing.
 
-102 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+109 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
 field bit sizing per mode, compute→verify round-trip, corruption
-detection in the header and allocation regions, and decoder-level mute
-concealment on mismatch), the §2.4.2.5 allocation→bits table, the
+detection in the header and allocation regions, and decoder-level
+concealment on mismatch — both `ConcealmentMode::Mute` and
+`ConcealmentMode::RepeatPrevious`: that repeat reproduces the last good
+frame's PCM, does not chain repeats-of-repeats, falls back to mute on a
+corrupt first frame, drops its history on `reset` while preserving the
+mode, and is switchable at runtime via `set_concealment`), the
+§2.4.2.5 allocation→bits table, the
 MSB-first
 bit reader, the §2.4.3.2 requantization formula at several widths,
 mono / stereo / joint-stereo audio-data decode, the Table 3-B.1
@@ -150,9 +173,11 @@ plus LSF silence + tone round-trips at 16 / 22.05 / 24 kHz and an LSF
 frame-layout / header-round-trip check), and the direct-factory
 endpoints (`decoder::make_decoder` drives a real mono decode and
 `encoder::make_encoder` a real stereo encode through the boxed trait
-objects, plus the missing-`sample_rate`/`channels` rejection path).
-Test bytes are constructed locally from the §2.4.1 field layouts — no
-external fixtures.
+objects, `decoder::make_decoder_with_concealment` carries the chosen
+`ConcealmentMode` through to a real CRC-mismatch repeat while the plain
+factory keeps the Mute default, plus the missing-`sample_rate` /
+`channels` rejection path). Test bytes are constructed locally from the
+§2.4.1 field layouts — no external fixtures.
 
 ## Spec gaps (DOCS-GAP)
 
@@ -169,10 +194,29 @@ One gap remains, not blocking decode to PCM:
    the §2.4.3.2 prose (invert MSB → two's-complement fraction → linear
    formula) and the rescale is the prose's `s' = scalefactor · s''`.
 
-The CRC-mismatch concealment implemented is *muting* of the offending
-frame; the §2.4.3.1 alternative "repetition of the previous frame" is a
-followup, as is optional CRC emission on the encode side (the encoder
-currently always sets `protection_bit == 1`).
+Both §2.4.3.1 CRC-mismatch concealment strategies — *muting* of the
+offending frame and *repetition of the previous frame* — are now
+implemented and selectable (`ConcealmentMode`). Optional CRC emission
+on the encode side remains a followup (the encoder currently always
+sets `protection_bit == 1`).
+
+2. The **Annex D psychoacoustic models** are not implemented: the
+   encoder's bit allocator is signal-energy-driven rather than
+   perceptually driven. The staged 157-page `ISO_IEC_11172-3-MP3-1993.pdf`
+   carries the Annex D §D.1 (Psychoacoustic Model 1) prose — the
+   nine-step SMR algorithm, the masking-index / masking-function
+   formulae, the tonal/non-tonal labelling rules — in readable text,
+   but the essential numeric tables (D.1a/b/c "Frequencies, critical
+   band rates and absolute threshold" and D.2a/b/c "Critical band
+   boundaries" for Layer I) appear **only in an OCR-corrupted text
+   layer** where digits and decimal separators are unreliable
+   (e.g. index `7` rendered as `I`, `74` as `14`, `375,00` as
+   `315,oo`, threshold values mixing comma and period separators).
+   Transcribing a perceptual threshold table from that render would
+   silently introduce numeric errors with no clean source to validate
+   against, so the perceptual model is a DOCS-GAP awaiting clean
+   Annex D table renders (mirroring the existing `annex-b-renders/`
+   PNGs that unblocked Tables B.1 and B.3).
 
 ## License
 

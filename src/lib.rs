@@ -37,13 +37,25 @@
 //!   trait objects without the registry, mirroring the rest of the
 //!   workspace's dual-API convention.
 //!
-//! Spec gaps that remain (none block decode to PCM): on a CRC
-//! mismatch the §2.4.3.1 concealment applied is *muting* of the
-//! offending frame (the [`oxideav_core::Decoder`] emits a silent
-//! frame and rings out the filterbank history); the alternative
-//! "repetition of the previous frame" concealment is not implemented.
-//! The Layer I **encoder** always emits `protection_bit == 1`
-//! (no CRC) — optional CRC emission is a followup.
+//! On a CRC mismatch the §2.4.3.1 concealment is **selectable**: the
+//! decoder either *mutes* the offending frame
+//! ([`ConcealmentMode::Mute`], the default — emit a silent frame and
+//! ring out the filterbank history) or *repeats the previous frame*
+//! ([`ConcealmentMode::RepeatPrevious`] — re-synthesize the last good
+//! frame's subband samples). The mode is chosen at construction via
+//! [`Mp1Decoder::with_concealment`] /
+//! [`decoder::make_decoder_with_concealment`], or switched at runtime
+//! with [`Mp1Decoder::set_concealment`].
+//!
+//! Spec gaps that remain (none block decode to PCM): the Layer I
+//! **encoder** always emits `protection_bit == 1` (no CRC) — optional
+//! CRC emission is a followup. Annex D's psychoacoustic models are not
+//! implemented (the encoder's allocator is signal-energy-driven); the
+//! staged 11172-3 PDF carries Annex D §D.1 prose but the essential
+//! numeric tables (D.1a/b/c absolute thresholds, D.2a/b/c critical
+//! band boundaries) are only present in an OCR-corrupted text layer,
+//! so the perceptual model is a DOCS-GAP awaiting clean Annex D
+//! renders.
 
 #![warn(missing_debug_implementations)]
 
@@ -58,11 +70,12 @@ pub mod header;
 pub mod synthesis;
 pub mod tables;
 
-pub use codec::{register_codecs, Mp1Decoder, Mp1Encoder};
+pub use codec::{register_codecs, ConcealmentMode, Mp1Decoder, Mp1Encoder};
 pub use decode::{
     allocation_bits, decode_audio_data, requantize, BitReader, DecodeError, Subband,
     SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS,
 };
+pub use decoder::make_decoder_with_concealment;
 pub use encode::{
     allocate_bits, quantize, select_scalefactor, Allocation, AnalysisFilter, BitWriter,
     EncodeError, EncodeParams, Mp1FrameEncoder,
