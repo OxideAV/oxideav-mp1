@@ -23,11 +23,12 @@
 
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
-    Decoder, Error, Frame, Packet, Result,
+    Decoder, Encoder, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::decode::{decode_audio_data, SAMPLES_PER_SUBBAND};
-use crate::header::{find_sync, FrameHeader};
+use crate::decode::{decode_audio_data, SAMPLES_PER_SUBBAND, SUBBANDS};
+use crate::encode::{EncodeParams, Mp1FrameEncoder};
+use crate::header::{find_sync, Bitrate, FrameHeader, Mode};
 use crate::synthesis::{to_s16, SynthesisFilter};
 
 /// The canonical codec id for MPEG-1 Audio Layer I.
@@ -178,19 +179,215 @@ impl Decoder for Mp1Decoder {
     }
 }
 
-/// Install the MPEG-1 Audio Layer I decoder into `reg`.
+/// Build an [`Mp1Encoder`] from the supplied parameters. `sample_rate`
+/// is required (one of 44100, 48000, 32000), `channels` is required
+/// (1 or 2), and `bit_rate` is optional — it defaults to a sensible
+/// per-channel value if absent. The chosen mode is mono for
+/// `channels == 1` and stereo for `channels == 2`.
+pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("oxideav-mp1: sample_rate required"))?;
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("oxideav-mp1: channels required"))?;
+    let mode = match channels {
+        1 => Mode::SingleChannel,
+        2 => Mode::Stereo,
+        n => {
+            return Err(Error::invalid(format!(
+                "oxideav-mp1: unsupported channel count {n}",
+            )))
+        }
+    };
+    // Pick a default bitrate when the caller didn't specify one: 192
+    // kbit/s for mono, 256 kbit/s for stereo — middle-of-the-road values
+    // that the §2.4.2.3 ladder offers at every supported Fs.
+    let bitrate_kbps = match params.bit_rate {
+        Some(bps) => (bps / 1000) as u16,
+        None if channels == 1 => 192,
+        None => 256,
+    };
+    let bitrate = Bitrate::Fixed(bitrate_kbps);
+    let enc_params = EncodeParams {
+        bitrate,
+        sampling_frequency: sample_rate,
+        mode,
+    };
+    let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID));
+    out_params.sample_rate = Some(sample_rate);
+    out_params.channels = Some(channels);
+    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.bit_rate = Some(bitrate_kbps as u64 * 1000);
+    out_params.tag = Some(CodecTag::wave_format(0x0050));
+    Ok(Box::new(Mp1Encoder::new(
+        CodecId::new(CODEC_ID),
+        enc_params,
+        out_params,
+    )))
+}
+
+/// A frame-to-packet MPEG-1 Audio Layer I encoder.
+///
+/// Wraps [`Mp1FrameEncoder`] (which owns the per-channel analysis
+/// history) and adapts it to the [`oxideav_core::Encoder`] trait:
+/// accept an [`AudioFrame`] of interleaved S16 (or the same-shape S16P
+/// planar layout), produce one compressed Layer I packet per call.
+///
+/// Each input frame must carry exactly **384 samples per channel** —
+/// the Layer I frame granularity (§2.4.2.1). Partial frames on flush
+/// return [`Error::Eof`].
+#[derive(Debug)]
+pub struct Mp1Encoder {
+    codec_id: CodecId,
+    inner: Mp1FrameEncoder,
+    /// The output stream parameters muxers will read back via
+    /// [`Encoder::output_params`].
+    output: CodecParameters,
+    pending_frame: Option<AudioFrame>,
+    pending_pkt: Option<Packet>,
+    eof: bool,
+}
+
+impl Mp1Encoder {
+    fn new(codec_id: CodecId, params: EncodeParams, output: CodecParameters) -> Mp1Encoder {
+        Mp1Encoder {
+            codec_id,
+            inner: Mp1FrameEncoder::new(params),
+            output,
+            pending_frame: None,
+            pending_pkt: None,
+            eof: false,
+        }
+    }
+
+    /// Decode the AudioFrame's raw bytes into a per-channel-interleaved
+    /// `f64` PCM vector in `[-1, 1)`, supporting both interleaved S16
+    /// (`data.len() == 1`) and planar S16P (`data.len() == nch`).
+    fn frame_to_pcm(&self, frame: &AudioFrame) -> Result<Vec<f64>> {
+        let nch = self.inner.channels();
+        let samples = frame.samples as usize;
+        let total = samples * nch;
+        let mut pcm = vec![0.0f64; total];
+        if frame.data.len() == 1 {
+            // Interleaved S16.
+            let bytes = &frame.data[0];
+            if bytes.len() != total * 2 {
+                return Err(Error::invalid(format!(
+                    "oxideav-mp1: frame data len {} != {} expected",
+                    bytes.len(),
+                    total * 2
+                )));
+            }
+            for (i, p) in pcm.iter_mut().enumerate() {
+                let lo = bytes[i * 2];
+                let hi = bytes[i * 2 + 1];
+                let v = i16::from_le_bytes([lo, hi]);
+                *p = v as f64 / 32768.0;
+            }
+        } else if frame.data.len() == nch {
+            // Planar S16P: one plane per channel.
+            for (ch, plane) in frame.data.iter().enumerate() {
+                if plane.len() != samples * 2 {
+                    return Err(Error::invalid(format!(
+                        "oxideav-mp1: plane {ch} len {} != {}",
+                        plane.len(),
+                        samples * 2
+                    )));
+                }
+                for s in 0..samples {
+                    let v = i16::from_le_bytes([plane[s * 2], plane[s * 2 + 1]]);
+                    pcm[s * nch + ch] = v as f64 / 32768.0;
+                }
+            }
+        } else {
+            return Err(Error::invalid(format!(
+                "oxideav-mp1: expected 1 or {nch} planes, got {}",
+                frame.data.len()
+            )));
+        }
+        Ok(pcm)
+    }
+}
+
+impl Encoder for Mp1Encoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        if self.pending_pkt.is_some() || self.pending_frame.is_some() {
+            return Err(Error::other(
+                "oxideav-mp1: call receive_packet before sending another frame",
+            ));
+        }
+        let Frame::Audio(a) = frame else {
+            return Err(Error::invalid("oxideav-mp1: encoder requires audio frame"));
+        };
+        let expected = (SAMPLES_PER_SUBBAND * SUBBANDS) as u32;
+        if a.samples != expected {
+            return Err(Error::invalid(format!(
+                "oxideav-mp1: frame must carry {expected} samples/channel, got {}",
+                a.samples
+            )));
+        }
+        self.pending_frame = Some(a.clone());
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        if let Some(p) = self.pending_pkt.take() {
+            return Ok(p);
+        }
+        let Some(frame) = self.pending_frame.take() else {
+            return if self.eof {
+                Err(Error::Eof)
+            } else {
+                Err(Error::NeedMore)
+            };
+        };
+        let pcm = self.frame_to_pcm(&frame)?;
+        let bytes = self
+            .inner
+            .encode_frame(&pcm)
+            .map_err(|e| Error::other(format!("oxideav-mp1: encode: {e}")))?;
+        let sr = self.output.sample_rate.unwrap_or(48_000);
+        let mut pkt = Packet::new(0, TimeBase::new(1, sr as i64), bytes);
+        if let Some(pts) = frame.pts {
+            pkt.pts = Some(pts);
+        }
+        Ok(pkt)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        self.pending_frame = None;
+        Ok(())
+    }
+}
+
+/// Install the MPEG-1 Audio Layer I codec into `reg` (decoder and
+/// encoder).
 ///
 /// Claims the WAVE format tag `0x0050` (MPEG-1 Audio, Layer I/II) and
 /// the Matroska codec id `A_MPEG/L1` so containers can route Layer I
-/// streams here. The decoder emits interleaved S16 PCM.
+/// streams here. The decoder emits interleaved S16 PCM; the encoder
+/// accepts the same shape and produces one Layer I packet per
+/// 384-sample frame.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let info = CodecInfo::new(CodecId::new(CODEC_ID))
         .capabilities(
             CodecCapabilities::audio("mp1")
                 .with_decode()
+                .with_encode()
                 .with_lossy(true),
         )
         .decoder(make_decoder)
+        .encoder(make_encoder)
         .tags([
             CodecTag::wave_format(0x0050),
             CodecTag::matroska("A_MPEG/L1"),

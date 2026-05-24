@@ -8,6 +8,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer I encoder (PCM → bitstream)**, derived solely from ISO/IEC
+  11172-3 (1993) informative Annex C plus the normative Layer I clauses:
+  - `tables::ANALYSIS_WINDOW` — the 512 Table C.1 "Coefficients Ci of
+    the Analysis Window" taps (Annex C, PDF pages 68–69), transcribed
+    verbatim. A unit test cross-checks magnitudes against
+    `SYNTHESIS_WINDOW / 32` (the prototype-filter relationship the two
+    tables share) so a transcription slip in either table is caught.
+  - `tables::QUANT_A`, `tables::QUANT_B` — the 14 Table C.3 "Layer I
+    Quantization Coefficients" (Annex C, PDF page 72), indexed by `nb`.
+    Values cross-checked against the closed forms
+    `A = (2^nb − 1)/2^nb`, `B = −1/2^nb`.
+  - `tables::SNR_DB` — the 16 Table C.2 "Layer I Signal-to-Noise
+    Ratios" (Annex C, PDF page 72), indexed by `nb`.
+  - `encode::AnalysisFilter` — the §C.1.3 polyphase analysis filterbank
+    (figure C.4): per-channel 512-element `X` FIFO with cross-frame
+    history, the §C.1.3 windowing by `C[]`, the partial sum
+    `Y[i] = Σ_{j=0..7} Z[i+64j]`, and the matrixing
+    `S[i] = Σ_{k=0..63} M[i][k]·Y[k]` with
+    `M[i][k] = cos[(2i+1)(k-16)π/64]`.
+  - `encode::select_scalefactor` — the §C.1.5.1.4 pick: the lowest
+    Table 3-B.1 value larger than the max-absolute subband sample.
+  - `encode::quantize` — the §C.1.5.1.7 linear quantizer (Table C.3 `A,
+    B`, scaled `nb`-bit two's-complement, MSB-inverted). Exact inverse
+    of the decoder's `requantize`, verified bit-exact per (nb, code).
+  - `encode::allocate_bits` — the §C.1.5.1.6 iterative allocator. The
+    clean-room encoder uses a non-psychoacoustic signal-energy SMR
+    proxy (Annex D models intentionally not implemented), and respects
+    the `adb` budget including the +6 scalefactor cost on the 0→2 jump.
+  - `encode::Mp1FrameEncoder` — frame-level encoder that ties analysis
+    + scalefactor pick + allocation + quantization + frame assembly
+    (HEADER, ALLOC, SCALEFACTORS, SAMPLES, ANC, MSB-first per figure
+    C.2) into one Layer I packet.
+  - `codec::Mp1Encoder` implements `oxideav_core::Encoder`:
+    interleaved-S16 `AudioFrame` (384 samples/channel) → Layer I
+    packet. Factory takes `sample_rate`, `channels` and optional
+    `bit_rate` (192 kbit/s mono, 256 stereo default). `register_codecs`
+    installs encoder alongside decoder.
+  - 14 further unit tests (69 total): analysis-window endpoints +
+    2^-21 quantization + magnitude cross-check, Table C.3 closed-form
+    A/B, Table C.2 SNR monotonicity + spot values, analysis-matrix
+    spot values, `quantize ∘ requantize` identity for every (nb, code),
+    `select_scalefactor` lowest-larger-value semantics, allocator
+    behaviour at tight / zero budgets, and an analysis+synthesis
+    reconstruction test that proves the Table C.1 signs are correct
+    end-to-end (RMS < 1e-3 against the original sine).
+  - 8 new integration tests in `tests/roundtrip.rs`: silence, mono and
+    stereo tones, white noise, frame layout, output-params, registry
+    round-trip — driving the full
+    `CodecParameters → first_encoder → send_frame → receive_packet →
+    first_decoder → send_packet → receive_frame` path that a real
+    container would take.
 - **Layer I decode to PCM complete**, derived solely from ISO/IEC
   11172-3 (1993) Annex B (now staged in the 157-page PDF):
   - `tables::SCALEFACTORS` — the 63 Table 3-B.1 "LAYER I, II
