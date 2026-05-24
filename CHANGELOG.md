@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Direct factory API endpoints** (`decoder` / `encoder` modules),
+  completing the workspace dual-API convention so the crate exposes both
+  the registry path and the historical direct API:
+  - `decoder::make_decoder(&CodecParameters) -> Result<Box<dyn Decoder>, Error>`
+    and `encoder::make_encoder(&CodecParameters) -> Result<Box<dyn Encoder>, Error>`
+    are thin public wrappers over the exact `Mp1Decoder` / `Mp1Encoder`
+    construction `register_codecs` performs; a downstream caller can now
+    do `oxideav_mp1::decoder::make_decoder(&params)` /
+    `oxideav_mp1::encoder::make_encoder(&params)` like every other codec
+    crate. The `register` / `register_codecs` registry path is
+    unchanged.
+  - 3 new unit tests: a real mono decode through the boxed decoder, a
+    real stereo encode through the boxed encoder, and the
+    missing-`sample_rate`/`channels` rejection path. 92 tests total.
 - **MPEG-2 LSF (Lower Sampling Frequencies) Layer I support**, derived
   solely from ISO/IEC 13818-3 (1997) §2.4.2.3 (read from the staged
   `ISO_IEC_13818-3-MPEG2-audio-1997.pdf`), extending decode + encode to

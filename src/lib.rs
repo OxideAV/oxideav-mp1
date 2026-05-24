@@ -27,8 +27,12 @@
 //!   and [`synthesis`].
 //! * An [`oxideav_core::Decoder`] that turns one Layer I packet into a
 //!   384-sample-per-channel interleaved S16
-//!   [`AudioFrame`](oxideav_core::AudioFrame) — see [`codec`].
-//!   [`register`] installs it into the runtime registry.
+//!   [`AudioFrame`](oxideav_core::AudioFrame), and a matching
+//!   [`oxideav_core::Encoder`] — see [`codec`]. [`register`] installs
+//!   them into the runtime registry; the [`decoder::make_decoder`] and
+//!   [`encoder::make_encoder`] direct factories build the same boxed
+//!   trait objects without the registry, mirroring the rest of the
+//!   workspace's dual-API convention.
 //!
 //! Spec gaps that remain (none block decode to PCM): the CRC-16
 //! generator polynomial and Table 3-B.5 bit-coverage are not present
@@ -42,7 +46,9 @@ use oxideav_core::RuntimeContext;
 
 pub mod codec;
 pub mod decode;
+pub mod decoder;
 pub mod encode;
+pub mod encoder;
 pub mod header;
 pub mod synthesis;
 pub mod tables;

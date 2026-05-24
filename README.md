@@ -108,8 +108,16 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   **self-roundtrip**: a 1 kHz tone encodes + decodes back to PCM at
   RMS < 0.01 (≈ −40 dBFS) at 192 kbit/s mono, and stereo / white-noise /
   LSF (16 / 22.05 / 24 kHz) inputs reconstruct within similar bounds.
+- **Dual-API surface**: alongside the registry path (`register` /
+  `register_codecs`), the crate exposes the historical *direct* factory
+  endpoints — `decoder::make_decoder(&CodecParameters)` and
+  `encoder::make_encoder(&CodecParameters)`, each returning a boxed
+  `oxideav_core::Decoder` / `Encoder`. They are thin wrappers over the
+  exact construction `register_codecs` performs, so a downstream caller
+  can build a Layer I codec object without touching the runtime
+  registry, mirroring the rest of the workspace.
 
-89 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+92 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the
 CRC-presence paths, the §2.4.2.5 allocation→bits table, the MSB-first
@@ -130,8 +138,12 @@ MPEG-1-vs-LSF divergence at index 2, and three LSF frame-length cases),
 and the self-roundtrip integration tests (silence, mono tone, stereo
 tone, white noise, frame shape, output-params, registry round-trip,
 plus LSF silence + tone round-trips at 16 / 22.05 / 24 kHz and an LSF
-frame-layout / header-round-trip check). Test bytes are constructed
-locally from the §2.4.1 field layouts — no external fixtures.
+frame-layout / header-round-trip check), and the direct-factory
+endpoints (`decoder::make_decoder` drives a real mono decode and
+`encoder::make_encoder` a real stereo encode through the boxed trait
+objects, plus the missing-`sample_rate`/`channels` rejection path).
+Test bytes are constructed locally from the §2.4.1 field layouts — no
+external fixtures.
 
 ## Spec gaps (DOCS-GAP)
 
