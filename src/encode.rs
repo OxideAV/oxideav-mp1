@@ -1,9 +1,12 @@
-//! MPEG-1 Audio **Layer I** encode (analysis filterbank, scalefactor
-//! selection, bit allocation, uniform quantization).
+//! MPEG-1 / MPEG-2 LSF Audio **Layer I** encode (analysis
+//! filterbank, scalefactor selection, bit allocation, uniform
+//! quantization).
 //!
 //! Everything in this module is derived solely from ISO/IEC 11172-3
 //! (1993), the informative Annex C "The encoding process" plus the
-//! normative Layer I clauses:
+//! normative Layer I clauses, with the ISO/IEC 13818-3 §2.4.2.3 LSF
+//! extension that adds the 16 / 22.05 / 24 kHz sampling rates and a
+//! distinct Layer I bitrate ladder when the `ID` header bit is `0`:
 //!
 //! * §C.1.3 / figure C.4 "Analysis Subband Filter Flow Chart" — the
 //!   32-band polyphase analysis filterbank: shift 512-element input
@@ -445,24 +448,48 @@ impl core::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-/// The §2.4.2.3 `sampling_frequency` field code for a frequency, or
-/// `None` if the frequency is not a Layer I value.
-fn sampling_code(hz: u32) -> Option<u8> {
+/// The §2.4.2.3 `sampling_frequency` field code for a frequency, plus
+/// the `ID` bit (`1` for MPEG-1, `0` for MPEG-2 LSF), or `None` if the
+/// frequency is on neither Layer I sampling-frequency table.
+///
+/// MPEG-1 (11172-3 §2.4.2.3, `ID == 1`): 44.1 / 48 / 32 kHz maps to
+/// `0b00 / 0b01 / 0b10`. MPEG-2 LSF (13818-3 §2.4.2.3, `ID == 0`):
+/// 22.05 / 24 / 16 kHz maps to `0b00 / 0b01 / 0b10`.
+fn sampling_code(hz: u32) -> Option<(u8, u8)> {
     match hz {
-        44_100 => Some(0b00),
-        48_000 => Some(0b01),
-        32_000 => Some(0b10),
+        // MPEG-1 (11172-3 §2.4.2.3).
+        44_100 => Some((1, 0b00)),
+        48_000 => Some((1, 0b01)),
+        32_000 => Some((1, 0b10)),
+        // MPEG-2 LSF (13818-3 §2.4.2.3).
+        22_050 => Some((0, 0b00)),
+        24_000 => Some((0, 0b01)),
+        16_000 => Some((0, 0b10)),
         _ => None,
     }
 }
 
 /// The §2.4.2.3 `bitrate_index` for a fixed Layer I ladder value in
-/// kbit/s, or `None` if the value is not on the ladder.
-fn bitrate_index(kbps: u16) -> Option<u8> {
-    const LADDER: [u16; 14] = [
+/// kbit/s, given the `ID` bit (`1` → MPEG-1, `0` → MPEG-2 LSF), or
+/// `None` if the value is not on that ladder.
+///
+/// The MPEG-1 ladder (11172-3 §2.4.2.3) is `32 / 64 / 96 / 128 / 160 /
+/// 192 / 224 / 256 / 288 / 320 / 352 / 384 / 416 / 448`. The LSF
+/// ladder (13818-3 §2.4.2.3) is `32 / 48 / 56 / 64 / 80 / 96 / 112 /
+/// 128 / 144 / 160 / 176 / 192 / 224 / 256`.
+fn bitrate_index(kbps: u16, id_bit: u8) -> Option<u8> {
+    const LADDER_MPEG1: [u16; 14] = [
         32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
     ];
-    LADDER
+    const LADDER_LSF: [u16; 14] = [
+        32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+    ];
+    let ladder: &[u16] = if id_bit == 1 {
+        &LADDER_MPEG1
+    } else {
+        &LADDER_LSF
+    };
+    ladder
         .iter()
         .position(|&k| k == kbps)
         .map(|p| (p + 1) as u8)
@@ -525,10 +552,11 @@ impl Mp1FrameEncoder {
             Bitrate::Fixed(k) => k,
             _ => return Err(EncodeError::UnsupportedBitrate),
         };
-        let brate_idx = bitrate_index(bitrate_kbps).ok_or(EncodeError::UnsupportedBitrate)?;
-        let samp_code = sampling_code(self.params.sampling_frequency).ok_or(
+        let (id_bit, samp_code) = sampling_code(self.params.sampling_frequency).ok_or(
             EncodeError::UnsupportedSamplingFrequency(self.params.sampling_frequency),
         )?;
+        let brate_idx =
+            bitrate_index(bitrate_kbps, id_bit).ok_or(EncodeError::UnsupportedBitrate)?;
 
         // --- 1. Analysis: 12 slots * 32 subband samples per channel ---
         // subbands[ch][sb][slot]
@@ -579,7 +607,7 @@ impl Mp1FrameEncoder {
         let mut bw = BitWriter::new();
         // Header (§2.4.1.3), MSB-first.
         bw.put(0xFFF, 12); // syncword
-        bw.put(1, 1); // ID = MPEG-1
+        bw.put(id_bit as u32, 1); // ID: 1 = MPEG-1, 0 = MPEG-2 LSF (13818-3 §2.4.2.3)
         bw.put(0b11, 2); // layer I
         bw.put(1, 1); // protection_bit = 1 (no CRC)
         bw.put(brate_idx as u32, 4); // bitrate_index

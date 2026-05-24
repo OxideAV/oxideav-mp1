@@ -1,14 +1,21 @@
 //! # oxideav-mp1
 //!
-//! Pure-Rust **MPEG-1 Audio Layer I** decoder, clean-room rebuilt
-//! against ISO/IEC 11172-3 (1993) with every numeric table read only
-//! from the standard's Annex B.
+//! Pure-Rust **MPEG-1 / MPEG-2 LSF Audio Layer I** codec, clean-room
+//! rebuilt against ISO/IEC 11172-3 (1993) — with every numeric table
+//! read only from the standard's Annex B — and ISO/IEC 13818-3 (1997)
+//! §2.4.2.3, whose Lower-Sampling-Frequencies extension adds the
+//! 16 / 22.05 / 24 kHz sampling rates and a distinct Layer I bitrate
+//! ladder when the `ID` header bit is `0`.
 //!
-//! The crate implements the full Layer I decode path:
+//! The crate implements the full Layer I decode and encode paths
+//! across both editions:
 //!
 //! * The §2.4.1.3 / §2.4.2.3 frame **header**, frame sync and
 //!   frame-length computation (§2.4.2.1 / §2.4.3.1), plus the optional
 //!   16-bit CRC `error_check()` field (§2.4.1.4) — see [`header`].
+//!   Both the MPEG-1 sampling-frequency / bitrate tables and the
+//!   13818-3 §2.4.2.3 LSF tables are wired in; the `ID` bit selects
+//!   which pair applies.
 //! * The §2.4.1.5 / §2.4.3.2 **audio-data decode**: 4-bit bit
 //!   allocation, 6-bit scalefactor indices, and per-sample
 //!   requantization, for all four modes (mono, stereo, dual-channel,

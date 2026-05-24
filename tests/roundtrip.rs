@@ -319,3 +319,127 @@ fn encoder_and_decoder_types_export() {
     _assert_send::<Mp1Encoder>();
     _assert_send::<Mp1Decoder>();
 }
+
+// ---- 8. MPEG-2 LSF round-trip across all three LSF rates -------
+//
+// 13818-3 §2.4.2.3 adds 16 / 22.05 / 24 kHz sampling and a distinct
+// Layer I bitrate ladder when the header `ID` bit is `0`. Each LSF
+// rate is exercised end-to-end via the same encoder/decoder pair the
+// MPEG-1 tests use.
+
+#[test]
+fn lsf_silence_roundtrips_to_near_silence_all_rates() {
+    // 4 frames of mono silence at each of the three LSF rates with a
+    // representative LSF-ladder bitrate (LSF ladder tops out at 256
+    // kbit/s; mid values are picked per rate).
+    for &(fs, bitrate) in &[(16_000u32, 64u32), (22_050, 80), (24_000, 96)] {
+        let n_frames = 4;
+        let n = SAMPLES_PER_FRAME as usize * n_frames;
+        let mono = vec![0.0f64; n];
+        let (_, pcm) = pcm_s16_interleaved(&[mono]);
+        let out = encode_decode_stream(&pcm, 1, fs, bitrate);
+        for &b in &out {
+            assert_eq!(b, 0, "fs={fs} bitrate={bitrate}: non-silent byte");
+        }
+    }
+}
+
+#[test]
+fn lsf_tone_roundtrips_with_bounded_error_24khz() {
+    // 1 kHz tone at 24 kHz (LSF), 16 frames so the analysis +
+    // synthesis ramp-in (~480 samples each) clears before the
+    // steady-state region we measure. The §2.4.2.3 LSF table puts 24
+    // kHz under `ID==0, sampling_frequency=0b01`.
+    let n_frames = 16;
+    let n = SAMPLES_PER_FRAME as usize * n_frames;
+    let freq = 1000.0f64;
+    let fs = 24_000.0f64;
+    let sig: Vec<f64> = (0..n)
+        .map(|i| 0.5 * (2.0 * std::f64::consts::PI * freq * (i as f64) / fs).sin())
+        .collect();
+    let (_, pcm) = pcm_s16_interleaved(std::slice::from_ref(&sig));
+    let out = encode_decode_stream(&pcm, 1, 24_000, 128);
+    let rms = rms_per_channel(&pcm, &out, 1);
+    assert!(rms < 0.02, "LSF 24 kHz tone RMS {rms} too large");
+}
+
+#[test]
+fn lsf_tone_roundtrips_with_bounded_error_22k05hz() {
+    // 700 Hz tone at 22.05 kHz (LSF, `ID==0, sampling_frequency=0b00`).
+    // 22.05 kHz isn't an integer divisor of 12·bitrate, so the
+    // padding-bit path could in principle fire on per-frame basis; the
+    // encoder currently always emits padding_bit=0 (the frame_len
+    // bound below confirms the encoder writes the right slot count).
+    let n_frames = 16;
+    let n = SAMPLES_PER_FRAME as usize * n_frames;
+    let freq = 700.0f64;
+    let fs = 22_050.0f64;
+    let sig: Vec<f64> = (0..n)
+        .map(|i| 0.5 * (2.0 * std::f64::consts::PI * freq * (i as f64) / fs).sin())
+        .collect();
+    let (_, pcm) = pcm_s16_interleaved(std::slice::from_ref(&sig));
+    let out = encode_decode_stream(&pcm, 1, 22_050, 96);
+    let rms = rms_per_channel(&pcm, &out, 1);
+    assert!(rms < 0.05, "LSF 22.05 kHz tone RMS {rms} too large");
+}
+
+#[test]
+fn lsf_tone_roundtrips_with_bounded_error_16khz() {
+    // 500 Hz tone at 16 kHz (LSF, `ID==0, sampling_frequency=0b10`).
+    // 16 kHz is the lowest LSF rate; the audio bandwidth is ~7.5 kHz.
+    let n_frames = 16;
+    let n = SAMPLES_PER_FRAME as usize * n_frames;
+    let freq = 500.0f64;
+    let fs = 16_000.0f64;
+    let sig: Vec<f64> = (0..n)
+        .map(|i| 0.5 * (2.0 * std::f64::consts::PI * freq * (i as f64) / fs).sin())
+        .collect();
+    let (_, pcm) = pcm_s16_interleaved(std::slice::from_ref(&sig));
+    let out = encode_decode_stream(&pcm, 1, 16_000, 64);
+    let rms = rms_per_channel(&pcm, &out, 1);
+    assert!(rms < 0.05, "LSF 16 kHz tone RMS {rms} too large");
+}
+
+#[test]
+fn lsf_encoded_frame_layout_24khz() {
+    // Encode one mono silent frame at LSF 24 kHz / 128 kbit/s and
+    // verify (1) the syncword, (2) the `ID` bit is 0 (the 5th
+    // most-significant bit of byte 1), (3) the encoded frame size
+    // matches the §2.4.2.3 formula `floor(12·bitrate/Fs)·4 bytes`,
+    // and (4) parsing the header confirms LSF + 24 kHz + 128 kbit/s.
+    use oxideav_core::{AudioFrame, CodecId, CodecParameters, CodecRegistry, Frame, Packet};
+    use oxideav_mp1::register_codecs as reg;
+    let n = SAMPLES_PER_FRAME as usize;
+    let sig = vec![0.0f64; n];
+    let (_, pcm) = pcm_s16_interleaved(&[sig]);
+    let bitrate_kbps = 128u32;
+    let sample_rate = 24_000u32;
+    let mut registry = CodecRegistry::new();
+    reg(&mut registry);
+    let mut params = CodecParameters::audio(CodecId::new("mp1"));
+    params.sample_rate = Some(sample_rate);
+    params.channels = Some(1);
+    params.bit_rate = Some(bitrate_kbps as u64 * 1000);
+    let mut enc = registry.first_encoder(&params).expect("encoder");
+    let frame = AudioFrame {
+        samples: SAMPLES_PER_FRAME,
+        pts: Some(0),
+        data: vec![pcm],
+    };
+    enc.send_frame(&Frame::Audio(frame)).unwrap();
+    let pkt: Packet = enc.receive_packet().unwrap();
+    // syncword: byte 0 = 0xFF, top nibble of byte 1 = 0xF.
+    assert_eq!(pkt.data[0], 0xFF);
+    assert_eq!(pkt.data[1] & 0xF0, 0xF0);
+    // ID bit is bit 4 of byte 1 (5th MSB-counted): must be 0 for LSF.
+    assert_eq!(pkt.data[1] & 0x08, 0, "expected LSF ID bit (0)");
+    let expected_slots = (12 * bitrate_kbps * 1000) / sample_rate;
+    let expected_bytes = expected_slots as usize * 4;
+    assert_eq!(pkt.data.len(), expected_bytes);
+    // Round-trip parse confirms the header round-trips as LSF, 128 kbit/s,
+    // 24 kHz exactly.
+    let h = oxideav_mp1::FrameHeader::parse(&pkt.data).unwrap();
+    assert!(h.is_lsf());
+    assert_eq!(h.sampling_frequency, sample_rate);
+    assert_eq!(h.bitrate, oxideav_mp1::Bitrate::Fixed(bitrate_kbps as u16));
+}

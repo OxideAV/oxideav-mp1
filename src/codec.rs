@@ -180,10 +180,12 @@ impl Decoder for Mp1Decoder {
 }
 
 /// Build an [`Mp1Encoder`] from the supplied parameters. `sample_rate`
-/// is required (one of 44100, 48000, 32000), `channels` is required
-/// (1 or 2), and `bit_rate` is optional — it defaults to a sensible
-/// per-channel value if absent. The chosen mode is mono for
-/// `channels == 1` and stereo for `channels == 2`.
+/// is required (one of the six Layer I rates: MPEG-1 32 / 44.1 / 48
+/// kHz from 11172-3 §2.4.2.3, or MPEG-2 LSF 16 / 22.05 / 24 kHz from
+/// 13818-3 §2.4.2.3), `channels` is required (1 or 2), and `bit_rate`
+/// is optional — it defaults to a sensible per-channel value if
+/// absent. The chosen mode is mono for `channels == 1` and stereo for
+/// `channels == 2`.
 pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params
         .sample_rate
@@ -200,11 +202,20 @@ pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>
             )))
         }
     };
-    // Pick a default bitrate when the caller didn't specify one: 192
-    // kbit/s for mono, 256 kbit/s for stereo — middle-of-the-road values
-    // that the §2.4.2.3 ladder offers at every supported Fs.
+    // Whether the requested sample rate is an MPEG-2 LSF rate
+    // (13818-3 §2.4.2.3): 16 / 22.05 / 24 kHz. The LSF Layer I
+    // ladder tops out at 256 kbit/s vs MPEG-1's 448, and the default
+    // bitrate is scaled down to match the per-rate audio bandwidth
+    // (LSF Fs ≈ 1/2 MPEG-1 Fs, so a per-bit-budget midpoint of half
+    // the MPEG-1 default keeps allocation density comparable).
+    let is_lsf = matches!(sample_rate, 16_000 | 22_050 | 24_000);
+    // Pick a default bitrate when the caller didn't specify one. The
+    // LSF defaults are picked from the LSF ladder (which differs from
+    // MPEG-1's at almost every position).
     let bitrate_kbps = match params.bit_rate {
         Some(bps) => (bps / 1000) as u16,
+        None if is_lsf && channels == 1 => 96,
+        None if is_lsf => 128,
         None if channels == 1 => 192,
         None => 256,
     };

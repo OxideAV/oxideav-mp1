@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MPEG-2 LSF (Lower Sampling Frequencies) Layer I support**, derived
+  solely from ISO/IEC 13818-3 (1997) §2.4.2.3 (read from the staged
+  `ISO_IEC_13818-3-MPEG2-audio-1997.pdf`), extending decode + encode to
+  the three additional sampling rates 16 / 22.05 / 24 kHz when the
+  header `ID` bit is `0`:
+  - `header::Id::Mpeg2Lsf` — the `ID == 0` variant (previously
+    `Reserved`). `FrameHeader::is_lsf()` reports it.
+  - `FrameHeader::parse` selects the §2.4.2.3 LSF `sampling_frequency`
+    table (`0b00 → 22.05`, `0b01 → 24`, `0b10 → 16` kHz) and the LSF
+    Layer I `bitrate_index` ladder (32 / 48 / 56 / 64 / 80 / 96 / 112 /
+    128 / 144 / 160 / 176 / 192 / 224 / 256 kbit/s) when `ID == 0`,
+    keeping the MPEG-1 tables for `ID == 1`. The Layer I slot-count
+    formula `N = floor(12·bitrate/Fs) + padding` is unchanged.
+  - `encode` writes the `ID` bit per the requested sample rate and uses
+    the matching bitrate ladder; the factory accepts the LSF rates and
+    defaults to 96 kbit/s mono / 128 kbit/s stereo for LSF inputs.
+  - 7 new unit tests (LSF sampling table, reserved-rate rejection, the
+    full LSF bitrate ladder, MPEG-1-vs-LSF ladder divergence at index 2,
+    and three LSF frame-length cases) plus 5 new integration tests (LSF
+    silence + tone round-trips across 16 / 22.05 / 24 kHz and an LSF
+    frame-layout / header-round-trip check). 89 tests total.
 - **Layer I encoder (PCM → bitstream)**, derived solely from ISO/IEC
   11172-3 (1993) informative Annex C plus the normative Layer I clauses:
   - `tables::ANALYSIS_WINDOW` — the 512 Table C.1 "Coefficients Ci of

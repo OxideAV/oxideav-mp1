@@ -1,11 +1,12 @@
 # oxideav-mp1
 
-A pure-Rust **MPEG-1 Audio Layer I** (MP1) decoder for the
+A pure-Rust **MPEG-1 / MPEG-2 LSF Audio Layer I** (MP1) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
 ## Status
 
-**Clean-room rebuild — encode + decode round-trip (2026-05-24).** The prior
+**Clean-room rebuild — encode + decode round-trip, MPEG-1 and MPEG-2 LSF
+(2026-05-24).** The prior
 implementation was retired under the workspace
 [clean-room policy](https://github.com/OxideAV/oxideav-workspace/blob/master/docs/IMPLEMENTOR_ROUND.md):
 the provenance of its 512-tap synthesis-window data table could not be
@@ -15,18 +16,25 @@ rather than read solely from the ISO/IEC specification. Master history
 was fully erased per the Hat-3 cold-enforcement procedure.
 
 The rebuild reads numeric tables **only** from ISO/IEC 11172-3 (1993),
-the MPEG-1 audio standard (157-page edition with Annex B).
+the MPEG-1 audio standard (157-page edition with Annex B), and from
+ISO/IEC 13818-3 (1997) §2.4.2.3 for the MPEG-2 LSF (Lower Sampling
+Frequencies) redefinitions.
 
 ## What works today
 
-The crate decodes a complete MPEG-1 Audio **Layer I** frame to
-interleaved S16 PCM, all from ISO/IEC 11172-3:
+The crate decodes and encodes complete MPEG-1 *and* MPEG-2 LSF Audio
+**Layer I** frames to/from interleaved S16 PCM, all from ISO/IEC 11172-3
+plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
 
 - **32-bit frame header** (§2.4.1.3 / §2.4.2.3): all thirteen fields
-  decoded into the typed [`FrameHeader`] struct. The Layer I
-  `bitrate_index` ladder and `sampling_frequency` table come straight
-  from the §2.4.2.3 tables; forbidden (`0b1111`) and reserved (`0b11`)
-  values are rejected, free format is recognized.
+  decoded into the typed [`FrameHeader`] struct. The `ID` bit selects
+  the edition: `ID == 1` uses the MPEG-1 Layer I `bitrate_index` ladder
+  (32 … 448 kbit/s) and `sampling_frequency` table (32 / 44.1 / 48 kHz);
+  `ID == 0` uses the ISO/IEC 13818-3 §2.4.2.3 LSF Layer I ladder (32 /
+  48 / 56 / 64 / 80 / 96 / 112 / 128 / 144 / 160 / 176 / 192 / 224 /
+  256 kbit/s) and LSF sampling table (16 / 22.05 / 24 kHz). Forbidden
+  (`0b1111`) and reserved (`0b11`) values are rejected, free format is
+  recognized. `FrameHeader::is_lsf()` reports which edition was parsed.
 - **Frame sync** (§2.4.3.1) and **frame-length computation**
   (§2.4.2.1 / §2.4.3.1): slot count
   `N = floor(12 · bitrate / sampling_frequency) + padding_bit`, four
@@ -41,7 +49,9 @@ interleaved S16 PCM, all from ISO/IEC 11172-3:
   as a two's-complement fraction, apply the §2.4.3.2 linear formula).
   Handles mono, stereo, dual-channel, and joint-stereo — the
   joint-stereo upper band `[bound, 32)` shares one allocation and one
-  sample stream copied to both channels (intensity_stereo).
+  sample stream copied to both channels (intensity_stereo). The decode
+  path is sample-rate-agnostic, so MPEG-1 and LSF frames decode through
+  the same code once the header has selected the right tables.
 - **Scalefactor rescale** (§2.4.3.2): each requantized sample is
   multiplied by `scalefactor[index]` from **Table 3-B.1 "LAYER I, II
   SCALEFACTORS"** (Annex B, PDF page 51), transcribed into
@@ -90,29 +100,37 @@ interleaved S16 PCM, all from ISO/IEC 11172-3:
 - **`oxideav_core::Encoder` + registration**: `Mp1Encoder` turns a
   384-sample-per-channel interleaved S16 `AudioFrame` into one Layer I
   packet; `register_codecs` installs it alongside the decoder. The
-  factory takes `sample_rate`, `channels` and optional `bit_rate` (192
-  kbit/s mono, 256 stereo default) from `CodecParameters`. Validated by
+  factory takes `sample_rate`, `channels` and optional `bit_rate` from
+  `CodecParameters`, accepting all six Layer I rates — the MPEG-1 32 /
+  44.1 / 48 kHz (default 192 kbit/s mono, 256 stereo) and the LSF 16 /
+  22.05 / 24 kHz (default 96 kbit/s mono, 128 stereo) — and writing the
+  `ID` bit and bitrate-ladder index that match. Validated by
   **self-roundtrip**: a 1 kHz tone encodes + decodes back to PCM at
-  RMS < 0.01 (≈ −40 dBFS) at 192 kbit/s mono, and stereo / white-noise
-  inputs reconstruct within similar bounds.
+  RMS < 0.01 (≈ −40 dBFS) at 192 kbit/s mono, and stereo / white-noise /
+  LSF (16 / 22.05 / 24 kHz) inputs reconstruct within similar bounds.
 
-77 tests cover the whole bitrate ladder, every sampling rate, all
-mode / mode_extension / emphasis codes, both padding cases at 44.1 kHz,
-sync recovery, the CRC-presence paths, the §2.4.2.5 allocation→bits
-table, the MSB-first bit reader, the §2.4.3.2 requantization formula at
-several widths, mono / stereo / joint-stereo audio-data decode, the
-Table 3-B.1 scalefactor table (spot checks + formula + the 2^-16
-quantization of Table 3-B.3 + its symmetry), the matrixing coefficients,
-a window overlap-add unit test, full frame→PCM smoke tests (mono +
-stereo), and the new encoder coverage: the Table C.1 analysis-window
-endpoints + 2^-21 quantization + magnitude cross-check against Table
-3-B.3, the Table C.3 closed-form `A`/`B`, the Table C.2 SNR
-monotonicity, analysis-matrix spot values, the round-trip
-`quantize → requantize` identity at every (nb, code), scalefactor
-selection per §C.1.5.1.4, allocator behaviour under tight budgets, the
-analysis+synthesis reconstruction test, and eight self-roundtrip
-integration tests (silence, mono tone, stereo tone, white noise, frame
-shape, output-params, registry round-trip). Test bytes are constructed
+89 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+rate across both editions, all mode / mode_extension / emphasis codes,
+padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the
+CRC-presence paths, the §2.4.2.5 allocation→bits table, the MSB-first
+bit reader, the §2.4.3.2 requantization formula at several widths,
+mono / stereo / joint-stereo audio-data decode, the Table 3-B.1
+scalefactor table (spot checks + formula + the 2^-16 quantization of
+Table 3-B.3 + its symmetry), the matrixing coefficients, a window
+overlap-add unit test, full frame→PCM smoke tests (mono + stereo), the
+encoder coverage (the Table C.1 analysis-window endpoints + 2^-21
+quantization + magnitude cross-check against Table 3-B.3, the Table C.3
+closed-form `A`/`B`, the Table C.2 SNR monotonicity, analysis-matrix
+spot values, the round-trip `quantize → requantize` identity at every
+(nb, code), scalefactor selection per §C.1.5.1.4, allocator behaviour
+under tight budgets, the analysis+synthesis reconstruction test), the
+ISO/IEC 13818-3 §2.4.2.3 LSF tables (the LSF sampling-frequency map, the
+reserved-rate rejection, the full LSF Layer I ladder, the
+MPEG-1-vs-LSF divergence at index 2, and three LSF frame-length cases),
+and the self-roundtrip integration tests (silence, mono tone, stereo
+tone, white noise, frame shape, output-params, registry round-trip,
+plus LSF silence + tone round-trips at 16 / 22.05 / 24 kHz and an LSF
+frame-layout / header-round-trip check). Test bytes are constructed
 locally from the §2.4.1 field layouts — no external fixtures.
 
 ## Spec gaps (DOCS-GAP)

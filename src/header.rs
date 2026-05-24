@@ -1,20 +1,31 @@
-//! MPEG-1 Audio **Layer I** frame-header parsing.
+//! MPEG-1 / MPEG-2 LSF Audio **Layer I** frame-header parsing.
 //!
 //! Everything in this module is derived solely from ISO/IEC 11172-3
-//! (1993), the MPEG-1 audio standard, Layer I clauses:
+//! (1993), the MPEG-1 audio standard (Layer I clauses), and from
+//! ISO/IEC 13818-3 (1997) §2.4.2.3 which redefines the
+//! `sampling_frequency` and Layer I `bitrate_index` ladders when the
+//! `ID` bit is `0` (Lower Sampling Frequencies / LSF mode, adding
+//! 16 / 22.05 / 24 kHz):
 //!
-//! * §2.4.1.3 — the 32-bit `header()` field layout.
+//! * §2.4.1.3 — the 32-bit `header()` field layout (common to MPEG-1
+//!   and MPEG-2 LSF Layer I).
 //! * §2.4.1.4 — the optional `error_check()` (16-bit CRC) that follows
 //!   the header when `protection_bit == 0`.
 //! * §2.4.2.1 — frame definition: in Layer I a frame carries 384
 //!   samples and consists of an integer number of *slots*, each slot
-//!   being four bytes.
-//! * §2.4.2.3 — the field semantics, the `bitrate_index` ladder, the
-//!   `sampling_frequency` table, the `mode`/`mode_extension` tables,
-//!   the `emphasis` table, and the padding method that gives the
-//!   Layer I slot count `dif = (12 * bitrate) % sampling_frequency`.
+//!   being four bytes (unchanged by LSF — only Layer III shrinks to
+//!   576 samples per LSF frame).
+//! * §2.4.2.3 (11172-3) — the MPEG-1 field semantics, the `ID==1`
+//!   sampling-frequency table (32 / 44.1 / 48 kHz) and Layer I
+//!   bitrate ladder (32 / 64 / ... / 448 kbit/s).
+//! * §2.4.2.3 (13818-3) — the LSF redefinitions used when `ID==0`:
+//!   the `sampling_frequency` table maps to 16 / 22.05 / 24 kHz, the
+//!   Layer I bitrate ladder is 32 / 48 / 56 / 64 / 80 / 96 / 112 /
+//!   128 / 144 / 160 / 176 / 192 / 224 / 256 kbit/s.
 //! * §2.4.3.1 — synchronization and the frame-length relationship
-//!   (slot distance `N` between consecutive syncwords).
+//!   (slot distance `N` between consecutive syncwords). The Layer I
+//!   slot-count formula `N = floor(12·bitrate/Fs) + padding` is
+//!   identical in both editions; only the operands change.
 //!
 //! This module implements **only** the common header plus Layer I
 //! frame sync and frame-length computation. The bit-allocation,
@@ -32,24 +43,51 @@ pub const LAYER1_SAMPLES_PER_FRAME: u32 = 384;
 pub const LAYER1_SLOT_BYTES: u32 = 4;
 
 /// The 11172-3 §2.4.2.3 `bitrate_index` → bitrate ladder, **Layer I
-/// column only**, in kbit/s.
+/// column only** (`ID == 1`, MPEG-1), in kbit/s.
 ///
 /// Index `0b0000` is the *free format* condition (signalled here as
 /// [`Bitrate::Free`]); index `0b1111` is *forbidden*
 /// ([`Bitrate::Forbidden`]). The intermediate indices map to the
 /// fixed bitrates listed in the standard's table.
-const LAYER1_BITRATE_KBPS: [u16; 14] = [
-    // bitrate_index 0b0001 .. 0b1110 (the 14 fixed Layer I rates).
+const LAYER1_BITRATE_KBPS_MPEG1: [u16; 14] = [
+    // bitrate_index 0b0001 .. 0b1110 (the 14 fixed MPEG-1 Layer I rates).
     32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
 ];
 
-/// The 11172-3 §2.4.2.3 `sampling_frequency` table, in Hz.
+/// The 13818-3 §2.4.2.3 `bitrate_index` → bitrate ladder, **Layer I
+/// column only** (`ID == 0`, MPEG-2 LSF), in kbit/s.
+///
+/// Index `0b0000` is the *free format* condition, `0b1111` is
+/// *forbidden*. The Lower-Sampling-Frequencies ladder differs from
+/// the MPEG-1 ladder: notably the smaller increments at the low end
+/// (32 / 48 / 56 / 64 …) and the top rate of 256 kbit/s.
+const LAYER1_BITRATE_KBPS_LSF: [u16; 14] = [
+    // bitrate_index 0b0001 .. 0b1110 (the 14 fixed LSF Layer I rates,
+    // per ISO/IEC 13818-3 §2.4.2.3 table).
+    32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+];
+
+/// The 11172-3 §2.4.2.3 `sampling_frequency` table (MPEG-1, `ID == 1`)
+/// in Hz.
 ///
 /// Index `0b11` is *reserved* and is represented here by `None`.
-const SAMPLING_FREQUENCY_HZ: [Option<u32>; 4] = [
+const SAMPLING_FREQUENCY_HZ_MPEG1: [Option<u32>; 4] = [
     Some(44_100), // 0b00 -> 44.1 kHz
     Some(48_000), // 0b01 -> 48 kHz
     Some(32_000), // 0b10 -> 32 kHz
+    None,         // 0b11 -> reserved
+];
+
+/// The 13818-3 §2.4.2.3 `sampling_frequency` table (MPEG-2 LSF,
+/// `ID == 0`) in Hz.
+///
+/// Note the different mapping from the MPEG-1 table: `0b00` selects
+/// 22.05 kHz, `0b01` selects 24 kHz, `0b10` selects 16 kHz. Index
+/// `0b11` is *reserved*.
+const SAMPLING_FREQUENCY_HZ_LSF: [Option<u32>; 4] = [
+    Some(22_050), // 0b00 -> 22.05 kHz
+    Some(24_000), // 0b01 -> 24 kHz
+    Some(16_000), // 0b10 -> 16 kHz
     None,         // 0b11 -> reserved
 ];
 
@@ -90,13 +128,24 @@ impl core::fmt::Display for HeaderError {
 
 impl std::error::Error for HeaderError {}
 
-/// The `ID` bit (§2.4.2.3): the algorithm identifier.
+/// The `ID` bit (§2.4.2.3).
+///
+/// In ISO/IEC 11172-3 alone, `ID == '0'` is reserved. ISO/IEC 13818-3
+/// §2.4.2.3 redefines `ID == '0'` as the *Lower Sampling Frequencies*
+/// (LSF) extension that adds the three sampling frequencies 16 /
+/// 22.05 / 24 kHz and a separate Layer I bitrate ladder. This crate
+/// supports both editions, so `ID == '0'` is now [`Id::Mpeg2Lsf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Id {
-    /// `ID == '1'`: MPEG audio.
+    /// `ID == '1'`: MPEG-1 audio (11172-3) — the 32 / 44.1 / 48 kHz
+    /// sampling-frequency table and the 32 / 64 / … / 448 kbit/s
+    /// Layer I bitrate ladder apply.
     Mpeg,
-    /// `ID == '0'`: reserved by the standard.
-    Reserved,
+    /// `ID == '0'`: MPEG-2 LSF audio (13818-3 §2.4.2.3) — the
+    /// 16 / 22.05 / 24 kHz sampling-frequency table and the LSF
+    /// Layer I bitrate ladder (32 / 48 / 56 / 64 / 80 / 96 / 112 /
+    /// 128 / 144 / 160 / 176 / 192 / 224 / 256 kbit/s) apply.
+    Mpeg2Lsf,
 }
 
 /// The `mode` field (§2.4.2.3).
@@ -256,20 +305,31 @@ impl FrameHeader {
             return Err(HeaderError::NotLayer1(layer));
         }
 
-        // bitrate_index against the Layer I ladder (§2.4.2.3).
+        // ID selects which Layer I bitrate ladder and which
+        // sampling_frequency table apply: 11172-3 §2.4.2.3 for ID==1,
+        // 13818-3 §2.4.2.3 (LSF) for ID==0.
+        let id = if id_bit == 1 { Id::Mpeg } else { Id::Mpeg2Lsf };
+        let bitrate_table = match id {
+            Id::Mpeg => &LAYER1_BITRATE_KBPS_MPEG1,
+            Id::Mpeg2Lsf => &LAYER1_BITRATE_KBPS_LSF,
+        };
+        let sampling_table = match id {
+            Id::Mpeg => &SAMPLING_FREQUENCY_HZ_MPEG1,
+            Id::Mpeg2Lsf => &SAMPLING_FREQUENCY_HZ_LSF,
+        };
+
+        // bitrate_index against the selected Layer I ladder.
         let bitrate = match bitrate_index {
             0b0000 => Bitrate::Free,
             0b1111 => return Err(HeaderError::ForbiddenBitrate),
-            n => Bitrate::Fixed(LAYER1_BITRATE_KBPS[(n - 1) as usize]),
+            n => Bitrate::Fixed(bitrate_table[(n - 1) as usize]),
         };
 
-        // sampling_frequency table (§2.4.2.3).
-        let sampling_frequency = match SAMPLING_FREQUENCY_HZ[sampling_index] {
+        // sampling_frequency table for the selected ID.
+        let sampling_frequency = match sampling_table[sampling_index] {
             Some(hz) => hz,
             None => return Err(HeaderError::ReservedSamplingFrequency),
         };
-
-        let id = if id_bit == 1 { Id::Mpeg } else { Id::Reserved };
 
         // protection_bit == '1' means NO redundancy added (§2.4.2.3).
         let protection = protection_bit == 1;
@@ -312,6 +372,12 @@ impl FrameHeader {
     /// (§2.4.1.4): present exactly when `protection_bit == 0`.
     pub fn has_crc(self) -> bool {
         !self.protection
+    }
+
+    /// Whether this header is an MPEG-2 LSF (Lower Sampling
+    /// Frequencies) header (13818-3 §2.4.2.3, `ID == 0`).
+    pub fn is_lsf(self) -> bool {
+        matches!(self.id, Id::Mpeg2Lsf)
     }
 
     /// Number of slots in this frame (§2.4.2.3 / §2.4.3.1).
@@ -598,14 +664,110 @@ mod tests {
 
     #[test]
     fn single_bit_flags_round_trip() {
-        // private, copyright, original=copy, id=reserved, padding all set.
+        // Drive a stress combination: ID==0 (MPEG-2 LSF), all single-bit
+        // flags set, padding on, original/copy cleared. With ID==0 the
+        // bitrate_index 0b1000 maps to 128 kbit/s on the LSF ladder and
+        // sampling 0b01 maps to 24 kHz (13818-3 §2.4.2.3).
         let bytes = build_header(0, 0b11, 1, 0b1000, 0b01, 1, 1, 0b00, 0, 1, 0, 0);
         let h = FrameHeader::parse(&bytes).unwrap();
-        assert_eq!(h.id, Id::Reserved);
+        assert_eq!(h.id, Id::Mpeg2Lsf);
+        assert!(h.is_lsf());
+        assert_eq!(h.bitrate, Bitrate::Fixed(128));
+        assert_eq!(h.sampling_frequency, 24_000);
         assert!(h.padding);
         assert!(h.private);
         assert!(h.copyright);
         assert!(!h.original, "original/copy == 0 means a copy");
+    }
+
+    // ---- ISO/IEC 13818-3 §2.4.2.3 LSF (ID==0) -----------------
+
+    #[test]
+    fn lsf_sampling_frequency_table() {
+        // 13818-3 §2.4.2.3: with ID==0 the sampling_frequency field
+        // maps 0b00 -> 22.05 kHz, 0b01 -> 24 kHz, 0b10 -> 16 kHz.
+        let cases = [(0b00u32, 22_050u32), (0b01, 24_000), (0b10, 16_000)];
+        for (bits, hz) in cases {
+            // bitrate_index 0b0001 = 32 kbit/s on the LSF ladder.
+            let bytes = build_header(0, 0b11, 1, 0b0001, bits, 0, 0, 0, 0, 0, 1, 0);
+            let h = FrameHeader::parse(&bytes).unwrap();
+            assert_eq!(h.id, Id::Mpeg2Lsf);
+            assert_eq!(h.sampling_frequency, hz, "lsf sampling 0b{bits:02b}");
+        }
+    }
+
+    #[test]
+    fn lsf_reserved_sampling_frequency() {
+        // ID==0 with sampling_frequency 0b11 must still be rejected.
+        let bytes = build_header(0, 0b11, 1, 0b0001, 0b11, 0, 0, 0, 0, 0, 1, 0);
+        assert_eq!(
+            FrameHeader::parse(&bytes),
+            Err(HeaderError::ReservedSamplingFrequency)
+        );
+    }
+
+    #[test]
+    fn lsf_whole_bitrate_ladder_layer1() {
+        // 13818-3 §2.4.2.3 Layer I LSF column, indices 0b0001..0b1110.
+        // Read directly from the staged ISO/IEC 13818-3 PDF table at
+        // §2.4.2.3 ("bitrate specified (kbit/s) for Fs = 16, 22,05, 24
+        // kHz", Layer I column).
+        let expected = [
+            32u16, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+        ];
+        for (i, &kbps) in expected.iter().enumerate() {
+            let idx = (i + 1) as u32; // 0b0001..0b1110
+                                      // Use 24 kHz (sampling 0b01 with ID==0) so every ladder
+                                      // entry yields a non-zero slot count.
+            let bytes = build_header(0, 0b11, 1, idx, 0b01, 0, 0, 0, 0, 0, 1, 0);
+            let h = FrameHeader::parse(&bytes).unwrap();
+            assert_eq!(h.bitrate, Bitrate::Fixed(kbps), "LSF index 0b{idx:04b}");
+        }
+    }
+
+    #[test]
+    fn lsf_does_not_overlap_mpeg1_ladder_at_index_2() {
+        // Index 0b0010: MPEG-1 -> 64 kbit/s, LSF -> 48 kbit/s. Same
+        // header bits, different ID, different decoded bitrate.
+        let m1 = FrameHeader::parse(&build_header(1, 0b11, 1, 0b0010, 0b01, 0, 0, 0, 0, 0, 1, 0))
+            .unwrap();
+        assert_eq!(m1.bitrate, Bitrate::Fixed(64));
+        let lsf = FrameHeader::parse(&build_header(0, 0b11, 1, 0b0010, 0b01, 0, 0, 0, 0, 0, 1, 0))
+            .unwrap();
+        assert_eq!(lsf.bitrate, Bitrate::Fixed(48));
+    }
+
+    #[test]
+    fn lsf_frame_length_24k_64kbps() {
+        // 24 kHz, 64 kbit/s (LSF index 0b0100), no padding.
+        // slots = floor(12 * 64000 / 24000) = 32 -> 128 bytes.
+        let bytes = build_header(0, 0b11, 1, 0b0100, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&bytes).unwrap();
+        assert!(h.is_lsf());
+        assert_eq!(h.slot_count(), Some(32));
+        assert_eq!(h.frame_length_bytes(), Some(128));
+    }
+
+    #[test]
+    fn lsf_frame_length_22k05_needs_padding() {
+        // 22.05 kHz, 64 kbit/s (LSF index 0b0100), padding bit set.
+        // base = floor(12 * 64000 / 22050) = floor(34.83..) = 34;
+        // +1 padding slot = 35 slots -> 140 bytes.
+        let bytes = build_header(0, 0b11, 1, 0b0100, 0b00, 1, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&bytes).unwrap();
+        assert_eq!(h.slot_count(), Some(35));
+        assert_eq!(h.frame_length_bytes(), Some(140));
+    }
+
+    #[test]
+    fn lsf_frame_length_16k_lowest_bitrate() {
+        // 16 kHz, 32 kbit/s (LSF index 0b0001), no padding.
+        // slots = floor(12 * 32000 / 16000) = 24 -> 96 bytes.
+        let bytes = build_header(0, 0b11, 1, 0b0001, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&bytes).unwrap();
+        assert_eq!(h.sampling_frequency, 16_000);
+        assert_eq!(h.slot_count(), Some(24));
+        assert_eq!(h.frame_length_bytes(), Some(96));
     }
 
     #[test]
