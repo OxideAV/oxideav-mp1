@@ -8,6 +8,70 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II `audio_data()` decode** (ISO/IEC 11172-3 (1993) §2.4.1.6
+  / §2.4.2.6 / §2.4.3.3 + Annex B Tables 3-B.2a..d "Possible
+  quantization per subband" and 3-B.4 "Layer II classes of
+  quantization"). The frame-header parser now accepts the `layer ==
+  '10'` codepoint (alongside `'11'` Layer I) and selects the correct
+  bitrate ladder for either edition (MPEG-1 Layer II:
+  32/48/56/64/80/96/112/128/160/192/224/256/320/384 kbit/s; MPEG-2
+  LSF Layer II / III shared ladder: 8/16/24/32/40/48/56/64/80/96/
+  112/128/144/160). Layer II framing uses 1-byte slots and the
+  `slot_count = floor(144 · bitrate / Fs) + padding` formula
+  (§2.4.2.1), producing 1152 samples per channel per frame.
+  - New `decode_layer2` module + `decode_layer2_audio_data` entry
+    point: reads the per-subband nbal-bit allocation (table picked by
+    `(Fs, kbps-per-channel)` per the §B.2 per-table headers), the
+    per-subband 2-bit `scfsi`, the 1..3 six-bit Table 3-B.1
+    scalefactor indices per §2.4.3.3.2 scfsi schedule, and 12
+    syntax-granules of either one grouped `samplecode` (degrouped by
+    `c % nlevels; c /= nlevels` × 3) or three separable `sample`
+    reads. Each triplet's §2.4.3.3.4 linear formula
+    `s'' = C · (s''' + D)` (constants from Table 3-B.4) is rescaled
+    by the per-part Table 3-B.1 multiplier; 36 sample-slots per
+    subband per channel feed the existing §2.4.3.2 polyphase synthesis
+    filterbank.
+  - Intensity_stereo upper band (`[bound, sblimit)` in joint_stereo)
+    shares one allocation and one sample stream copied into both
+    channels (§2.4.2.6 / §2.4.3.3).
+  - `Mp1Decoder` routes Layer II packets through the new audio_data
+    + a 36-slot synthesis loop that emits 1152 samples per channel
+    per frame (vs the Layer I path's 384).
+  - 4 Tables-3-B.2x allocation tables transcribed verbatim from PDF
+    pages 52-55 page renders; 17 Table 3-B.4 quantization classes
+    transcribed from PDF page 59 (formulas C = 2^n/(2^n-1),
+    D = 2^(-n+1) cross-checked against every non-grouped row).
+  - **Fixture-driven integration test**
+    (`tests/layer2_mono.rs`): decodes an ffmpeg-encoded mono `.mp2`
+    (440 Hz sine, 64 kbit/s, 44.1 kHz, 20 frames) and compares the
+    steady-state PCM against ffmpeg's reference S16 decode of the
+    same file. **RMS = 0.50 LSB, max|err| = 1 LSB across 20 736
+    samples** — essentially bit-exact, the residual being IEEE-754
+    multiplication-order differences.
+  - New public types/items: `Layer`, `Layer2Subband`, `Layer2Subbands`,
+    `LAYER2_SAMPLES_PER_FRAME`, `LAYER2_SAMPLES_PER_SUBBAND`,
+    `decode_layer2_audio_data`, `tables_layer2::QuantClass`,
+    `tables_layer2::AllocationTable`,
+    `tables_layer2::layer2_bit_allocation_table`,
+    `tables_layer2::QUANT_CLASSES`.
+  - New `FrameHeader::layer` field carries the parsed `Layer::{I, II}`
+    value. `HeaderError::NotLayer1` is retained for API stability but
+    now only fires on Layer III (`'01'`) and the reserved value
+    (`'00'`).
+  - 16 new unit tests across `decode_layer2` (all-unallocated mono
+    decode through B.2a, requantization endpoints, grouped degroup)
+    and `tables_layer2` (B.4 formula cross-check, grouped-class
+    bits-per-sample, B.2a/B.2c/B.2d shapes + sum-of-nbal footers,
+    quant-class resolution, stereo bitrate-per-channel division).
+    3 new integration tests in `tests/layer2_mono.rs`. Total now 126
+    tests (108 unit + 16 integration + 2 doc).
+  - **Followups**: Layer II encoder; §2.4.3.1 CRC-16 verification
+    over the Layer II protected fields (header bits 16…31 + bit
+    allocation + scfsi per Table 3-B.5); transcription of the
+    13818-3 LSF Layer II allocation table for Fs ∈ {16, 22.05, 24}
+    kHz (currently mapped onto the 11172-3 B.2b table as a defensive
+    default).
+
 - **Selectable §2.4.3.1 CRC-mismatch concealment** (`ConcealmentMode`),
   derived solely from ISO/IEC 11172-3 (1993) §2.4.3.1, which recommends
   "muting of the actual frame or repetition of the previous frame".

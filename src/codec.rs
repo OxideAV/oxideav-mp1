@@ -29,8 +29,9 @@ use oxideav_core::{
 };
 
 use crate::decode::{decode_audio_data, SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS};
+use crate::decode_layer2::{decode_layer2_audio_data, Layer2Subbands, LAYER2_SAMPLES_PER_SUBBAND};
 use crate::encode::{EncodeParams, Mp1FrameEncoder};
-use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Mode};
+use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Layer, Mode};
 use crate::synthesis::{to_s16, SynthesisFilter};
 
 /// The canonical codec id for MPEG-1 Audio Layer I.
@@ -133,13 +134,14 @@ impl Mp1Decoder {
         self.concealment
     }
 
-    /// Decode one Layer I frame found in `data` into interleaved S16
-    /// PCM. Returns `(pcm_bytes, samples_per_channel, channels)`.
+    /// Decode one Layer I or Layer II frame found in `data` into
+    /// interleaved S16 PCM. Returns
+    /// `(pcm_bytes, samples_per_channel, channels)`.
     fn decode_frame(&mut self, data: &[u8]) -> Result<(Vec<u8>, u32, usize)> {
         // Locate the frame sync. find_sync validates the whole 32-bit
         // header so a leading ID3 tag / junk is skipped.
         let off = find_sync(data)
-            .ok_or_else(|| Error::invalid("oxideav-mp1: no Layer I frame sync in packet"))?;
+            .ok_or_else(|| Error::invalid("oxideav-mp1: no Layer I/II frame sync in packet"))?;
         let frame = &data[off..];
         let header = FrameHeader::parse(frame)
             .map_err(|e| Error::invalid(format!("oxideav-mp1: header parse: {e}")))?;
@@ -157,6 +159,20 @@ impl Mp1Decoder {
             ));
         }
         let audio = &frame[audio_start..];
+
+        // Layer II frames go through their own audio_data() decode and
+        // synthesis loop (36 sample-slots per channel instead of 12).
+        // CRC verification for Layer II is not yet implemented because
+        // Table 3-B.5 lists the Layer II protected fields as header
+        // bits 16…31 + bit allocation + scfsi — bit-allocation is
+        // variable-width per table B.2x and scfsi is decided dynamically
+        // from the allocation values, so the CRC computation has to walk
+        // the allocation stage first. A Layer II frame with a CRC word
+        // still parses (the word is skipped) but the word is not
+        // checked yet. Layer I CRC handling is unchanged.
+        if matches!(header.layer, Layer::II) {
+            return self.decode_layer2_frame(&header, audio);
+        }
 
         // §2.4.3.1 error_check(): when the frame is CRC-protected,
         // verify the stored word over header bits 16…31 + the
@@ -188,6 +204,51 @@ impl Mp1Decoder {
         // RepeatPrevious concealment (§2.4.3.1).
         self.last_subbands = Some(subbands);
         Ok(out)
+    }
+
+    /// Decode one Layer II frame's audio_data + run the §2.4.3.2
+    /// polyphase synthesis filterbank over its 36 sample-slots,
+    /// producing 1152 PCM samples per channel.
+    fn decode_layer2_frame(
+        &mut self,
+        header: &FrameHeader,
+        audio: &[u8],
+    ) -> Result<(Vec<u8>, u32, usize)> {
+        let nch = header.channels() as usize;
+        let subbands = decode_layer2_audio_data(header, audio)
+            .map_err(|e| Error::invalid(format!("oxideav-mp1: layer II audio_data: {e}")))?;
+        let out = self.synthesize_layer2_subbands(&subbands, nch);
+        Ok(out)
+    }
+
+    /// Run the §2.4.3.2 polyphase synthesis filterbank over a Layer II
+    /// frame's 36 sub-band sample-slots, packing the result into
+    /// interleaved S16 PCM (1152 samples per channel).
+    fn synthesize_layer2_subbands(
+        &mut self,
+        subbands: &Layer2Subbands,
+        nch: usize,
+    ) -> (Vec<u8>, u32, usize) {
+        while self.filters.len() < nch {
+            self.filters.push(SynthesisFilter::new());
+        }
+        let total_samples = LAYER2_SAMPLES_PER_SUBBAND * 32; // 1152 per channel
+        let mut pcm = vec![0i16; total_samples * nch];
+        for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+            for ch in 0..nch {
+                let input = subbands.slot(ch, slot);
+                let out = self.filters[ch].synthesize(&input);
+                for (j, &v) in out.iter().enumerate() {
+                    let frame_sample = slot * 32 + j;
+                    pcm[frame_sample * nch + ch] = to_s16(v);
+                }
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        (bytes, total_samples as u32, nch)
     }
 
     /// Run the §2.4.3.2 polyphase synthesis filterbank over one frame's

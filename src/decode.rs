@@ -461,6 +461,7 @@ mod tests {
     fn header(mode: Mode, mode_ext: u8) -> FrameHeader {
         FrameHeader {
             id: Id::Mpeg,
+            layer: crate::header::Layer::I,
             protection: true, // no CRC
             bitrate: Bitrate::Fixed(256),
             sampling_frequency: 48_000,

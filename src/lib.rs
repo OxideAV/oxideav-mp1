@@ -63,17 +63,23 @@ use oxideav_core::RuntimeContext;
 
 pub mod codec;
 pub mod decode;
+pub mod decode_layer2;
 pub mod decoder;
 pub mod encode;
 pub mod encoder;
 pub mod header;
 pub mod synthesis;
 pub mod tables;
+pub mod tables_layer2;
 
 pub use codec::{register_codecs, ConcealmentMode, Mp1Decoder, Mp1Encoder};
 pub use decode::{
     allocation_bits, decode_audio_data, requantize, BitReader, DecodeError, Subband,
     SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS,
+};
+pub use decode_layer2::{
+    decode_layer2_audio_data, Layer2Subband, Layer2Subbands, LAYER2_SAMPLES_PER_FRAME,
+    LAYER2_SAMPLES_PER_SUBBAND,
 };
 pub use decoder::make_decoder_with_concealment;
 pub use encode::{
@@ -81,7 +87,8 @@ pub use encode::{
     EncodeError, EncodeParams, Mp1FrameEncoder,
 };
 pub use header::{
-    find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader, HeaderError, Id, Mode, ModeExtension,
+    find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader, HeaderError, Id, Layer, Mode,
+    ModeExtension,
 };
 pub use synthesis::{to_s16, SynthesisFilter};
 pub use tables::{ANALYSIS_WINDOW, QUANT_A, QUANT_B, SCALEFACTORS, SNR_DB, SYNTHESIS_WINDOW};

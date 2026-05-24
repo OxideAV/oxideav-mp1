@@ -98,9 +98,11 @@ pub enum HeaderError {
     TooShort,
     /// The 12-bit syncword `0xFFF` was not present at the start.
     BadSync,
-    /// The 2-bit `layer` field did not select Layer I (`0b11`).
-    ///
-    /// Carries the raw 2-bit value that was read.
+    /// The 2-bit `layer` field selected a layer the crate does not
+    /// decode (Layer III `0b01` or the reserved value `0b00`). The
+    /// historical variant name (`NotLayer1`) is preserved for API
+    /// stability; Layer II is now decoded too, so this only fires on
+    /// `0b01` and `0b00`. Carries the raw 2-bit value that was read.
     NotLayer1(u8),
     /// `bitrate_index` was `0b1111`, which the standard marks as
     /// *forbidden*.
@@ -115,9 +117,10 @@ impl core::fmt::Display for HeaderError {
         match self {
             HeaderError::TooShort => write!(f, "fewer than 4 header bytes available"),
             HeaderError::BadSync => write!(f, "syncword 0xFFF not found at start of header"),
-            HeaderError::NotLayer1(v) => {
-                write!(f, "layer field 0b{v:02b} does not select Layer I")
-            }
+            HeaderError::NotLayer1(v) => write!(
+                f,
+                "layer field 0b{v:02b} is not Layer I or Layer II (not supported by this crate)"
+            ),
             HeaderError::ForbiddenBitrate => write!(f, "bitrate_index 0b1111 is forbidden"),
             HeaderError::ReservedSamplingFrequency => {
                 write!(f, "sampling_frequency 0b11 is reserved")
@@ -147,6 +150,37 @@ pub enum Id {
     /// 128 / 144 / 160 / 176 / 192 / 224 / 256 kbit/s) apply.
     Mpeg2Lsf,
 }
+
+/// The `layer` field, as the variants this crate decodes (§2.4.2.3).
+///
+/// The crate handles Layer I (its original scope) and Layer II (added
+/// for the §2.4.3.3 path). Layer III and the reserved value `0b00` are
+/// rejected as [`HeaderError::NotLayer1`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// `'11'` — Layer I (§2.4.1.5 / §2.4.3.2).
+    I,
+    /// `'10'` — Layer II (§2.4.1.6 / §2.4.3.3).
+    II,
+}
+
+/// The 11172-3 §2.4.2.3 `bitrate_index` → bitrate ladder, **Layer II
+/// column** (`ID == 1`, MPEG-1), in kbit/s.
+///
+/// Index `0b0000` is the *free format* condition; index `0b1111` is
+/// *forbidden*. The intermediate indices map to the fixed Layer II
+/// bitrates listed in the standard's table.
+const LAYER2_BITRATE_KBPS_MPEG1: [u16; 14] = [
+    32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+];
+
+/// The 13818-3 §2.4.2.3 `bitrate_index` → bitrate ladder, **Layer II
+/// column** (`ID == 0`, MPEG-2 LSF), in kbit/s.
+///
+/// LSF shares the *same* ladder between Layer II and Layer III
+/// (per 13818-3 §2.4.2.3 table), distinct from the LSF Layer I ladder.
+const LAYER2_BITRATE_KBPS_LSF: [u16; 14] =
+    [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
 /// The `mode` field (§2.4.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,20 +265,25 @@ impl ModeExtension {
     }
 }
 
-/// A fully decoded MPEG-1 Audio Layer I frame header (§2.4.1.3).
+/// A fully decoded MPEG-1 / MPEG-2 LSF Audio frame header (§2.4.1.3).
 ///
-/// All thirteen header fields are preserved verbatim so a parsed
-/// header carries enough state to compute the frame length and (in a
-/// later round) drive the audio-data decode.
+/// Carries the thirteen header fields verbatim plus the [`Layer`]
+/// selection so a parsed header drives both frame-length computation
+/// and the per-layer audio-data decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     /// `ID` — algorithm identifier.
     pub id: Id,
+    /// `layer`: which Layer this frame carries. Layer I and Layer II
+    /// are supported; other values produce
+    /// [`HeaderError::NotLayer1`] at parse time.
+    pub layer: Layer,
     /// `protection_bit`: `true` when **no** redundancy (CRC) was
     /// added. When `false`, a 16-bit CRC follows the header
     /// (§2.4.1.4).
     pub protection: bool,
-    /// `bitrate_index` interpreted against the Layer I ladder.
+    /// `bitrate_index` interpreted against the appropriate ladder for
+    /// the parsed [`Layer`].
     pub bitrate: Bitrate,
     /// `sampling_frequency`, in Hz.
     pub sampling_frequency: u32,
@@ -300,18 +339,31 @@ impl FrameHeader {
         let original_bit = (word >> 2) & 0x1;
         let emphasis_bits = (word & 0x3) as u8;
 
-        // layer: '11' selects Layer I (§2.4.2.3).
-        if layer != 0b11 {
-            return Err(HeaderError::NotLayer1(layer));
-        }
+        // layer: '11' selects Layer I, '10' selects Layer II
+        // (§2.4.2.3). '01' (Layer III) and '00' (reserved) are not
+        // supported by this crate. The `NotLayer1` variant is retained
+        // for compatibility with the original Layer-I-only API; Layer
+        // III and the reserved value are reported via the broader
+        // `UnsupportedLayer`.
+        let parsed_layer = match layer {
+            0b11 => Layer::I,
+            0b10 => Layer::II,
+            // 0b01 (Layer III) / 0b00 (reserved): rejected. The
+            // `NotLayer1` variant name is preserved from the
+            // Layer-I-only era for API stability.
+            _ => return Err(HeaderError::NotLayer1(layer)),
+        };
 
-        // ID selects which Layer I bitrate ladder and which
-        // sampling_frequency table apply: 11172-3 §2.4.2.3 for ID==1,
-        // 13818-3 §2.4.2.3 (LSF) for ID==0.
+        // ID selects which bitrate ladder and which sampling_frequency
+        // table apply: 11172-3 §2.4.2.3 for ID==1, 13818-3 §2.4.2.3
+        // (LSF) for ID==0. The ladder column further depends on the
+        // selected Layer.
         let id = if id_bit == 1 { Id::Mpeg } else { Id::Mpeg2Lsf };
-        let bitrate_table = match id {
-            Id::Mpeg => &LAYER1_BITRATE_KBPS_MPEG1,
-            Id::Mpeg2Lsf => &LAYER1_BITRATE_KBPS_LSF,
+        let bitrate_table: &[u16; 14] = match (id, parsed_layer) {
+            (Id::Mpeg, Layer::I) => &LAYER1_BITRATE_KBPS_MPEG1,
+            (Id::Mpeg, Layer::II) => &LAYER2_BITRATE_KBPS_MPEG1,
+            (Id::Mpeg2Lsf, Layer::I) => &LAYER1_BITRATE_KBPS_LSF,
+            (Id::Mpeg2Lsf, Layer::II) => &LAYER2_BITRATE_KBPS_LSF,
         };
         let sampling_table = match id {
             Id::Mpeg => &SAMPLING_FREQUENCY_HZ_MPEG1,
@@ -350,6 +402,7 @@ impl FrameHeader {
 
         Ok(FrameHeader {
             id,
+            layer: parsed_layer,
             protection,
             bitrate,
             sampling_frequency,
@@ -384,10 +437,14 @@ impl FrameHeader {
     ///
     /// For Layer I the slot distance `N` between consecutive syncwords
     /// is `floor(12 * bitrate / sampling_frequency)`, plus one extra
-    /// slot when `padding_bit == 1`. This is the integer form of the
-    /// §2.4.2.3 padding method, whose Layer I remainder is
-    /// `dif = (12 * bitrate) % sampling_frequency`. `bitrate` here is
-    /// in bit/s (the ladder stores kbit/s, so we scale by 1000).
+    /// slot when `padding_bit == 1` (slot size = 4 bytes; 384 samples).
+    /// Layer II carries 1152 samples per frame in **1-byte** slots, so
+    /// the slot count is `floor(144 * bitrate / sampling_frequency)`
+    /// plus an optional padding slot (§2.4.2.1 + §2.4.3.1: a Layer II
+    /// frame is 3 Layer-I-sized granules, so 12 × 3 = 36 ÷ 1-byte slot
+    /// reflects in the per-slot bit budget — the constant 144 falls out
+    /// from `samples_per_frame / 8 = 1152 / 8 = 144`). `bitrate` here
+    /// is in bit/s (the ladder stores kbit/s, so we scale by 1000).
     ///
     /// Returns `None` for the *free format* condition, where the
     /// header alone does not determine the slot count (§2.4.3.1: it
@@ -398,7 +455,10 @@ impl FrameHeader {
             Bitrate::Free | Bitrate::Forbidden => return None,
         };
         let bitrate_bps = kbps * 1000;
-        let base = (12 * bitrate_bps) / self.sampling_frequency;
+        let base = match self.layer {
+            Layer::I => (12 * bitrate_bps) / self.sampling_frequency,
+            Layer::II => (144 * bitrate_bps) / self.sampling_frequency,
+        };
         Some(base + u32::from(self.padding))
     }
 
@@ -407,10 +467,15 @@ impl FrameHeader {
     /// are accounted for by the slot count, since the slot count spans
     /// the whole inter-syncword distance per §2.4.2.1 / §2.4.3.1).
     ///
-    /// Each Layer I slot is four bytes (§2.4.2.1). Returns `None` for
-    /// the free-format condition (see [`slot_count`](Self::slot_count)).
+    /// Layer I slot = 4 bytes; Layer II slot = 1 byte (§2.4.2.1).
+    /// Returns `None` for the free-format condition (see
+    /// [`slot_count`](Self::slot_count)).
     pub fn frame_length_bytes(self) -> Option<u32> {
-        self.slot_count().map(|slots| slots * LAYER1_SLOT_BYTES)
+        let slot_bytes = match self.layer {
+            Layer::I => LAYER1_SLOT_BYTES,
+            Layer::II => 1,
+        };
+        self.slot_count().map(|slots| slots * slot_bytes)
     }
 }
 
@@ -702,14 +767,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_layer1() {
-        // layer '10' = Layer II, '01' = Layer III, '00' = reserved.
-        for (bits, _name) in [(0b10u32, "II"), (0b01, "III"), (0b00, "reserved")] {
+    fn rejects_layer3_and_reserved() {
+        // layer '01' = Layer III (not decoded by this crate), '00' =
+        // reserved. Layer II ('10') is now accepted (§2.4.1.6) and is
+        // exercised by the Layer II tests; only the two unsupported
+        // codepoints are rejected here.
+        for (bits, _name) in [(0b01u32, "III"), (0b00, "reserved")] {
             let bytes = build_header(1, bits, 1, 0b1000, 0b01, 0, 0, 0, 0, 0, 1, 0);
             assert_eq!(
                 FrameHeader::parse(&bytes),
                 Err(HeaderError::NotLayer1(bits as u8))
             );
+        }
+    }
+
+    #[test]
+    fn accepts_layer2_header() {
+        // Layer II (layer '10'), MPEG-1, no CRC, 192 kbit/s
+        // (index 0b1010 on the MPEG-1 Layer II ladder), 44.1 kHz,
+        // stereo. Frame should parse cleanly with `layer == Layer::II`
+        // and `bitrate == Fixed(192)`.
+        let bytes = build_header(1, 0b10, 1, 0b1010, 0b00, 0, 0, 0b00, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&bytes).unwrap();
+        assert_eq!(h.layer, Layer::II);
+        assert_eq!(h.bitrate, Bitrate::Fixed(192));
+        assert_eq!(h.sampling_frequency, 44_100);
+        assert_eq!(h.mode, Mode::Stereo);
+        // §2.4.2.1 Layer II framing: 1-byte slots, 1152 samples / frame.
+        // 144 * 192000 / 44100 = 626.939... -> floor = 626 slots = 626 bytes.
+        // (ffmpeg's `-f mp2` muxer emits the same byte count for an
+        // unpadded MPEG-1 LII / 192 kbit/s / 44.1 kHz frame.)
+        assert_eq!(h.slot_count(), Some(626));
+        assert_eq!(h.frame_length_bytes(), Some(626));
+    }
+
+    #[test]
+    fn layer2_mpeg1_bitrate_ladder() {
+        // §2.4.2.3 Layer II column (MPEG-1), indices 0b0001..0b1110.
+        let expected = [
+            32u16, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+        ];
+        for (i, &kbps) in expected.iter().enumerate() {
+            let idx = (i + 1) as u32;
+            let bytes = build_header(1, 0b10, 1, idx, 0b00, 0, 0, 0, 0, 0, 1, 0);
+            let h = FrameHeader::parse(&bytes).unwrap();
+            assert_eq!(
+                h.bitrate,
+                Bitrate::Fixed(kbps),
+                "L2 MPEG-1 index 0b{idx:04b}"
+            );
+        }
+    }
+
+    #[test]
+    fn layer2_lsf_bitrate_ladder() {
+        // 13818-3 §2.4.2.3 Layer II,III column (LSF), indices 0b0001..0b1110.
+        let expected = [8u16, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+        for (i, &kbps) in expected.iter().enumerate() {
+            let idx = (i + 1) as u32;
+            // LSF ID=0, 24 kHz (0b01).
+            let bytes = build_header(0, 0b10, 1, idx, 0b01, 0, 0, 0, 0, 0, 1, 0);
+            let h = FrameHeader::parse(&bytes).unwrap();
+            assert_eq!(h.bitrate, Bitrate::Fixed(kbps), "L2 LSF index 0b{idx:04b}");
         }
     }
 

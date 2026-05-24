@@ -1,7 +1,9 @@
 # oxideav-mp1
 
-A pure-Rust **MPEG-1 / MPEG-2 LSF Audio Layer I** (MP1) codec for the
+A pure-Rust **MPEG-1 / MPEG-2 LSF Audio** codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
+Decodes both **Layer I** and **Layer II** (mp2) frames; encodes
+**Layer I** only.
 
 ## Status
 
@@ -85,10 +87,36 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   (Annex B, PDF pages 56–58), and sums to 32 PCM samples — `12 × 32 =
   384` PCM samples per channel per frame.
 - **`oxideav_core::Decoder` + registration**: `Mp1Decoder` turns one
-  Layer I packet into a 384-sample interleaved S16 `AudioFrame`;
-  `register` installs it under the WAVE format tag `0x0050` and the
-  Matroska codec id `A_MPEG/L1`. `reset` zeroes the filterbank history
-  after a seek.
+  Layer I (or Layer II — see below) packet into an interleaved S16
+  `AudioFrame`; `register` installs it under the WAVE format tag
+  `0x0050` and the Matroska codec id `A_MPEG/L1`. `reset` zeroes the
+  filterbank history after a seek.
+- **Layer II `audio_data()` decode** (§2.4.1.6 / §2.4.2.6 / §2.4.3.3
+  + Annex B Tables 3-B.2a..d "Possible quantization per subband" and
+  3-B.4 "Layer II classes of quantization"): the decoder routes any
+  packet whose `layer` field is `'10'` through the §2.4.1.6 syntax —
+  one of the four B.2x bit-allocation tables selected by `(sampling
+  frequency, bitrate per channel)`, per-subband 2-bit `scfsi`, 1..3
+  six-bit Table 3-B.1 scalefactor indices per subband per `scfsi`
+  schedule, and twelve granules of either one grouped `samplecode`
+  (degrouped by repeated `% nlevels`, `/ nlevels` per §2.4.3.3.4) or
+  three separable `sample` reads. Each triplet's §2.4.3.3.4 linear
+  formula `s'' = C · (s''' + D)` (constants from Table 3-B.4) is
+  rescaled by the per-part Table 3-B.1 multiplier and fed into the
+  same §2.4.3.2 polyphase synthesis filterbank the Layer I path uses
+  (36 sample-slots per channel = 1152 PCM samples per channel per
+  Layer II frame, §2.4.2.1). The intensity_stereo upper band
+  (`[bound, sblimit)` in joint_stereo) reads one shared sample stream
+  copied into both channels (§2.4.2.6 / §2.4.3.3). A fixture-driven
+  integration test decodes an ffmpeg-encoded mono `.mp2` (440 Hz
+  sine, 64 kbit/s, 44.1 kHz, 20 frames) and compares the steady-state
+  PCM against ffmpeg's reference S16 decode of the same file:
+  **RMS = 0.50 LSB, max|err| = 1 LSB across 20 736 samples** —
+  essentially bit-exact, the residual being IEEE-754 ordering. Layer
+  II encoding, the §2.4.3.1 CRC verification over the Layer II
+  protected fields (header bits 16…31 + bit allocation + scfsi per
+  Table 3-B.5), and a transcription of the 13818-3 LSF Layer II
+  allocation table for Fs ∈ {16, 22.05, 24} kHz remain followups.
 - **Polyphase analysis filterbank** (§C.1.3, informative Annex C, figure
   C.4 "Analysis Subband Filter Flow Chart"): per channel, a 512-element
   `X` input FIFO carries windowing history across slots; each slot
