@@ -47,15 +47,23 @@
 //! [`decoder::make_decoder_with_concealment`], or switched at runtime
 //! with [`Mp1Decoder::set_concealment`].
 //!
-//! Spec gaps that remain (none block decode to PCM): the Layer I
-//! **encoder** always emits `protection_bit == 1` (no CRC) — optional
-//! CRC emission is a followup. Annex D's psychoacoustic models are not
-//! implemented (the encoder's allocator is signal-energy-driven); the
-//! staged 11172-3 PDF carries Annex D §D.1 prose but the essential
-//! numeric tables (D.1a/b/c absolute thresholds, D.2a/b/c critical
-//! band boundaries) are only present in an OCR-corrupted text layer,
-//! so the perceptual model is a DOCS-GAP awaiting clean Annex D
-//! renders.
+//! The Layer I **encoder** now supports optional §2.4.1.4 CRC emission:
+//! the default factory ([`encoder::make_encoder`]) still writes
+//! `protection_bit == 1` (no CRC), and a new opt-in factory
+//! ([`encoder::make_encoder_with_crc`]) writes `protection_bit == 0`
+//! plus a 16-bit CRC word over the Annex B Table 3-B.5 protected
+//! fields (the same §2.4.3.1 polynomial the decoder verifies against).
+//! Both factories produce byte-identical frame lengths — the CRC's 16
+//! bits are taken out of the per-frame audio-data budget so the
+//! §2.4.2.1 slot count is unchanged.
+//!
+//! One spec gap remains, not blocking decode to PCM: Annex D's
+//! psychoacoustic models are not implemented (the encoder's allocator
+//! is signal-energy-driven); the staged 11172-3 PDF carries Annex D
+//! §D.1 prose but the essential numeric tables (D.1a/b/c absolute
+//! thresholds, D.2a/b/c critical band boundaries) are only present in
+//! an OCR-corrupted text layer, so the perceptual model is a DOCS-GAP
+//! awaiting clean Annex D renders.
 
 #![warn(missing_debug_implementations)]
 
@@ -86,6 +94,7 @@ pub use encode::{
     allocate_bits, quantize, select_scalefactor, Allocation, AnalysisFilter, BitWriter,
     EncodeError, EncodeParams, Mp1FrameEncoder,
 };
+pub use encoder::make_encoder_with_crc;
 pub use header::{
     find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader, HeaderError, Id, Layer, Mode,
     ModeExtension,

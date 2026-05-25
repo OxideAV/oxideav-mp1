@@ -41,7 +41,7 @@
 //! by direct unit tests against the spec formulas.
 
 use crate::decode::{SAMPLES_PER_SUBBAND, SUBBANDS};
-use crate::header::{Bitrate, Mode};
+use crate::header::{Bitrate, FrameHeader, Mode};
 use crate::tables::{ANALYSIS_WINDOW, QUANT_A, QUANT_B, SCALEFACTORS, SNR_DB};
 
 /// Length of the analysis input FIFO `X` (figure C.4: the shift loop
@@ -413,6 +413,46 @@ pub struct EncodeParams {
     /// sample set per channel (no joint-stereo bound — every subband is
     /// per-channel for stereo / dual_channel).
     pub mode: Mode,
+    /// When `true`, the encoder emits the optional §2.4.1.4
+    /// `error_check()` field: it writes the header with `protection_bit
+    /// == 0`, then writes a 16-bit CRC word computed via §2.4.3.1
+    /// (`G(X) = X^16 + X^15 + X^2 + 1`, initial state `0xFFFF`) over
+    /// the Annex B Table 3-B.5 Layer I protected fields (header bits
+    /// 16…31 plus the bit-allocation field).
+    ///
+    /// Defaults to `false` (no CRC, `protection_bit == 1`), matching
+    /// the encoder's behaviour before optional CRC emission was added.
+    /// When `true`, the 16-bit CRC is deducted from the per-frame audio
+    /// data budget (`adb` of §C.1.5.1.6) so the slot count remains the
+    /// §2.4.2.1 `N = floor(12 · bitrate / Fs) + padding` value.
+    pub emit_crc: bool,
+}
+
+impl EncodeParams {
+    /// A new [`EncodeParams`] with `emit_crc = false`, the encoder's
+    /// historical default (the optional §2.4.1.4 CRC `error_check()` is
+    /// **not** written; `protection_bit == 1`).
+    ///
+    /// `bitrate` is a fixed Layer I ladder value (free format is not
+    /// produced); `sampling_frequency` must be one of the six Layer I
+    /// sampling rates (MPEG-1 32 / 44.1 / 48 kHz from 11172-3 §2.4.2.3,
+    /// or MPEG-2 LSF 16 / 22.05 / 24 kHz from 13818-3 §2.4.2.3); `mode`
+    /// is the per-channel mode written into the header `mode` field.
+    pub fn new(bitrate: Bitrate, sampling_frequency: u32, mode: Mode) -> EncodeParams {
+        EncodeParams {
+            bitrate,
+            sampling_frequency,
+            mode,
+            emit_crc: false,
+        }
+    }
+
+    /// Builder: select whether the encoder emits the optional §2.4.1.4
+    /// `error_check()` CRC field (see [`EncodeParams::emit_crc`]).
+    pub fn with_emit_crc(mut self, emit: bool) -> EncodeParams {
+        self.emit_crc = emit;
+        self
+    }
 }
 
 /// Errors raised while encoding a Layer I frame.
@@ -531,8 +571,13 @@ impl Mp1FrameEncoder {
     /// frame bytes.
     ///
     /// `pcm` is interleaved: `pcm[sample*nch + ch]`, with exactly 384
-    /// samples per channel (`pcm.len() == 384 * nch`). No CRC is written
-    /// (`protection_bit == 1`).
+    /// samples per channel (`pcm.len() == 384 * nch`). When the encoder's
+    /// [`EncodeParams::emit_crc`] is `false` (the default), no CRC is
+    /// written (`protection_bit == 1`); when `true`, a 16-bit CRC word
+    /// (§2.4.1.4 / §2.4.3.1) is computed over the Annex B Table 3-B.5
+    /// protected fields (header bits 16…31 + bit-allocation field) and
+    /// inserted between the header and the audio data, with
+    /// `protection_bit == 0`.
     // The figure-C.4 / §C.1.5.1 encode body is a nested set of
     // index-driven loops over (slot, channel, subband) that walk the
     // §2.4.1.5 packed-bitstream order exactly as the spec lists it.
@@ -594,7 +639,7 @@ impl Mp1FrameEncoder {
         }
 
         // --- 3. Bit allocation (§C.1.5.1.6) ---
-        let has_crc = false;
+        let has_crc = self.params.emit_crc;
         let budget = frame_payload_bits(
             bitrate_kbps as u32,
             self.params.sampling_frequency,
@@ -609,7 +654,10 @@ impl Mp1FrameEncoder {
         bw.put(0xFFF, 12); // syncword
         bw.put(id_bit as u32, 1); // ID: 1 = MPEG-1, 0 = MPEG-2 LSF (13818-3 §2.4.2.3)
         bw.put(0b11, 2); // layer I
-        bw.put(1, 1); // protection_bit = 1 (no CRC)
+                         // §2.4.2.3: protection_bit '0' indicates redundancy (CRC)
+                         // *has* been added; '1' indicates no redundancy. The encoder
+                         // writes '0' iff `emit_crc` was requested.
+        bw.put(if has_crc { 0 } else { 1 }, 1);
         bw.put(brate_idx as u32, 4); // bitrate_index
         bw.put(samp_code as u32, 2); // sampling_frequency
         bw.put(0, 1); // padding_bit = 0
@@ -619,6 +667,15 @@ impl Mp1FrameEncoder {
         bw.put(0, 1); // copyright
         bw.put(1, 1); // original/home
         bw.put(0, 2); // emphasis = none
+
+        // When emitting a CRC, leave a 16-bit placeholder immediately
+        // after the header. The header is exactly 32 bits / 4 bytes, so
+        // the placeholder occupies bytes 4..6 of the eventual frame.
+        // §2.4.1.4: the `error_check()` field directly follows the
+        // header when `protection_bit == 0`.
+        if has_crc {
+            bw.put(0, 16);
+        }
 
         // ALLOC: 4 bits per (sb, ch) — §2.4.1.5 reads sb-major, ch-minor.
         for sb in 0..SUBBANDS {
@@ -657,6 +714,31 @@ impl Mp1FrameEncoder {
         if bytes.len() < frame_len {
             bytes.resize(frame_len, 0);
         }
+
+        // Patch the §2.4.1.4 CRC placeholder. The CRC covers the
+        // Table 3-B.5 Layer I protected fields: header bits 16…31 plus
+        // the bit-allocation field (§2.4.3.1). `FrameHeader::compute_crc`
+        // walks the parsed header to size the allocation field
+        // correctly, and is the exact inverse of the decoder's
+        // `verify_crc` path. The allocation field lives at the start of
+        // the audio-data region, which begins immediately after the
+        // 16-bit CRC word at byte 6.
+        if has_crc {
+            // Parse our own header back to drive `compute_crc`. This is
+            // self-consistent (we just wrote it) and avoids duplicating
+            // the protected-field sizing logic across the codebase.
+            let header_bytes = &bytes[0..4];
+            let header = FrameHeader::parse(header_bytes)
+                .expect("encoder produced a valid Layer I header; FrameHeader::parse must succeed");
+            let audio = &bytes[6..];
+            let crc = header
+                .compute_crc(header_bytes, audio)
+                .expect("encoder allocation field fits the frame; compute_crc must succeed");
+            let crc_bytes = crc.to_be_bytes();
+            bytes[4] = crc_bytes[0];
+            bytes[5] = crc_bytes[1];
+        }
+
         Ok(bytes)
     }
 
@@ -867,5 +949,166 @@ mod tests {
             best_err < 1e-3,
             "reconstruction RMS {best_err} too large (best delay {best_delay})"
         );
+    }
+
+    // ---- §2.4.1.4 optional CRC emission -----------------------
+
+    use crate::header::{CrcStatus, FrameHeader as TestFrameHeader};
+
+    /// 384 samples per channel = one Layer I frame (§2.4.2.1).
+    fn unit_mono_pcm() -> Vec<f64> {
+        let mut pcm = vec![0.0f64; SAMPLES_PER_SUBBAND * SUBBANDS];
+        for (n, v) in pcm.iter_mut().enumerate() {
+            // 1 kHz tone at Fs = 48 kHz; modest amplitude to keep
+            // every subband below clip.
+            let t = n as f64 / 48_000.0;
+            *v = 0.4 * (2.0 * std::f64::consts::PI * 1_000.0 * t).sin();
+        }
+        pcm
+    }
+
+    #[test]
+    fn encode_params_emit_crc_default_off() {
+        // The historical encoder default is `protection_bit == 1` (no
+        // CRC); the new field must preserve that out of the box.
+        let p = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel);
+        assert!(!p.emit_crc);
+    }
+
+    #[test]
+    fn encode_params_with_emit_crc_builder() {
+        let p =
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel).with_emit_crc(true);
+        assert!(p.emit_crc);
+        // The builder must not flip any other field.
+        assert_eq!(p.bitrate, Bitrate::Fixed(256));
+        assert_eq!(p.sampling_frequency, 48_000);
+        assert_eq!(p.mode, Mode::SingleChannel);
+    }
+
+    #[test]
+    fn encoded_frame_without_crc_has_protection_bit_1() {
+        // Baseline: the default (emit_crc=false) writes
+        // protection_bit==1 and the header reports has_crc()==false.
+        let params = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let bytes = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        assert!(!h.has_crc(), "default encoder must not emit a CRC");
+        assert!(h.protection, "protection_bit must be 1 when no CRC");
+    }
+
+    #[test]
+    fn encoded_frame_with_crc_has_protection_bit_0() {
+        let params =
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel).with_emit_crc(true);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let bytes = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        assert!(h.has_crc(), "emit_crc=true must clear protection_bit");
+        assert!(
+            !h.protection,
+            "protection_bit must be 0 when CRC is emitted"
+        );
+    }
+
+    #[test]
+    fn encoded_frame_with_crc_verifies_against_spec_helper() {
+        // The CRC the encoder writes must verify clean through the
+        // decoder-side `FrameHeader::verify_crc` (§2.4.3.1). This is the
+        // round-trip property that guarantees an external decoder will
+        // accept the frame's `error_check()` field.
+        let params =
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel).with_emit_crc(true);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let bytes = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        let status = h
+            .verify_crc(&bytes[..4], &bytes[4..])
+            .expect("CRC region present");
+        match status {
+            CrcStatus::Ok(_) => {}
+            other => panic!("encoder-emitted CRC failed verification: {other:?}"),
+        }
+        assert!(status.is_good());
+    }
+
+    #[test]
+    fn encoded_frame_with_crc_keeps_slot_count() {
+        // §2.4.2.1: the slot count `N = floor(12 * bitrate / Fs) +
+        // padding` is a function of the header alone, so enabling the
+        // CRC must not change the per-frame byte length.
+        let mut enc_no = Mp1FrameEncoder::new(EncodeParams::new(
+            Bitrate::Fixed(256),
+            48_000,
+            Mode::SingleChannel,
+        ));
+        let mut enc_crc = Mp1FrameEncoder::new(
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel).with_emit_crc(true),
+        );
+        let pcm = unit_mono_pcm();
+        let n = enc_no.encode_frame(&pcm).unwrap().len();
+        let c = enc_crc.encode_frame(&pcm).unwrap().len();
+        assert_eq!(n, c, "CRC emission must not change the slot/byte count");
+        // 12 * 256000 / 48000 = 64 slots * 4 bytes/slot = 256.
+        assert_eq!(n, 256);
+    }
+
+    #[test]
+    fn encoded_frame_with_crc_corruption_is_detected() {
+        // Flip a single bit inside the protected bit-allocation field
+        // and confirm `verify_crc` reports `Mismatch`. The first
+        // allocation nibble lives at bytes[6] for a CRC-protected
+        // frame (header 0..4, CRC 4..6, allocation 6..).
+        let params =
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::Stereo).with_emit_crc(true);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let mut pcm = Vec::with_capacity(SAMPLES_PER_SUBBAND * SUBBANDS * 2);
+        for n in 0..SAMPLES_PER_SUBBAND * SUBBANDS {
+            let v = 0.3 * (n as f64 * 0.07).sin();
+            pcm.push(v); // ch0
+            pcm.push(v); // ch1
+        }
+        let mut bytes = enc.encode_frame(&pcm).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        assert!(h.has_crc());
+        // Sanity: the un-touched frame verifies.
+        assert!(matches!(
+            h.verify_crc(&bytes[..4], &bytes[4..]),
+            Some(CrcStatus::Ok(_))
+        ));
+        // Flip a bit inside the allocation field.
+        bytes[6] ^= 0x80;
+        match h.verify_crc(&bytes[..4], &bytes[4..]) {
+            Some(CrcStatus::Mismatch { stored, computed }) => {
+                assert_ne!(stored, computed);
+            }
+            other => panic!("expected Mismatch after corruption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_frame_with_crc_stereo_round_trips() {
+        // Stereo (`nch = 2`) doubles the allocation field to 256 bits;
+        // confirm `compute_crc` sizes it correctly via the parsed
+        // header and the round-trip still verifies.
+        let params =
+            EncodeParams::new(Bitrate::Fixed(384), 48_000, Mode::Stereo).with_emit_crc(true);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let mut pcm = vec![0.0f64; SAMPLES_PER_SUBBAND * SUBBANDS * 2];
+        for n in 0..SAMPLES_PER_SUBBAND * SUBBANDS {
+            let t = n as f64 / 48_000.0;
+            let v = 0.4 * (2.0 * std::f64::consts::PI * 880.0 * t).sin();
+            pcm[n * 2] = v;
+            pcm[n * 2 + 1] = -v;
+        }
+        let bytes = enc.encode_frame(&pcm).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        assert!(h.has_crc());
+        assert_eq!(h.mode, Mode::Stereo);
+        let status = h
+            .verify_crc(&bytes[..4], &bytes[4..])
+            .expect("CRC region present");
+        assert!(matches!(status, CrcStatus::Ok(_)));
     }
 }

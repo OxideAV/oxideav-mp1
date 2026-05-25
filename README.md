@@ -175,6 +175,23 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   **self-roundtrip**: a 1 kHz tone encodes + decodes back to PCM at
   RMS < 0.01 (≈ −40 dBFS) at 192 kbit/s mono, and stereo / white-noise /
   LSF (16 / 22.05 / 24 kHz) inputs reconstruct within similar bounds.
+- **Optional §2.4.1.4 CRC emission on the encode side**: the new
+  `EncodeParams::emit_crc` flag (also reachable via the
+  [`EncodeParams::with_emit_crc`] builder) controls whether the encoder
+  writes the optional `error_check()` field. When `true` the encoder
+  writes `protection_bit == 0` and a 16-bit CRC word computed via
+  §2.4.3.1 (`G(X) = X^16 + X^15 + X^2 + 1`, init `0xFFFF`) over the
+  Annex B Table 3-B.5 Layer I protected fields (header bits 16…31 + the
+  bit-allocation field); when `false` (default) the encoder still emits
+  `protection_bit == 1` and no CRC, preserving byte-for-byte
+  compatibility with the prior encoder output. The CRC's 16 bits are
+  taken out of the per-frame audio-data budget (`adb`), so the §2.4.2.1
+  slot count is unchanged — a CRC-on and CRC-off encode of the same
+  PCM produce the same byte count. New high-level factories
+  [`encoder::make_encoder_with_crc`] (direct API) and
+  `codec::make_encoder_with_crc` (registry path) build a boxed
+  `Mp1Encoder` with CRC emission enabled; the existing
+  [`encoder::make_encoder`] continues to keep `protection_bit == 1`.
 - **Dual-API surface**: alongside the registry path (`register` /
   `register_codecs`), the crate exposes the historical *direct* factory
   endpoints — `decoder::make_decoder(&CodecParameters)` and
@@ -187,7 +204,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-140 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+153 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
@@ -225,7 +242,16 @@ endpoints (`decoder::make_decoder` drives a real mono decode and
 objects, `decoder::make_decoder_with_concealment` carries the chosen
 `ConcealmentMode` through to a real CRC-mismatch repeat while the plain
 factory keeps the Mute default, plus the missing-`sample_rate` /
-`channels` rejection path). Test bytes are constructed locally from the
+`channels` rejection path), and the §2.4.1.4 optional CRC emission
+(default `EncodeParams::emit_crc == false` keeps `protection_bit == 1`;
+`with_emit_crc(true)` flips the bit, writes a 16-bit CRC the decoder's
+`FrameHeader::verify_crc` accepts as `CrcStatus::Ok`, preserves the
+§2.4.2.1 frame byte count, and a bit-flip inside the protected
+allocation field is detected as `CrcStatus::Mismatch`; a stereo
+encode-with-CRC also verifies clean; the `make_encoder_with_crc`
+direct + registry factories produce verifying CRCs and a full
+encode-with-CRC → decode loop reaches PCM without tripping the
+§2.4.3.1 concealment path). Test bytes are constructed locally from the
 §2.4.1 field layouts — no external fixtures.
 
 ## Spec gaps (DOCS-GAP)
@@ -248,8 +274,11 @@ blocking decode to PCM:
 Both §2.4.3.1 CRC-mismatch concealment strategies — *muting* of the
 offending frame and *repetition of the previous frame* — are now
 implemented and selectable (`ConcealmentMode`). Optional CRC emission
-on the encode side remains a followup (the encoder currently always
-sets `protection_bit == 1`).
+on the encode side is also implemented as of r129
+(`EncodeParams::emit_crc` / `encoder::make_encoder_with_crc`); the
+default factory still keeps `protection_bit == 1` for byte-compatible
+output, opt in to flip the bit and have the encoder write the matching
+§2.4.3.1 CRC word.
 
 2. The **Annex D psychoacoustic models** are not implemented: the
    encoder's bit allocator is signal-energy-driven rather than

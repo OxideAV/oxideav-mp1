@@ -471,8 +471,28 @@ impl Decoder for Mp1Decoder {
 /// 13818-3 §2.4.2.3), `channels` is required (1 or 2), and `bit_rate`
 /// is optional — it defaults to a sensible per-channel value if
 /// absent. The chosen mode is mono for `channels == 1` and stereo for
-/// `channels == 2`.
+/// `channels == 2`. The §2.4.1.4 CRC is **not** emitted; the encoded
+/// frame's `protection_bit` is `1`. Use
+/// [`make_encoder_with_crc`] to enable optional CRC emission.
 pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_inner(params, /*emit_crc=*/ false)
+}
+
+/// Build an [`Mp1Encoder`] from `params`, with the optional §2.4.1.4
+/// CRC `error_check()` enabled.
+///
+/// Identical to [`make_encoder`] except the produced encoder writes
+/// `protection_bit == 0` and a 16-bit CRC word computed over the Annex
+/// B Table 3-B.5 Layer I protected fields (§2.4.3.1 polynomial
+/// `G(X) = X^16 + X^15 + X^2 + 1`, init `0xFFFF`). The CRC's 16 bits are
+/// taken out of the per-frame audio-data budget, so the slot count
+/// reported by the header stays at the §2.4.2.1
+/// `N = floor(12 · bitrate / Fs) + padding` value.
+pub(crate) fn make_encoder_with_crc(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_inner(params, /*emit_crc=*/ true)
+}
+
+fn make_encoder_inner(params: &CodecParameters, emit_crc: bool) -> Result<Box<dyn Encoder>> {
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("oxideav-mp1: sample_rate required"))?;
@@ -506,11 +526,7 @@ pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>
         None => 256,
     };
     let bitrate = Bitrate::Fixed(bitrate_kbps);
-    let enc_params = EncodeParams {
-        bitrate,
-        sampling_frequency: sample_rate,
-        mode,
-    };
+    let enc_params = EncodeParams::new(bitrate, sample_rate, mode).with_emit_crc(emit_crc);
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID));
     out_params.sample_rate = Some(sample_rate);
     out_params.channels = Some(channels);
@@ -1457,5 +1473,110 @@ mod tests {
         // Mode check: confirm we built a stereo header.
         let h = FrameHeader::parse(&pkt.data).unwrap();
         assert_eq!(h.mode, Mode::Stereo);
+    }
+
+    // ---- §2.4.1.4 optional CRC emission (encoder-level) ----------
+
+    /// Build a 1 kHz mono S16 frame (384 samples / channel) at the
+    /// given sample rate, in the AudioFrame shape the encoder consumes.
+    fn build_audio_frame_mono(sample_rate: u32) -> AudioFrame {
+        let n = 384usize;
+        let mut bytes = Vec::with_capacity(n * 2);
+        for k in 0..n {
+            let t = k as f64 / sample_rate as f64;
+            let v = (2.0 * std::f64::consts::PI * 1_000.0 * t).sin();
+            let s = (v * 16_000.0) as i16;
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        AudioFrame {
+            samples: n as u32,
+            pts: None,
+            data: vec![bytes],
+        }
+    }
+
+    #[test]
+    fn make_encoder_default_emits_protection_bit_1() {
+        // The default registry factory must continue to emit
+        // `protection_bit == 1` (no CRC) so existing consumers are
+        // byte-compatible.
+        let mut params = CodecParameters::audio(CodecId::new("mp1"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(1);
+        let mut enc = make_encoder(&params).unwrap();
+        let frame = build_audio_frame_mono(48_000);
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let h = FrameHeader::parse(&pkt.data).unwrap();
+        assert!(!h.has_crc(), "default factory must produce no CRC");
+    }
+
+    #[test]
+    fn make_encoder_with_crc_emits_verifying_crc() {
+        // The opt-in factory writes a CRC that verifies clean against
+        // the decoder-side check.
+        let mut params = CodecParameters::audio(CodecId::new("mp1"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(1);
+        let mut enc = make_encoder_with_crc(&params).unwrap();
+        let frame = build_audio_frame_mono(48_000);
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let h = FrameHeader::parse(&pkt.data).unwrap();
+        assert!(h.has_crc(), "with-CRC factory must clear protection_bit");
+        let status = h
+            .verify_crc(&pkt.data[..4], &pkt.data[4..])
+            .expect("CRC region present");
+        assert!(
+            status.is_good(),
+            "encoder-emitted CRC failed verification: {status:?}"
+        );
+    }
+
+    #[test]
+    fn make_encoder_with_crc_round_trips_through_decoder() {
+        // A full encode-with-CRC -> decode loop reaches PCM cleanly:
+        // the §2.4.3.1 CRC matches, the decoder takes the audio data
+        // path (not concealment), and the frame shape is preserved.
+        let mut params = CodecParameters::audio(CodecId::new("mp1"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(1);
+        let mut enc = make_encoder_with_crc(&params).unwrap();
+        let mut dec = make_decoder(&params).unwrap();
+        // Drive several frames so the synthesis filter ramps and we
+        // see audio (not just leading-edge silence) on the decode side.
+        let mut saw_nonzero = false;
+        for _ in 0..6 {
+            let frame = build_audio_frame_mono(48_000);
+            enc.send_frame(&Frame::Audio(frame)).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            // Confirm every produced packet is CRC-protected.
+            let h = FrameHeader::parse(&pkt.data).unwrap();
+            assert!(h.has_crc());
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            assert_eq!(a.samples, 384);
+            if a.data[0].iter().any(|&b| b != 0) {
+                saw_nonzero = true;
+            }
+        }
+        assert!(
+            saw_nonzero,
+            "CRC-protected encode -> decode produced only silence"
+        );
+    }
+
+    #[test]
+    fn make_encoder_with_crc_validates_params() {
+        // The CRC factory shares its validation with the default
+        // factory: missing sample_rate / channels must be rejected the
+        // same way.
+        let bare = CodecParameters::audio(CodecId::new("mp1"));
+        assert!(make_encoder_with_crc(&bare).is_err());
+        let mut sr_only = CodecParameters::audio(CodecId::new("mp1"));
+        sr_only.sample_rate = Some(48_000);
+        assert!(make_encoder_with_crc(&sr_only).is_err());
     }
 }

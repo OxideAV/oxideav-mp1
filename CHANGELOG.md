@@ -8,6 +8,56 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Optional §2.4.1.4 CRC `error_check()` emission on the Layer I
+  encode side**, closing the long-standing followup recorded against
+  the prior CRC verification work. The encoder previously always wrote
+  `protection_bit == 1` and never emitted a CRC; it now does both on
+  opt-in. Derived solely from ISO/IEC 11172-3 (1993) §2.4.1.4 / §2.4.2.3
+  for the `protection_bit` semantics and §2.4.3.1 + Annex B Table 3-B.5
+  for the protected-field set and CRC-16 generator polynomial — all
+  three were already in the staged PDF for the Layer I / Layer II
+  verification work.
+  - `encode::EncodeParams` grows an `emit_crc: bool` field (default
+    `false`, preserving the historical no-CRC encoder output) plus an
+    `EncodeParams::with_emit_crc(bool)` builder and an
+    `EncodeParams::new(bitrate, sampling_frequency, mode)` constructor
+    so callers no longer need a struct literal to build params.
+  - `encode::Mp1FrameEncoder::encode_frame` honours `emit_crc`: it
+    writes `protection_bit == if emit_crc { 0 } else { 1 }`, leaves a
+    16-bit placeholder immediately after the header when CRC is
+    requested, finishes the audio data normally, and then patches the
+    placeholder with the §2.4.3.1 CRC-16 over the Table 3-B.5 Layer I
+    protected fields (header bits 16…31 + the bit-allocation field).
+    `FrameHeader::compute_crc` is reused to drive the protected-field
+    sizing, keeping the encoder and decoder CRC paths bit-identical.
+  - `frame_payload_bits` already accounted for `has_crc`; passing the
+    `emit_crc` flag through to it deducts the CRC's 16 bits from the
+    §C.1.5.1.6 `adb` budget so the §2.4.2.1 slot count remains
+    `N = floor(12 · bitrate / Fs) + padding` — a CRC-on and CRC-off
+    encode of the same PCM produce byte-identical frame lengths.
+  - `codec::Mp1Encoder` (registry path) and `encoder::make_encoder`
+    (direct API) keep their default no-CRC behaviour. Two new
+    factories — `codec::make_encoder_with_crc` and
+    `encoder::make_encoder_with_crc` — produce a boxed `Mp1Encoder`
+    with `emit_crc == true`, re-exported at the crate root as
+    `oxideav_mp1::make_encoder_with_crc`. The two existing
+    `make_encoder` factories continue to validate `sample_rate` /
+    `channels` exactly as before; the with-crc variants share that
+    validation through a common `make_encoder_inner` helper.
+  - 13 new tests: 7 in `encode` (the `EncodeParams` default and builder,
+    `protection_bit == 1` on the default encoder, `protection_bit == 0`
+    + verifying CRC on the opt-in encoder, byte-count parity with and
+    without CRC, mid-allocation-field corruption is detected as
+    `CrcStatus::Mismatch` for a stereo frame, and a stereo
+    encode-with-CRC round-trips clean), 4 in `codec` (registry-side:
+    default `make_encoder` emits `protection_bit == 1`,
+    `make_encoder_with_crc` emits a CRC the decoder accepts and a full
+    encode-with-CRC → decode loop reaches non-silent PCM, plus the
+    missing-`sample_rate`/`channels` rejection path on the new
+    factory), and 2 in `encoder` (the direct-API `make_encoder_with_crc`
+    round-trip, confirming the plain `make_encoder` still defaults to
+    no CRC and both factories produce the same frame byte count). 153
+    tests total (135 unit + 16 integration + 2 doc).
 - **Layer II §2.4.3.1 CRC-16 `error_check()` verification**, closing
   the long-standing Layer II CRC followup from the §2.4.1.6 work.
   Derived solely from ISO/IEC 11172-3 (1993) §2.4.3.1 + Annex B Table
