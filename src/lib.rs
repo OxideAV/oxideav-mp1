@@ -78,8 +78,8 @@ pub use decode::{
     SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS,
 };
 pub use decode_layer2::{
-    decode_layer2_audio_data, Layer2Subband, Layer2Subbands, LAYER2_SAMPLES_PER_FRAME,
-    LAYER2_SAMPLES_PER_SUBBAND,
+    compute_layer2_crc, decode_layer2_audio_data, verify_layer2_crc, Layer2Subband, Layer2Subbands,
+    LAYER2_SAMPLES_PER_FRAME, LAYER2_SAMPLES_PER_SUBBAND,
 };
 pub use decoder::make_decoder_with_concealment;
 pub use encode::{

@@ -113,10 +113,29 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   PCM against ffmpeg's reference S16 decode of the same file:
   **RMS = 0.50 LSB, max|err| = 1 LSB across 20 736 samples** —
   essentially bit-exact, the residual being IEEE-754 ordering. Layer
-  II encoding, the §2.4.3.1 CRC verification over the Layer II
-  protected fields (header bits 16…31 + bit allocation + scfsi per
-  Table 3-B.5), and a transcription of the 13818-3 LSF Layer II
+  II encoding and a transcription of the 13818-3 LSF Layer II
   allocation table for Fs ∈ {16, 22.05, 24} kHz remain followups.
+- **Layer II §2.4.3.1 CRC-16 `error_check()` verification** over the
+  §2.4.3.1 + Annex B Table 3-B.5 Layer II protected fields (header
+  bits 16…31 + the §2.4.1.6 bit-allocation field + the §2.4.1.6
+  scfsi field). [`verify_layer2_crc`] / [`compute_layer2_crc`] walk
+  the per-frame Tables 3-B.2x allocation row widths to size the
+  allocation field, parse it to find which subbands carry scfsi
+  (one scfsi per channel per non-zero allocation, two bits each, per
+  the §2.4.1.6 syntax), and feed the concatenated protected bits
+  through the same §2.4.3.1 CRC-16 register (`G(X) = X^16 + X^15 +
+  X^2 + 1`, init `0xFFFF`) used by the Layer I path. The
+  [`Mp1Decoder`] routes every CRC-protected Layer II packet through
+  [`verify_layer2_crc`] and, on a mismatch, applies the configured
+  [`ConcealmentMode`]: `Mute` emits a 1152-sample silent frame and
+  rings the filterbank history out with zeros, while
+  `RepeatPrevious` re-synthesizes the last successfully-decoded
+  Layer II frame's 36-slot subband samples (a Layer-II-specific
+  history kept alongside the Layer I one, since the two
+  `Layer2Subbands` / `SubbandSamples` shapes differ in their
+  per-subband sample count). The last-good-only repeat semantics and
+  the first-frame `Mute` fallback match Layer I; `reset` drops both
+  histories.
 - **Polyphase analysis filterbank** (§C.1.3, informative Annex C, figure
   C.4 "Analysis Subband Filter Flow Chart"): per channel, a 512-element
   `X` input FIFO carries windowing history across slots; each slot
@@ -168,18 +187,20 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-109 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+140 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
 field bit sizing per mode, compute→verify round-trip, corruption
-detection in the header and allocation regions, and decoder-level
-concealment on mismatch — both `ConcealmentMode::Mute` and
-`ConcealmentMode::RepeatPrevious`: that repeat reproduces the last good
-frame's PCM, does not chain repeats-of-repeats, falls back to mute on a
-corrupt first frame, drops its history on `reset` while preserving the
-mode, and is switchable at runtime via `set_concealment`), the
-§2.4.2.5 allocation→bits table, the
+detection in the header and allocation regions for Layer I and now in
+the header, allocation **and scfsi** regions for Layer II, and
+decoder-level concealment on mismatch — both `ConcealmentMode::Mute`
+and `ConcealmentMode::RepeatPrevious`: that repeat reproduces the last
+good frame's PCM, does not chain repeats-of-repeats, falls back to
+mute on a corrupt first frame, drops its history on `reset` while
+preserving the mode, and is switchable at runtime via
+`set_concealment` — exercised for both Layer I and Layer II protected
+frames), the §2.4.2.5 allocation→bits table, the
 MSB-first
 bit reader, the §2.4.3.2 requantization formula at several widths,
 mono / stereo / joint-stereo audio-data decode, the Table 3-B.1
@@ -212,8 +233,10 @@ factory keeps the Mute default, plus the missing-`sample_rate` /
 The staged `ISO_IEC_11172-3-MP3-1993.pdf` (157-page edition) carries
 Annex B, so the scalefactor and synthesis-window tables are available;
 the §2.4.3.1 CRC-16 polynomial render and Table 3-B.5 protected-field
-listing are likewise staged, so CRC verification is now implemented.
-One gap remains, not blocking decode to PCM:
+listing are likewise staged, so CRC verification is now implemented
+for **both** Layer I (header bits 16…31 + bit allocation) and Layer II
+(header bits 16…31 + bit allocation + scfsi). One gap remains, not
+blocking decode to PCM:
 
 1. The **§2.4.3.2 requantization linear formula** and the rescale
    formula are rendered as image regions the text layer does not

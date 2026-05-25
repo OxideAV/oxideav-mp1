@@ -29,7 +29,9 @@ use oxideav_core::{
 };
 
 use crate::decode::{decode_audio_data, SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS};
-use crate::decode_layer2::{decode_layer2_audio_data, Layer2Subbands, LAYER2_SAMPLES_PER_SUBBAND};
+use crate::decode_layer2::{
+    decode_layer2_audio_data, verify_layer2_crc, Layer2Subbands, LAYER2_SAMPLES_PER_SUBBAND,
+};
 use crate::encode::{EncodeParams, Mp1FrameEncoder};
 use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Layer, Mode};
 use crate::synthesis::{to_s16, SynthesisFilter};
@@ -90,6 +92,13 @@ pub struct Mp1Decoder {
     /// decoded frame, kept for [`ConcealmentMode::RepeatPrevious`].
     /// `None` until a frame has decoded without a CRC failure.
     last_subbands: Option<SubbandSamples>,
+    /// The Layer II requantized subband samples of the last
+    /// *successfully* decoded Layer II frame, kept for
+    /// [`ConcealmentMode::RepeatPrevious`]. Layer II carries 36
+    /// sample-slots per subband (1152 samples / channel) so it cannot
+    /// share storage with the 12-slot Layer I [`SubbandSamples`].
+    /// `None` until a Layer II frame has decoded without a CRC failure.
+    last_layer2_subbands: Option<Layer2Subbands>,
 }
 
 impl Mp1Decoder {
@@ -108,6 +117,7 @@ impl Mp1Decoder {
             eof: false,
             concealment: ConcealmentMode::default(),
             last_subbands: None,
+            last_layer2_subbands: None,
         }
     }
 
@@ -162,15 +172,27 @@ impl Mp1Decoder {
 
         // Layer II frames go through their own audio_data() decode and
         // synthesis loop (36 sample-slots per channel instead of 12).
-        // CRC verification for Layer II is not yet implemented because
-        // Table 3-B.5 lists the Layer II protected fields as header
-        // bits 16…31 + bit allocation + scfsi — bit-allocation is
-        // variable-width per table B.2x and scfsi is decided dynamically
-        // from the allocation values, so the CRC computation has to walk
-        // the allocation stage first. A Layer II frame with a CRC word
-        // still parses (the word is skipped) but the word is not
-        // checked yet. Layer I CRC handling is unchanged.
+        // §2.4.3.1 + Annex B Table 3-B.5: the Layer II protected fields
+        // are header bits 16…31 + the §2.4.1.6 allocation field + the
+        // §2.4.1.6 scfsi field. `verify_layer2_crc` walks the allocation
+        // field to determine how many scfsi bits are present, then
+        // CRCs the full protected region. On a mismatch the same
+        // §2.4.3.1 concealment strategy as Layer I applies (mute or
+        // repeat-previous).
         if matches!(header.layer, Layer::II) {
+            if header.has_crc() {
+                match verify_layer2_crc(&header, &frame[..4], &frame[4..]) {
+                    Some(CrcStatus::Mismatch { .. }) => {
+                        return Ok(self.conceal_layer2_frame(nch));
+                    }
+                    None => {
+                        return Err(Error::invalid(
+                            "oxideav-mp1: Layer II packet too short for CRC-protected field",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             return self.decode_layer2_frame(&header, audio);
         }
 
@@ -218,7 +240,51 @@ impl Mp1Decoder {
         let subbands = decode_layer2_audio_data(header, audio)
             .map_err(|e| Error::invalid(format!("oxideav-mp1: layer II audio_data: {e}")))?;
         let out = self.synthesize_layer2_subbands(&subbands, nch);
+        // Remember this good frame's Layer II subbands for a future
+        // RepeatPrevious concealment (§2.4.3.1).
+        self.last_layer2_subbands = Some(subbands);
         Ok(out)
+    }
+
+    /// Apply the selected §2.4.3.1 concealment for a Layer II CRC
+    /// failure.
+    ///
+    /// * [`ConcealmentMode::Mute`] — push 36 slots of zero subband
+    ///   samples through each channel's bank: the frame is silent and
+    ///   the previous frame's filter tail rings out continuously.
+    /// * [`ConcealmentMode::RepeatPrevious`] — re-synthesize the last
+    ///   successfully-decoded Layer II frame's requantized subband
+    ///   samples. If no good Layer II frame has decoded yet, this
+    ///   falls back to muting for that frame.
+    ///
+    /// Returns `(pcm_bytes, samples_per_channel, channels)` like
+    /// [`decode_frame`](Self::decode_frame). A concealed frame never
+    /// becomes the "previous frame" for a subsequent repeat — same
+    /// last-good-only semantics as the Layer I concealment path.
+    fn conceal_layer2_frame(&mut self, nch: usize) -> (Vec<u8>, u32, usize) {
+        match self.concealment {
+            ConcealmentMode::RepeatPrevious => {
+                if let Some(prev) = self.last_layer2_subbands.clone() {
+                    let prev_nch = prev.channels.clamp(1, 2);
+                    return self.synthesize_layer2_subbands(&prev, prev_nch);
+                }
+                self.conceal_muted_layer2_frame(nch)
+            }
+            ConcealmentMode::Mute => self.conceal_muted_layer2_frame(nch),
+        }
+    }
+
+    /// Build a muted Layer II concealment frame (§2.4.3.1 "muting of the
+    /// actual frame"): an empty [`Layer2Subbands`] pushed through each
+    /// channel's synthesis bank so the overlap-add `V` history advances
+    /// continuously rather than being cut, giving the standard's
+    /// "mute" behaviour without a discontinuity click.
+    fn conceal_muted_layer2_frame(&mut self, nch: usize) -> (Vec<u8>, u32, usize) {
+        // `Layer2Subbands::silent` carries `sblimit = 0`, forcing every
+        // (sb, slot) sample to zero through `Layer2Subbands::slot` —
+        // the §2.4.3.1 muting shape for Layer II.
+        let zeros = Layer2Subbands::silent(nch);
+        self.synthesize_layer2_subbands(&zeros, nch)
     }
 
     /// Run the §2.4.3.2 polyphase synthesis filterbank over a Layer II
@@ -391,6 +457,7 @@ impl Decoder for Mp1Decoder {
         // meaningful "previous frame" to repeat. The concealment *mode*
         // is a configured policy and is intentionally preserved.
         self.last_subbands = None;
+        self.last_layer2_subbands = None;
         for f in &mut self.filters {
             f.reset();
         }
@@ -1132,6 +1199,215 @@ mod tests {
         assert!(
             pcm.iter().all(|&b| b == 0),
             "after reset, RepeatPrevious must mute (history dropped)"
+        );
+    }
+
+    // ---- Layer II CRC concealment routing ------------------------
+
+    /// Build a protected mono Layer II frame at 64 kbit/s / 44.1 kHz
+    /// (selects Table 3-B.2a, sblimit = 27, no padding), with the
+    /// given allocation-of-sb0 (`alloc_sb0`, nbal=4 column, valid
+    /// values 0..=14) and the standard "all subsequent subbands
+    /// unallocated" pattern. The CRC word is computed correctly when
+    /// `corrupt_crc` is false; otherwise it is XOR-flipped so the
+    /// decoder's §2.4.3.1 concealment path fires.
+    fn build_protected_l2_mono_frame(alloc_sb0: u32, corrupt_crc: bool) -> Vec<u8> {
+        use crate::decode_layer2::compute_layer2_crc;
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        // Layer II (0b10), MPEG-1, protection=0 -> CRC present.
+        // bitrate_index 0b0100 -> 64 kbit/s; sampling 0b00 -> 44.1 kHz;
+        // single_channel. frame_length = floor(144 * 64000 / 44100)
+        // = 208 bytes.
+        let word: u32 = (0xFFF << 20)
+            | (1 << 19)        // ID = MPEG-1
+            | (0b10 << 17)     // layer II
+            // protection bit (16) = 0 -> CRC present
+            | (0b0100 << 12)   // bitrate index -> 64 kbit/s
+            // sampling 0b00 (44.1 kHz) — implicit zero; clippy identity_op.
+            | (0b11 << 6)      // single_channel
+            | (1 << 2); // original
+        let header = word.to_be_bytes();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+
+        // Allocation field: sb0 takes the requested alloc, all higher
+        // subbands stay at 0 (sums to 88 bits = 11 bytes for B.2a mono).
+        let mut bw = BitWriter::new();
+        bw.put(alloc_sb0, 4);
+        for sb in 1..table.sblimit() {
+            bw.put(0, table.nbal(sb));
+        }
+        // scfsi for the one allocated subband (2 bits, selector 0b00).
+        if alloc_sb0 != 0 {
+            bw.put(0b00, 2);
+            // Three scalefactor indices (6 bits each) — all zeros are
+            // valid (table index 0, multiplier 2.0).
+            for _ in 0..3 {
+                bw.put(0, 6);
+            }
+            // 12 syntax-granules: one codeword each. For sb0 alloc 1
+            // (B.2a row 0..2 column 0): nlevels=3, grouped, 5-bit
+            // codeword. Use all-zero codes (valid).
+            for _ in 0..12 {
+                bw.put(0, 5);
+            }
+        }
+        let body = bw.finish();
+
+        // Compute CRC over header bits 16..31 + allocation + scfsi.
+        let mut crc = compute_layer2_crc(&h, &header, &body).expect("layer2 crc");
+        if corrupt_crc {
+            crc ^= 0xFFFF;
+        }
+
+        // Frame: header + CRC word (MSB-first) + body, padded to the
+        // header's reported frame_length.
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(&crc.to_be_bytes());
+        frame.extend_from_slice(&body);
+        let target_len = h.frame_length_bytes().unwrap() as usize;
+        if frame.len() < target_len {
+            frame.resize(target_len, 0);
+        }
+        frame
+    }
+
+    #[test]
+    fn layer2_crc_match_decodes_to_1152_samples() {
+        // A valid Layer II protected frame must produce a 1152-sample
+        // PCM frame — same shape as an unprotected Layer II frame.
+        let frame = build_protected_l2_mono_frame(1, /*corrupt=*/ false);
+        // Confirm the header reports a CRC-protected frame.
+        let h = FrameHeader::parse(&frame).unwrap();
+        assert_eq!(h.layer, Layer::II);
+        assert!(h.has_crc());
+
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut dec = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), frame);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+            panic!("audio frame");
+        };
+        // §2.4.2.1: 1152 samples per channel per Layer II frame.
+        assert_eq!(a.samples, 1152);
+        assert_eq!(a.data[0].len(), 1152 * 2);
+    }
+
+    #[test]
+    fn layer2_crc_mismatch_is_concealed_as_mute() {
+        // A protected Layer II frame whose CRC has been flipped must
+        // be concealed (default ConcealmentMode::Mute): the decoder
+        // produces a correctly-shaped 1152-sample PCM frame whose
+        // contents are exact silence on the very first frame (the
+        // filterbank's `V` history is zero, so the muting concealment
+        // emits silence + a tail that's also still silence).
+        let params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut dec = make_decoder(&params).unwrap();
+        for _ in 0..3 {
+            let frame = build_protected_l2_mono_frame(1, /*corrupt=*/ true);
+            let pkt = Packet::new(0, TimeBase::new(1, 44_100), frame);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            assert_eq!(
+                a.samples, 1152,
+                "Layer II concealment must keep frame shape"
+            );
+            assert!(
+                a.data[0].iter().all(|&b| b == 0),
+                "muted Layer II concealment with no prior history must be exact silence"
+            );
+        }
+    }
+
+    #[test]
+    fn layer2_crc_mismatch_repeats_last_good_subbands() {
+        // With ConcealmentMode::RepeatPrevious, a CRC-failing Layer II
+        // frame must reproduce exactly the PCM the previous good
+        // Layer II frame's subband samples would produce on a decoder
+        // in the identical (now-advanced) filterbank state — i.e. it
+        // matches a fresh decoder consuming a second copy of the good
+        // frame.
+        let reference_params = CodecParameters::audio(CodecId::new("mp1"));
+        let mut reference = make_decoder(&reference_params).unwrap();
+        let good_frame = build_protected_l2_mono_frame(2, /*corrupt=*/ false);
+        let pkt1 = Packet::new(0, TimeBase::new(1, 44_100), good_frame.clone());
+        reference.send_packet(&pkt1).unwrap();
+        let _ = reference.receive_frame().unwrap();
+        let pkt2 = Packet::new(0, TimeBase::new(1, 44_100), good_frame.clone());
+        reference.send_packet(&pkt2).unwrap();
+        let Frame::Audio(want) = reference.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+
+        let mut subject = Box::new(
+            Mp1Decoder::new(CodecId::new("mp1")).with_concealment(ConcealmentMode::RepeatPrevious),
+        ) as Box<dyn Decoder>;
+        let pkt_a = Packet::new(0, TimeBase::new(1, 44_100), good_frame.clone());
+        subject.send_packet(&pkt_a).unwrap();
+        let _ = subject.receive_frame().unwrap();
+        let corrupt = build_protected_l2_mono_frame(2, /*corrupt=*/ true);
+        let pkt_b = Packet::new(0, TimeBase::new(1, 44_100), corrupt);
+        subject.send_packet(&pkt_b).unwrap();
+        let Frame::Audio(got) = subject.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        assert_eq!(
+            got.samples, 1152,
+            "Layer II RepeatPrevious must keep the 1152-sample shape"
+        );
+        assert_eq!(
+            got.data[0], want.data[0],
+            "Layer II RepeatPrevious must reproduce the last good frame's PCM"
+        );
+    }
+
+    #[test]
+    fn layer2_crc_mismatch_first_frame_repeat_falls_back_to_mute() {
+        // RepeatPrevious with no prior good Layer II frame: the first
+        // CRC-failing frame falls back to muting (exact silence).
+        let mut dec = Box::new(
+            Mp1Decoder::new(CodecId::new("mp1")).with_concealment(ConcealmentMode::RepeatPrevious),
+        ) as Box<dyn Decoder>;
+        let frame = build_protected_l2_mono_frame(1, /*corrupt=*/ true);
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), frame);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        assert_eq!(a.samples, 1152);
+        assert!(
+            a.data[0].iter().all(|&b| b == 0),
+            "first-frame Layer II RepeatPrevious must mute (no previous frame to repeat)"
+        );
+    }
+
+    #[test]
+    fn layer2_reset_clears_repeat_history() {
+        // After reset, RepeatPrevious has no Layer II "previous frame"
+        // to repeat, so the next corrupt frame mutes to exact silence.
+        let mut owned = Mp1Decoder::new(CodecId::new("mp1"));
+        owned.set_concealment(ConcealmentMode::RepeatPrevious);
+        {
+            let f = build_protected_l2_mono_frame(1, false);
+            let pkt = Packet::new(0, TimeBase::new(1, 44_100), f);
+            owned.send_packet(&pkt).unwrap();
+            let _ = owned.receive_frame().unwrap();
+        }
+        owned.reset().unwrap();
+        assert_eq!(owned.concealment(), ConcealmentMode::RepeatPrevious);
+        let mut boxed = Box::new(owned) as Box<dyn Decoder>;
+        let f = build_protected_l2_mono_frame(1, true);
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), f);
+        boxed.send_packet(&pkt).unwrap();
+        let Frame::Audio(a) = boxed.receive_frame().unwrap() else {
+            panic!("audio");
+        };
+        assert!(
+            a.data[0].iter().all(|&b| b == 0),
+            "after reset, Layer II RepeatPrevious must mute (history dropped)"
         );
     }
 

@@ -8,6 +8,68 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II §2.4.3.1 CRC-16 `error_check()` verification**, closing
+  the long-standing Layer II CRC followup from the §2.4.1.6 work.
+  Derived solely from ISO/IEC 11172-3 (1993) §2.4.3.1 + Annex B Table
+  3-B.5 (the Layer II protected fields: header bits 16…31 + the
+  §2.4.1.6 bit-allocation field + the §2.4.1.6 scfsi field). The
+  generator polynomial and shift-register initial state were already
+  recovered for the Layer I CRC work and are now shared by both
+  layers.
+  - `decode_layer2::compute_layer2_crc(&FrameHeader, header_bytes, alloc_and_scfsi)`
+    and `decode_layer2::verify_layer2_crc(&FrameHeader, header_bytes,
+    after_header)` walk the per-frame Table 3-B.2x allocation row
+    widths to size the bit-allocation field, parse it to find which
+    subbands carry scfsi (one 2-bit scfsi per channel per non-zero
+    allocation, including the §2.4.1.6 shared upper band where the
+    allocation is shared but `scfsi` is still read once per channel),
+    then feed the concatenated protected bits through the same
+    §2.4.3.1 CRC-16 register (`G(X) = X^16 + X^15 + X^2 + 1`, init
+    `0xFFFF`) used by the Layer I path. The CRC-16 helper is now
+    shared `pub(crate)` between `header` and `decode_layer2` to avoid
+    duplication.
+  - The `Mp1Decoder` routes every CRC-protected Layer II packet
+    through `verify_layer2_crc` and, on a mismatch, applies the
+    selected `ConcealmentMode` to a Layer II concealment frame: the
+    new `Mp1Decoder::conceal_layer2_frame` builds a 1152-sample
+    output through the synthesis filterbank, either from zero
+    subbands (`Mute` — `Layer2Subbands::silent`) or from the last
+    successfully-decoded Layer II frame's 36-slot subband samples
+    (`RepeatPrevious`). Because Layer II's `Layer2Subbands` carries 36
+    sample-slots per subband (vs Layer I's 12) the two cannot share
+    history storage, so a new `Mp1Decoder::last_layer2_subbands`
+    field holds the Layer II repeat state alongside the existing
+    Layer I `last_subbands`. The last-good-only repeat semantics, the
+    first-frame `Mute` fallback, and `reset` dropping the repeat
+    state all match the Layer I path; `reset` now clears both
+    histories.
+  - `Layer2Subbands::silent(channels)` is exposed publicly (mirroring
+    `SubbandSamples::silent`) to give callers the §2.4.3.1 muting
+    shape for Layer II (a `sblimit = 0` `Layer2Subbands` that
+    `slot(ch, slot)` zeros out completely).
+  - 8 new unit tests in `decode_layer2`: allocation-field bit count
+    sizing for mono B.2a, scfsi field bit count when no subband is
+    allocated and when several are, the full
+    `compute_layer2_crc → verify_layer2_crc` round-trip, mismatch
+    detection inside the allocation field, mismatch detection in
+    header bits 16…31 (different `bitrate_index` produces a different
+    CRC over the same allocation), mismatch detection inside the
+    scfsi field (different scfsi bits produce a different CRC), and
+    the `Absent` / truncated-buffer edge cases.
+  - 5 new decoder-level tests in `codec`: a CRC-matching protected
+    Layer II frame decodes to 1152 samples; a CRC-failing Layer II
+    frame with the default Mute concealment produces a 1152-sample
+    silent frame; `RepeatPrevious` on a CRC-failing Layer II frame
+    reproduces exactly the PCM the previous good Layer II frame's
+    subband samples would produce on an in-sync decoder; the
+    first-Layer-II-frame RepeatPrevious case falls back to mute
+    (nothing to repeat); and `reset` drops the Layer II repeat
+    history while preserving the configured mode.
+  - **Followups**: Layer II encoder; a transcription of the 13818-3
+    LSF Layer II allocation table for Fs ∈ {16, 22.05, 24} kHz
+    (currently mapped onto the 11172-3 B.2b table as a defensive
+    default); optional CRC emission on the encode side (the encoder
+    still always sets `protection_bit == 1`).
 - **Layer II `audio_data()` decode** (ISO/IEC 11172-3 (1993) §2.4.1.6
   / §2.4.2.6 / §2.4.3.3 + Annex B Tables 3-B.2a..d "Possible
   quantization per subband" and 3-B.4 "Layer II classes of

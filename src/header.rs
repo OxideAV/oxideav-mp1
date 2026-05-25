@@ -502,13 +502,13 @@ pub fn find_sync(buf: &[u8]) -> Option<usize> {
 /// image). In a 16-bit register the `X^16` term is the bit shifted out
 /// at the top, so the feedback taps below it are `X^15`, `X^2`, `X^0` —
 /// i.e. the mask `0b1000_0000_0000_0101 = 0x8005`.
-const CRC16_POLY: u16 = 0x8005;
+pub(crate) const CRC16_POLY: u16 = 0x8005;
 
 /// The §2.4.3.1 CRC-16 shift-register initial state.
 ///
 /// §2.4.3.1: "The initial state of the shift register is
 /// '1111 1111 1111 1111'." — numerically `0xFFFF`.
-const CRC16_INIT: u16 = 0xFFFF;
+pub(crate) const CRC16_INIT: u16 = 0xFFFF;
 
 /// Feed `count` bits of `byte` (the most-significant `count` bits,
 /// MSB-first) of each byte of `bytes` through the §2.4.3.1 CRC-16
@@ -523,7 +523,7 @@ const CRC16_INIT: u16 = 0xFFFF;
 ///
 /// `reg` is the running register state; the first call passes
 /// [`CRC16_INIT`].
-fn crc16_update_bits(mut reg: u16, bytes: &[u8], bit_count: usize) -> u16 {
+pub(crate) fn crc16_update_bits(mut reg: u16, bytes: &[u8], bit_count: usize) -> u16 {
     debug_assert!(bit_count <= bytes.len() * 8, "bit_count past slice end");
     for i in 0..bit_count {
         let bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;

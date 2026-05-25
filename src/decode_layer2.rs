@@ -42,7 +42,7 @@
 //! is valid for both channels").
 
 use crate::decode::{BitReader, DecodeError, SUBBANDS};
-use crate::header::{FrameHeader, Mode};
+use crate::header::{crc16_update_bits, CrcStatus, FrameHeader, Mode, CRC16_INIT};
 use crate::tables::SCALEFACTORS;
 use crate::tables_layer2::{layer2_bit_allocation_table, AllocationTable, QuantClass};
 
@@ -125,6 +125,17 @@ impl Layer2Subbands {
         }
     }
 
+    /// A silent Layer II frame: `channels` channels, `sblimit = 0`
+    /// (so every (sb, slot) sample is forced to zero by
+    /// [`slot`](Self::slot)).
+    ///
+    /// Feeding this through the §2.4.3.2 synthesis filterbank produces
+    /// silence for the new samples while the overlap-add history rings
+    /// out — the §2.4.3.1 "muting" concealment shape for Layer II.
+    pub fn silent(channels: usize) -> Layer2Subbands {
+        Layer2Subbands::empty(channels.clamp(1, 2), 0)
+    }
+
     /// The 32 sub-band sample values for channel `ch` and sample-slot
     /// `slot` (`slot < `[`LAYER2_SAMPLES_PER_SUBBAND`]), laid out as
     /// `[subband 0 .. subband 31]` ready to feed the synthesis
@@ -144,6 +155,140 @@ impl Layer2Subbands {
         }
         out
     }
+}
+
+/// Total number of bits the Layer II §2.4.1.6 `allocation` field
+/// occupies for the given header.
+///
+/// §2.4.1.6 reads the per-channel allocation field below the
+/// `stereo_bound` and one shared allocation field in the
+/// `[bound, sblimit)` upper band (intensity_stereo). Each subband's
+/// allocation is `nbal(sb)` bits wide per the per-frame Table 3-B.2x.
+fn layer2_allocation_field_bits(header: &FrameHeader, table: &'static AllocationTable) -> usize {
+    let nch = header.channels() as usize;
+    let sblimit = table.sblimit();
+    let bound = stereo_bound(header, sblimit);
+    let mut bits = 0usize;
+    for sb in 0..bound {
+        bits += (table.nbal(sb) as usize) * nch;
+    }
+    for sb in bound..sblimit {
+        bits += table.nbal(sb) as usize;
+    }
+    bits
+}
+
+/// Walk the §2.4.1.6 allocation field in `data` (starting at bit `0`)
+/// and return the total number of bits the §2.4.1.6 `scfsi` field
+/// occupies: 2 bits per (ch, sb) below `sblimit` whose decoded
+/// allocation is non-zero.
+///
+/// `data` is the bitstream slice that begins at the start of the
+/// allocation field (i.e. `after_header[2..]` in a CRC-protected
+/// frame, or `after_header` itself when no CRC is present). Returns
+/// `None` if the slice is too short to contain the allocation field
+/// or if an allocation index points at an empty (`-`) slot in the
+/// per-subband Table 3-B.2x row.
+fn layer2_scfsi_field_bits(
+    header: &FrameHeader,
+    table: &'static AllocationTable,
+    data: &[u8],
+) -> Option<usize> {
+    let nch = header.channels() as usize;
+    let sblimit = table.sblimit();
+    let bound = stereo_bound(header, sblimit);
+    let mut reader = BitReader::new(data);
+    let mut bits = 0usize;
+    // Low band: per-channel allocation, per-channel scfsi.
+    for sb in 0..bound {
+        let nbal = table.nbal(sb);
+        for _ch in 0..nch {
+            let alloc = reader.read_bits(nbal).ok()? as u8;
+            if alloc != 0 {
+                // Validate that the allocation index points at a real
+                // class — an invalid index here would also wreck the
+                // scalefactor/sample stage, so reject early.
+                table.quant_class(sb, alloc)?;
+                bits += 2;
+            }
+        }
+    }
+    // Upper band: one shared allocation; one scfsi *per channel* per
+    // §2.4.1.6 (scfsi is always per-channel even in the shared
+    // upper band — the syntax page lists `for(ch=0;ch<nch;ch++)`
+    // around the scfsi read for every sb below sblimit).
+    for sb in bound..sblimit {
+        let nbal = table.nbal(sb);
+        let alloc = reader.read_bits(nbal).ok()? as u8;
+        if alloc != 0 {
+            table.quant_class(sb, alloc)?;
+            bits += 2 * nch;
+        }
+    }
+    Some(bits)
+}
+
+/// Compute the §2.4.3.1 CRC-16 over the Layer II protected fields for a
+/// frame (Annex B Table 3-B.5: header bits 16…31, bit allocation,
+/// scalefactor selection information).
+///
+/// `header_bytes` is the four-byte frame header and `allocation_and_scfsi`
+/// is the bitstream slice that begins immediately at the allocation
+/// field (i.e. `after_header[2..]` for a CRC-protected frame, since the
+/// CRC word sits between the header and the allocation field). Returns
+/// the 16-bit CRC, or `None` if the slice is too short for the protected
+/// region or contains an invalid allocation index.
+pub fn compute_layer2_crc(
+    header: &FrameHeader,
+    header_bytes: &[u8],
+    allocation_and_scfsi: &[u8],
+) -> Option<u16> {
+    if header_bytes.len() < 4 {
+        return None;
+    }
+    let table = layer2_bit_allocation_table(header);
+    let alloc_bits = layer2_allocation_field_bits(header, table);
+    let scfsi_bits = layer2_scfsi_field_bits(header, table, allocation_and_scfsi)?;
+    let total_bits = alloc_bits + scfsi_bits;
+    if allocation_and_scfsi.len() * 8 < total_bits {
+        return None;
+    }
+    let mut reg = crc16_update_bits(CRC16_INIT, &header_bytes[2..4], 16);
+    reg = crc16_update_bits(reg, allocation_and_scfsi, total_bits);
+    Some(reg)
+}
+
+/// Read **and verify** the §2.4.1.4 / §2.4.3.1 `error_check()` word for
+/// a Layer II frame, returning the resulting [`CrcStatus`].
+///
+/// `header_bytes` is the four-byte frame header and `after_header` is the
+/// bitstream slice that begins immediately after the four header bytes.
+/// When [`FrameHeader::has_crc`] is false this returns [`CrcStatus::Absent`]
+/// without consuming any bytes. When a CRC is expected the §2.4.3.1
+/// CRC-16 is computed over header bits 16…31 + the §2.4.1.6 allocation
+/// field + the §2.4.1.6 scfsi field (per Annex B Table 3-B.5) and
+/// compared with the stored word; returns [`CrcStatus::Ok`] or
+/// [`CrcStatus::Mismatch`]. Returns `None` if a CRC is expected but the
+/// slice is too short to hold the CRC word plus the full protected
+/// region.
+pub fn verify_layer2_crc(
+    header: &FrameHeader,
+    header_bytes: &[u8],
+    after_header: &[u8],
+) -> Option<CrcStatus> {
+    if !header.has_crc() {
+        return Some(CrcStatus::Absent);
+    }
+    if header_bytes.len() < 4 || after_header.len() < 2 {
+        return None;
+    }
+    let stored = u16::from_be_bytes([after_header[0], after_header[1]]);
+    let computed = compute_layer2_crc(header, header_bytes, &after_header[2..])?;
+    Some(if computed == stored {
+        CrcStatus::Ok(stored)
+    } else {
+        CrcStatus::Mismatch { stored, computed }
+    })
 }
 
 /// The intensity_stereo `bound` for a Layer II frame: the first
@@ -477,6 +622,291 @@ mod tests {
         assert!((out[1] - (2.0 / 7.0)).abs() < 1e-12, "got {}", out[1]);
         // 7 inverted is 3 → frac 3/4 → s'' = (8/7)*1.0 = 8/7.
         assert!((out[2] - (8.0 / 7.0)).abs() < 1e-12, "got {}", out[2]);
+    }
+
+    // ---- §2.4.3.1 + Table 3-B.5 CRC walk -------------------------
+
+    /// Pack a sequence of (bit_width, value) pairs MSB-first into a
+    /// byte vector — the same MSB-first layout the §2.4.1.6 bitstream
+    /// uses for `allocation` / `scfsi` / `scalefactor` / `sample`
+    /// fields. Final partial byte is zero-padded on the low side.
+    fn pack_msb_first(fields: &[(u8, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut acc: u32 = 0;
+        let mut nbits: u8 = 0;
+        for &(w, v) in fields {
+            for i in (0..w).rev() {
+                let b = (v >> i) & 1;
+                acc = (acc << 1) | b;
+                nbits += 1;
+                if nbits == 8 {
+                    bytes.push(acc as u8);
+                    acc = 0;
+                    nbits = 0;
+                }
+            }
+        }
+        if nbits > 0 {
+            acc <<= 8 - nbits;
+            bytes.push(acc as u8);
+        }
+        bytes
+    }
+
+    /// Build a CRC-protected mono Layer II header at 64 kbit/s, 44.1
+    /// kHz (selects Table 3-B.2a, sblimit = 27). Returns the four-byte
+    /// header word.
+    fn protected_mono_l2_header() -> [u8; 4] {
+        // Layer II (layer 0b10), MPEG-1 (ID 1), protection=0,
+        // bitrate_index 0b0100 (64 kbit/s on the Layer II MPEG-1
+        // ladder), 44.1 kHz (0b00 — implicit zero), no padding,
+        // single_channel (0b11), mode_ext 0, no copyright, original,
+        // no emphasis. Zero-valued fields contribute nothing to the
+        // OR and are omitted (clippy `identity_op`).
+        let word: u32 = (0xFFF << 20)
+            | (1 << 19)        // ID = MPEG-1
+            | (0b10 << 17)     // layer II
+            // protection bit (16) = 0 -> CRC present
+            | (0b0100 << 12)   // bitrate index 0b0100 -> 64 kbit/s on L2 MPEG-1 ladder
+            // sampling_frequency (10..11) = 0b00 -> 44.1 kHz (omitted)
+            | (0b11 << 6)      // single_channel
+            | (1 << 2); // original
+        word.to_be_bytes()
+    }
+
+    #[test]
+    fn allocation_field_bits_mono_b2a() {
+        // 64 kbit/s mono @ 44.1 kHz -> B.2a (sum_of_nbal = 88, sblimit
+        // = 27). Mono single_channel: bound = sblimit, so allocation
+        // bits = 1 * sum_of_nbal = 88.
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+        assert_eq!(table.sblimit(), 27);
+        assert_eq!(layer2_allocation_field_bits(&h, table), 88);
+    }
+
+    #[test]
+    fn scfsi_field_bits_zero_when_no_subband_allocated() {
+        // All-zero allocation field: scfsi field carries zero bits.
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+        // 88 allocation bits = 11 bytes; pad some trailing room.
+        let data = vec![0u8; 32];
+        assert_eq!(layer2_scfsi_field_bits(&h, table, &data), Some(0));
+    }
+
+    #[test]
+    fn scfsi_field_bits_counts_each_allocated_subband() {
+        // 64 kbit/s mono @ 44.1 kHz selects B.2a. Build an allocation
+        // field with three subbands allocated (sb0 nbal=4 -> alloc 1,
+        // sb1 nbal=4 -> alloc 0, sb2 nbal=4 -> alloc 2, then zeros).
+        // Each allocated subband contributes 2 scfsi bits, so 3
+        // allocated subbands -> 6 scfsi bits.
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+        // First three subbands have nbal=4. Build sb0=1, sb1=0, sb2=2,
+        // then all-zero for the remaining 24 subbands (nbal mixes 4/3/2).
+        let mut fields: Vec<(u8, u32)> = vec![(4, 1), (4, 0), (4, 2)];
+        for sb in 3..table.sblimit() {
+            fields.push((table.nbal(sb), 0));
+        }
+        let bytes = pack_msb_first(&fields);
+        assert_eq!(layer2_scfsi_field_bits(&h, table, &bytes), Some(4));
+    }
+
+    #[test]
+    fn layer2_crc_round_trip_compute_then_verify_ok() {
+        // Synthesise a protected mono Layer II frame, compute the CRC
+        // over its allocation+scfsi region with `compute_layer2_crc`,
+        // store the CRC right after the header, and confirm
+        // `verify_layer2_crc` reports Ok.
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+        // Build a deliberate allocation field: sb0 nbal=4 -> 1
+        // (nlevels=3, grouped); sb1 nbal=4 -> 2 (nlevels=5, grouped);
+        // remaining subbands zero. The two scfsi reads (sb0, sb1) both
+        // take selector 0b00 (three scalefactors), but only the
+        // allocation + scfsi region is CRC-protected so we pick the
+        // smallest valid scfsi pattern (all zeros) and pad enough audio
+        // bytes for the decoder to work later.
+        let mut alloc_fields: Vec<(u8, u32)> = vec![(4, 1), (4, 2)];
+        for sb in 2..table.sblimit() {
+            alloc_fields.push((table.nbal(sb), 0));
+        }
+        // scfsi (2 bits per allocated subband; here 2 subbands -> 4 bits)
+        // — pick selector 0b00 each.
+        let mut combined_fields = alloc_fields.clone();
+        combined_fields.push((2, 0b00));
+        combined_fields.push((2, 0b00));
+        // Then a scalefactor field per part per subband (6 bits × 3
+        // parts × 2 subbands = 36 bits). All-zero scalefactor indices
+        // produce a valid (if quiet) Layer II frame.
+        for _ in 0..(3 * 2) {
+            combined_fields.push((6, 0));
+        }
+        // Sample data: 12 syntax-granules × 2 subbands × 1 codeword.
+        // Grouped class nlevels=3 uses 5 bits per codeword (Table 3-B.4);
+        // nlevels=5 uses 7. All-zero codewords are valid (they decode
+        // to non-zero samples but that doesn't affect the CRC).
+        for _ in 0..12 {
+            combined_fields.push((5, 0));
+            combined_fields.push((7, 0));
+        }
+        // Round up to a whole number of bytes for the rest of the frame.
+        let body = pack_msb_first(&combined_fields);
+
+        let crc = compute_layer2_crc(&h, &header, &body).expect("compute_layer2_crc");
+
+        // Stage the bitstream: header + CRC word (MSB-first) + body.
+        let mut after = crc.to_be_bytes().to_vec();
+        after.extend_from_slice(&body);
+
+        match verify_layer2_crc(&h, &header, &after) {
+            Some(CrcStatus::Ok(stored)) => assert_eq!(stored, crc),
+            other => panic!("expected CrcStatus::Ok, got {other:?}"),
+        }
+        assert!(verify_layer2_crc(&h, &header, &after).unwrap().is_good());
+    }
+
+    #[test]
+    fn layer2_crc_detects_corruption_in_allocation_field() {
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+        // Single allocated subband (sb0 alloc=1), zeros elsewhere.
+        let mut fields: Vec<(u8, u32)> = vec![(4, 1)];
+        for sb in 1..table.sblimit() {
+            fields.push((table.nbal(sb), 0));
+        }
+        // One scfsi read for sb0 (2 bits).
+        fields.push((2, 0b00));
+        // Three scalefactor indices for sb0 (6 bits each).
+        for _ in 0..3 {
+            fields.push((6, 0));
+        }
+        // 12 syntax-granules of one 5-bit codeword.
+        for _ in 0..12 {
+            fields.push((5, 0));
+        }
+        let body = pack_msb_first(&fields);
+        let crc = compute_layer2_crc(&h, &header, &body).unwrap();
+        let mut after = crc.to_be_bytes().to_vec();
+        after.extend_from_slice(&body);
+
+        // Flip a bit inside the first byte of the allocation field
+        // (after the 2-byte CRC), changing sb0's allocation from 1 to
+        // some other still-valid value. The flipped bit is within the
+        // first 88 protected bits, so the CRC must mismatch.
+        after[2] ^= 0b0001_0000; // flip a high bit in the alloc field's nibble
+        match verify_layer2_crc(&h, &header, &after) {
+            Some(CrcStatus::Mismatch { stored, computed }) => {
+                assert_eq!(stored, crc);
+                assert_ne!(computed, crc);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer2_crc_detects_corruption_in_header_bits_16_31() {
+        // Two protected Layer II headers that differ only in header
+        // bits 16..31 (different bitrate_index) produce different CRCs
+        // over the same allocation/scfsi region.
+        let header_a = protected_mono_l2_header();
+        let h_a = FrameHeader::parse(&header_a).unwrap();
+        // Build header_b: same as A but bitrate_index 0b0011 (56
+        // kbit/s on the L2 MPEG-1 ladder).
+        let word_b: u32 = (0xFFF << 20)
+            | (1 << 19)
+            | (0b10 << 17)
+            | (0b0011 << 12)
+            // sampling 0b00 (44.1 kHz) and other zero-valued fields omitted.
+            | (0b11 << 6)
+            | (1 << 2);
+        let header_b = word_b.to_be_bytes();
+        let h_b = FrameHeader::parse(&header_b).unwrap();
+        // Same allocation/scfsi body.
+        let table = layer2_bit_allocation_table(&h_a);
+        let mut fields: Vec<(u8, u32)> = vec![(4, 1)];
+        for sb in 1..table.sblimit() {
+            fields.push((table.nbal(sb), 0));
+        }
+        fields.push((2, 0b00));
+        let body = pack_msb_first(&fields);
+        let crc_a = compute_layer2_crc(&h_a, &header_a, &body).unwrap();
+        let crc_b = compute_layer2_crc(&h_b, &header_b, &body).unwrap();
+        assert_ne!(
+            crc_a, crc_b,
+            "CRC must cover header bits 16..31 — different bitrate_index must produce different CRC"
+        );
+    }
+
+    #[test]
+    fn layer2_crc_detects_corruption_in_scfsi_field() {
+        // Build a frame with one allocated subband. Flip a bit inside
+        // the scfsi field (which sits AFTER the 88-bit allocation
+        // field). The scfsi is part of the protected set per Table
+        // 3-B.5, so the CRC must mismatch when the scfsi bit changes.
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        let table = layer2_bit_allocation_table(&h);
+        let mut fields: Vec<(u8, u32)> = vec![(4, 1)];
+        for sb in 1..table.sblimit() {
+            fields.push((table.nbal(sb), 0));
+        }
+        // scfsi for sb0: selector 0b00 (then 6+6+6 scf bits and the
+        // sample data follow, but those are unprotected).
+        fields.push((2, 0b00));
+        for _ in 0..3 {
+            fields.push((6, 0));
+        }
+        for _ in 0..12 {
+            fields.push((5, 0));
+        }
+        let body = pack_msb_first(&fields);
+        let crc_ok = compute_layer2_crc(&h, &header, &body).unwrap();
+
+        // Build a second body where the scfsi bits are flipped to 0b11.
+        let mut fields2 = fields.clone();
+        fields2[table.sblimit()] = (2, 0b11); // index 27 is the scfsi entry
+        let body2 = pack_msb_first(&fields2);
+        let crc_diff = compute_layer2_crc(&h, &header, &body2).unwrap();
+        assert_ne!(
+            crc_ok, crc_diff,
+            "CRC must cover the scfsi field — different scfsi must produce different CRC"
+        );
+    }
+
+    #[test]
+    fn layer2_verify_crc_absent_when_protection_set() {
+        // protection_bit == 1 -> no CRC; verify reports Absent without
+        // consuming bytes.
+        let word: u32 = (0xFFF << 20)
+            | (1 << 19)
+            | (0b10 << 17)
+            | (1 << 16) // protection bit = 1 (no CRC)
+            | (0b0100 << 12)
+            // sampling 0b00 (44.1 kHz) omitted (clippy `identity_op`).
+            | (0b11 << 6)
+            | (1 << 2);
+        let header = word.to_be_bytes();
+        let h = FrameHeader::parse(&header).unwrap();
+        assert!(!h.has_crc());
+        assert_eq!(verify_layer2_crc(&h, &header, &[]), Some(CrcStatus::Absent));
+    }
+
+    #[test]
+    fn layer2_verify_crc_none_when_truncated() {
+        let header = protected_mono_l2_header();
+        let h = FrameHeader::parse(&header).unwrap();
+        // Only one byte after the header: not enough for the CRC word.
+        assert_eq!(verify_layer2_crc(&h, &header, &[0xAB]), None);
+        // CRC word present but allocation+scfsi field truncated.
+        assert_eq!(verify_layer2_crc(&h, &header, &[0x00, 0x00, 0x00]), None);
     }
 
     /// A grouped class: nlevels = 3, 5 bits per codeword. Degroup
