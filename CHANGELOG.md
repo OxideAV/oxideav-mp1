@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II §C.1.5.2.7 bit-allocation core** plus the §C.1.5.2 /
+  Table C.5 "Layer II Signal-to-Noise Ratios" table needed to drive
+  it. New `tables_layer2::layer2_snr_db(nlevels) -> Option<f64>`
+  transcribes Table C.5 (ISO/IEC 11172-3 (1993) Annex C, PDF page 76),
+  cross-checked against Table C.2 at the shared `nlevels` rows
+  (3 → 7.00, 7 → 16.00, 15 → 25.28 dB, … all the way to
+  32767 → 92.01 dB), and adds the three Layer-II-only rows
+  (5 → 11.00, 9 → 20.84, 65535 → 98.01 dB). New `encode::
+  allocate_bits_layer2(energy, nch, table, budget_bits)` runs the
+  §C.1.5.2.7 iterative allocator (find subband with minimal MNR,
+  raise to next legal Table-3-B.2x column, skipping `None` cells)
+  with the Annex-D-DOCS-GAP signal-energy proxy in place of the
+  perceptual SMR. Companion helpers `layer2_frame_payload_bits` and
+  `sum_nbal_per_channel` make the §2.4.2.1 `adb = bytes·8 − bhdr −
+  bcrc − bbal` budget directly testable.
+  - Eleven new lib-tests in `encode.rs` + `tables_layer2.rs` cover
+    the SNR table (known rows, monotonicity, Layer-I-overlap parity),
+    the per-class bit cost (grouped vs non-grouped), the §2.4.2.1
+    payload-bits formula (mono / stereo / CRC), the allocator's
+    budget-fit / louder-first / silent-stays-zero / `sblimit` /
+    legal-column properties, and the zero-budget no-op edge case.
+    Total `cargo test -p oxideav-mp1 --lib` count: **135 → 146**.
+
 - **MPEG-2 LSF stereo round-trip coverage and planar-S16P encoder
   input coverage** in `tests/roundtrip.rs`. No new spec material —
   every code path exercised is already covered by ISO/IEC 11172-3

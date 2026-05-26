@@ -91,8 +91,9 @@ pub use decode_layer2::{
 };
 pub use decoder::make_decoder_with_concealment;
 pub use encode::{
-    allocate_bits, quantize, select_scalefactor, Allocation, AnalysisFilter, BitWriter,
-    EncodeError, EncodeParams, Mp1FrameEncoder,
+    allocate_bits, allocate_bits_layer2, layer2_frame_payload_bits, quantize, select_scalefactor,
+    sum_nbal_per_channel, Allocation, AnalysisFilter, BitWriter, EncodeError, EncodeParams,
+    Layer2Allocation, Mp1FrameEncoder,
 };
 pub use encoder::make_encoder_with_crc;
 pub use header::{

@@ -112,9 +112,12 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   sine, 64 kbit/s, 44.1 kHz, 20 frames) and compares the steady-state
   PCM against ffmpeg's reference S16 decode of the same file:
   **RMS = 0.50 LSB, max|err| = 1 LSB across 20 736 samples** —
-  essentially bit-exact, the residual being IEEE-754 ordering. Layer
-  II encoding and a transcription of the 13818-3 LSF Layer II
-  allocation table for Fs ∈ {16, 22.05, 24} kHz remain followups.
+  essentially bit-exact, the residual being IEEE-754 ordering. A full
+  Layer II *encoder* (frame writer + §C.1.5.2.5 SCFSI selection from
+  Table C.4 + quantization with Table C.6 (A, B) constants) and a
+  transcription of the 13818-3 LSF Layer II allocation table for
+  Fs ∈ {16, 22.05, 24} kHz remain followups; the §C.1.5.2.7 bit
+  allocator and the Table C.5 SNR ladder are now in tree (see below).
 - **Layer II §2.4.3.1 CRC-16 `error_check()` verification** over the
   §2.4.3.1 + Annex B Table 3-B.5 Layer II protected fields (header
   bits 16…31 + the §2.4.1.6 bit-allocation field + the §2.4.1.6
@@ -155,6 +158,21 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   allocation codes, the §C.1.5.1.6 step budget (`12·(nb_new − nb_old)`
   sample bits plus +6 scalefactor bits on the 0→2 jump), and the Table
   C.2 SNR ladder per `nb` drive the loop.
+- **Layer II bit allocation core** (§C.1.5.2.7): the iterative
+  Layer-II allocator that walks each subband's Table 3-B.2x column
+  ladder (skipping `-` cells), accounting for the §2.4.2.1 frame
+  budget `adb = (144·bitrate/Fs)·8 − bhdr − bcrc − bbal` and the
+  per-subband bookkeeping cost on the first non-zero allocation (2-bit
+  `scfsi` plus three 6-bit scalefactor indices — the worst case under
+  the §C.1.5.2.5 / Table C.4 selection, since Table C.4 is rendered
+  as a PDF image the text layer cannot extract reliably). Exposed as
+  `encode::allocate_bits_layer2(energy, nch, table, budget_bits)` with
+  the companion `layer2_frame_payload_bits` / `sum_nbal_per_channel`
+  helpers. The per-iteration "minimum-MNR" search uses Table C.5
+  (`tables_layer2::layer2_snr_db`) — verbatim from PDF page 76 with
+  the three Layer-II-only rows (5 → 11.00, 9 → 20.84, 65535 →
+  98.01 dB) and overlap parity against Table C.2 at the shared
+  `nlevels` rows.
 - **Uniform quantization** (§C.1.5.1.7): each subband sample is
   normalized by its scalefactor, `A·X + B` is computed from the **Table
   C.3** coefficients `A = (2^nb − 1)/2^nb`, `B = −1/2^nb`, scaled to

@@ -399,6 +399,209 @@ fn allocation_code(nb: u8) -> u8 {
     }
 }
 
+// ---- Layer II bit allocation (§C.1.5.2.7) ----------------------
+
+use crate::tables_layer2::{layer2_snr_db, AllocationTable, QuantClass};
+
+/// Per-frame, per-channel, per-subband **Layer II** allocation indices.
+///
+/// `alloc[ch][sb]` is the raw `nbal`-bit `allocation[ch][sb]` value the
+/// bitstream stores (§2.4.1.6) — `0` means "no samples transferred", and
+/// `1..=(1<<nbal)-1` index into the row's Table 3-B.2x level list
+/// (after subtracting one). `None` cells in that row are never selected
+/// by [`allocate_bits_layer2`].
+pub type Layer2Allocation = [[u8; SUBBANDS]; 2];
+
+/// Cost in bits of one (sb, ch) sample region under a Layer II
+/// quantization class, per frame (§C.1.5.2.7 `bspl` increment for one
+/// subband). Layer II carries 36 sub-band samples per (sb, ch); for a
+/// grouped class three samples share one `bits_per_codeword`-bit
+/// codeword (12 codewords per frame), and for a non-grouped class each
+/// sample is its own codeword (36 codewords per frame).
+fn layer2_class_cost_bits(class: &QuantClass) -> usize {
+    use crate::decode_layer2::LAYER2_SAMPLES_PER_SUBBAND;
+    let n_codewords = LAYER2_SAMPLES_PER_SUBBAND / class.samples_per_codeword as usize;
+    n_codewords * class.bits_per_codeword as usize
+}
+
+/// One-time per-(sb, ch) bookkeeping cost charged when a subband first
+/// receives a non-zero allocation: the 2-bit `scfsi` field (§2.4.1.6)
+/// plus, conservatively, three 6-bit scalefactor indices (the maximum
+/// the §C.1.5.2.5 / Table C.4 selection logic can choose).
+///
+/// The Table C.4 SCFSI selection table is rendered as an image in the
+/// PDF that the staging text layer cannot extract reliably, so this
+/// encoder writes the worst-case `scfsi == '00'` (three scalefactors)
+/// for every allocated subband. That keeps the encoder's allocation
+/// fit-check sound at the cost of slightly underspending the budget on
+/// signals whose successive scalefactors collapse — see the per-frame
+/// "bsel + bscf" terms in the §C.1.5.2.7 budget formula.
+const LAYER2_PER_SUBBAND_OVERHEAD_BITS: usize = 2 + 3 * 6;
+
+/// Per-channel sum of `nbal[sb]` for subbands `0..sblimit` under one
+/// Table B.2x — the fixed cost of the `allocation` field per channel,
+/// independent of which raw allocation values are written.
+pub fn sum_nbal_per_channel(table: &AllocationTable) -> usize {
+    let mut s = 0usize;
+    for sb in 0..table.sblimit() {
+        s += table.nbal(sb) as usize;
+    }
+    s
+}
+
+/// Total Layer II audio-data budget for one frame (`adb` of §C.1.5.2.7),
+/// in bits, after subtracting the §2.4.1.6 header, the optional CRC,
+/// and the `bbal` allocation-field cost.
+///
+/// §2.4.2.1 sizes a Layer II frame as `N = floor(144 · bitrate / Fs)`
+/// bytes (1152 samples / 8 = 144). The header is 32 bits; an optional
+/// §2.4.1.4 CRC is 16 bits. `bbal = nch · Σ nbal[sb]`.
+pub fn layer2_frame_payload_bits(
+    bitrate_kbps: u32,
+    sampling_frequency: u32,
+    has_crc: bool,
+    nch: usize,
+    table: &AllocationTable,
+) -> usize {
+    let bytes = (144 * bitrate_kbps * 1000) / sampling_frequency;
+    let total = bytes as usize * 8;
+    let header = 32 + if has_crc { 16 } else { 0 };
+    let bbal = nch * sum_nbal_per_channel(table);
+    total.saturating_sub(header + bbal)
+}
+
+/// Step the per-(sb, ch) allocation up to the next legal Table 3-B.2x
+/// column for that subband, skipping any `None` (`-`) cells. Returns the
+/// new allocation index and the new quantization class, or `None` if
+/// the subband has already reached the last column on its row.
+fn layer2_next_alloc(
+    table: &AllocationTable,
+    sb: usize,
+    current: u8,
+) -> Option<(u8, &'static QuantClass)> {
+    let max_alloc = 1u8 << table.nbal(sb);
+    let mut next = current + 1;
+    while next < max_alloc {
+        if let Some(cls) = table.quant_class(sb, next) {
+            return Some((next, cls));
+        }
+        next += 1;
+    }
+    None
+}
+
+/// Run the §C.1.5.2.7 iterative bit allocation for one Layer II frame.
+///
+/// `energy[ch][sb]` is the per-subband signal-energy proxy (the maximum
+/// absolute analysed subband sample over the frame's 36 sample-slots),
+/// the same quantity that drives the Layer I allocator
+/// [`allocate_bits`]. `budget_bits` is the `adb` budget after the
+/// header, CRC and `bbal` have been subtracted; pass the result of
+/// [`layer2_frame_payload_bits`].
+///
+/// The loop is the spec algorithm:
+///
+/// > Determination of the minimal MNR of all subbands. The accuracy of
+/// > the quantization of the subband with the minimal MNR is increased
+/// > by using the next higher entry in the relevant table B.2 […]. bspl
+/// > is updated according to the additional number of bits required. If
+/// > a non-zero number of bits is assigned to a subband for the first
+/// > time, bsel has to be updated, and bscf has to be updated.
+///
+/// Since the perceptual SMR depends on the Annex D model that this
+/// crate documents as a DOCS-GAP, the encoder substitutes a signal-
+/// energy proxy: `MNR = SNR(nlevels) − 20·log10(peak)`. The §C.1.5.2.7
+/// "first non-zero allocation" overhead is the 2-bit scfsi plus three
+/// 6-bit scalefactor indices (the Table C.4 SCFSI selection is a
+/// DOCS-GAP; the encoder writes `scfsi == '00'` so the cost is
+/// independent of the input signal).
+///
+/// Subbands at or above `table.sblimit()` are forced to allocation `0`.
+// The §C.1.5.2.7 allocator is naturally an index-driven (ch, sb) double
+// loop; rewriting as iterator chains would obscure the "find min-MNR
+// (ch, sb)" loop body the spec literally describes.
+#[allow(clippy::needless_range_loop)]
+pub fn allocate_bits_layer2(
+    energy: &[[f64; SUBBANDS]; 2],
+    nch: usize,
+    table: &AllocationTable,
+    budget_bits: usize,
+) -> Layer2Allocation {
+    let sblimit = table.sblimit();
+    let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+
+    // Pre-compute the per-(ch, sb) signal level in dB. Silent subbands
+    // skip allocation entirely.
+    let mut level_db = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+    for ch in 0..nch {
+        for sb in 0..sblimit {
+            let p = energy[ch][sb];
+            level_db[ch][sb] = if p > 0.0 {
+                20.0 * p.log10()
+            } else {
+                f64::NEG_INFINITY
+            };
+        }
+    }
+
+    // Current quantization-class cost per (ch, sb); for `allocation = 0`
+    // this is `None` (no codewords transmitted).
+    let mut current_cost: [[usize; SUBBANDS]; 2] = [[0; SUBBANDS]; 2];
+
+    let mut spent = 0usize;
+
+    loop {
+        // §C.1.5.2.7 step 1: find the subband with the minimal MNR that
+        // can still grow to a next legal allocation under the remaining
+        // budget.
+        let mut best: Option<(usize, usize, f64, u8, &'static QuantClass, usize)> = None;
+        for ch in 0..nch {
+            for sb in 0..sblimit {
+                if level_db[ch][sb] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let (next_idx, next_cls) = match layer2_next_alloc(table, sb, alloc[ch][sb]) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let new_cost = layer2_class_cost_bits(next_cls);
+                let delta_sample_bits = new_cost - current_cost[ch][sb];
+                let overhead = if alloc[ch][sb] == 0 {
+                    LAYER2_PER_SUBBAND_OVERHEAD_BITS
+                } else {
+                    0
+                };
+                let step_cost = delta_sample_bits + overhead;
+                if spent + step_cost > budget_bits {
+                    continue;
+                }
+                // SNR after the proposed step: the quieter the subband
+                // for that SNR, the smaller (more negative) the MNR, the
+                // more urgent the next bit.
+                let snr = layer2_snr_db(next_cls.nlevels)
+                    .unwrap_or_else(|| panic!("nlevels {} missing SNR row", next_cls.nlevels));
+                let mnr = snr - level_db[ch][sb];
+                let better = match best {
+                    None => true,
+                    Some((_, _, bmnr, _, _, _)) => mnr < bmnr,
+                };
+                if better {
+                    best = Some((ch, sb, mnr, next_idx, next_cls, step_cost));
+                }
+            }
+        }
+        match best {
+            Some((ch, sb, _, next_idx, next_cls, step_cost)) => {
+                spent += step_cost;
+                alloc[ch][sb] = next_idx;
+                current_cost[ch][sb] = layer2_class_cost_bits(next_cls);
+            }
+            None => break,
+        }
+    }
+    alloc
+}
+
 /// Parameters for a single Layer I encode: the target bitrate and the
 /// stream's sampling frequency and channel mode.
 #[derive(Debug, Clone, Copy)]
@@ -754,6 +957,10 @@ impl Mp1FrameEncoder {
 }
 
 #[cfg(test)]
+// Tests walk per-channel (ch, sb) grids in the same row-major order as
+// the §C.1.5.x encode body, so flat index loops mirror the spec
+// presentation; allow `needless_range_loop` here for that reason.
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use crate::decode::requantize;
@@ -1110,5 +1317,211 @@ mod tests {
             .verify_crc(&bytes[..4], &bytes[4..])
             .expect("CRC region present");
         assert!(matches!(status, CrcStatus::Ok(_)));
+    }
+
+    // ---- Layer II bit allocation (§C.1.5.2.7) -----------------
+
+    use crate::header::{
+        Bitrate as TestBitrate, Emphasis as TestEmphasis, FrameHeader as TestFrameHeader2,
+        Id as TestId, Layer as TestLayer, Mode as TestMode, ModeExtension as TestModeExt,
+    };
+    use crate::tables_layer2::layer2_bit_allocation_table;
+
+    fn header_layer2(fs: u32, kbps: u16, mode: TestMode) -> TestFrameHeader2 {
+        TestFrameHeader2 {
+            id: TestId::Mpeg,
+            layer: TestLayer::II,
+            protection: true,
+            bitrate: TestBitrate::Fixed(kbps),
+            sampling_frequency: fs,
+            padding: false,
+            private: false,
+            mode,
+            mode_extension: TestModeExt(0),
+            copyright: false,
+            original: true,
+            emphasis: TestEmphasis::None,
+        }
+    }
+
+    #[test]
+    fn layer2_payload_bits_matches_spec_formula() {
+        // §2.4.2.1: a Layer II frame is `floor(144 · bitrate / Fs)`
+        // bytes; the §C.1.5.2.7 audio-data budget `adb` is
+        // (frame_bytes·8) − (32 + bcrc + bbal). For 128 kbit/s mono at
+        // 44.1 kHz with no CRC and Table B.2b (94 bits of `bbal` per
+        // channel), the budget is `floor(144·128000/44100)·8 − 32 − 94`.
+        let h = header_layer2(44_100, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let bytes = 144 * 128_000u32 / 44_100;
+        let expected = (bytes as usize * 8) - 32 - 94;
+        assert_eq!(
+            layer2_frame_payload_bits(128, 44_100, false, 1, table),
+            expected
+        );
+        // CRC eats another 16 bits.
+        assert_eq!(
+            layer2_frame_payload_bits(128, 44_100, true, 1, table),
+            expected - 16
+        );
+        // Stereo doubles `bbal` (two channels of nbal=94).
+        assert_eq!(
+            layer2_frame_payload_bits(128, 44_100, false, 2, table),
+            (bytes as usize * 8) - 32 - 2 * 94
+        );
+    }
+
+    #[test]
+    fn layer2_class_cost_known_values() {
+        use crate::tables_layer2::QUANT_CLASSES;
+        // nlevels = 3, grouped, bits_per_codeword = 5, 12 codewords/frame.
+        let cls = QUANT_CLASSES.iter().find(|c| c.nlevels == 3).unwrap();
+        assert_eq!(layer2_class_cost_bits(cls), 12 * 5);
+        // nlevels = 7, non-grouped, bits_per_codeword = 3, 36 codewords.
+        let cls = QUANT_CLASSES.iter().find(|c| c.nlevels == 7).unwrap();
+        assert_eq!(layer2_class_cost_bits(cls), 36 * 3);
+        // nlevels = 65535, non-grouped, bits_per_codeword = 16.
+        let cls = QUANT_CLASSES.iter().find(|c| c.nlevels == 65535).unwrap();
+        assert_eq!(layer2_class_cost_bits(cls), 36 * 16);
+    }
+
+    #[test]
+    fn layer2_allocate_respects_budget() {
+        // Mono frame at 128 kbit/s, 44.1 kHz (Table B.2b): one loud
+        // subband, rest silent. The loud band must get some allocation;
+        // every other (and every subband at or above sblimit) must stay
+        // at zero. The total spent bits must fit the budget.
+        let h = header_layer2(44_100, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut energy = [[0.0f64; SUBBANDS]; 2];
+        energy[0][2] = 0.5;
+        let budget = layer2_frame_payload_bits(128, 44_100, false, 1, table);
+        let alloc = allocate_bits_layer2(&energy, 1, table, budget);
+
+        assert!(alloc[0][2] >= 1, "loud sb got nothing: {}", alloc[0][2]);
+        for (sb, &a) in alloc[0].iter().enumerate() {
+            if sb == 2 {
+                continue;
+            }
+            assert_eq!(a, 0, "silent sb{sb} got alloc {a}");
+        }
+        // Re-derive spent bits and confirm it fits the budget.
+        let cls = table.quant_class(2, alloc[0][2]).expect("class");
+        let cost = layer2_class_cost_bits(cls) + LAYER2_PER_SUBBAND_OVERHEAD_BITS;
+        assert!(cost <= budget, "cost {cost} > budget {budget}");
+    }
+
+    #[test]
+    fn layer2_allocate_prefers_louder_subbands() {
+        // Two subbands, one much louder: with a tight budget the louder
+        // band must not receive a coarser class than the quieter one.
+        let h = header_layer2(44_100, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut energy = [[0.0f64; SUBBANDS]; 2];
+        energy[0][0] = 0.5;
+        energy[0][1] = 0.001;
+        let alloc = allocate_bits_layer2(&energy, 1, table, 400);
+        let nl_a = table
+            .quant_class(0, alloc[0][0])
+            .map(|c| c.nlevels)
+            .unwrap_or(0);
+        let nl_b = table
+            .quant_class(1, alloc[0][1])
+            .map(|c| c.nlevels)
+            .unwrap_or(0);
+        assert!(
+            nl_a >= nl_b,
+            "loud sb0 nlevels={} < quiet sb1 nlevels={}",
+            nl_a,
+            nl_b,
+        );
+    }
+
+    #[test]
+    fn layer2_allocate_zero_budget_allocates_nothing() {
+        let h = header_layer2(44_100, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut energy = [[0.0f64; SUBBANDS]; 2];
+        energy[0][0] = 0.5;
+        let alloc = allocate_bits_layer2(&energy, 1, table, 0);
+        for &a in alloc[0].iter() {
+            assert_eq!(a, 0);
+        }
+    }
+
+    #[test]
+    fn layer2_allocate_skips_subbands_above_sblimit() {
+        // Table B.2c has sblimit = 8 (32 kbit/s mono at 44.1 kHz).
+        // Energy in a high subband (sb 20) must NOT receive any
+        // allocation — the bitstream has no row for it.
+        let h = header_layer2(44_100, 32, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        assert_eq!(table.sblimit(), 8);
+        let mut energy = [[0.0f64; SUBBANDS]; 2];
+        energy[0][20] = 0.9; // above sblimit
+        let budget = layer2_frame_payload_bits(32, 44_100, false, 1, table);
+        let alloc = allocate_bits_layer2(&energy, 1, table, budget);
+        // All subbands `>= sblimit` must remain zero.
+        for sb in table.sblimit()..SUBBANDS {
+            assert_eq!(alloc[0][sb], 0, "sb{sb} (>= sblimit) got alloc");
+        }
+    }
+
+    #[test]
+    fn layer2_allocate_step_picks_legal_alloc_index() {
+        // For every (ch, sb) with non-zero allocation, the chosen index
+        // must resolve to a real `QuantClass` (i.e. it must not land on
+        // a `None` cell in the row). This is the structural correctness
+        // check against Table B.2x's `-` gaps.
+        let h = header_layer2(48_000, 96, TestMode::Stereo);
+        let table = layer2_bit_allocation_table(&h);
+        let mut energy = [[0.0f64; SUBBANDS]; 2];
+        // Spread some energy across subbands in both channels.
+        for sb in 0..table.sblimit() {
+            energy[0][sb] = 0.3 / (sb as f64 + 1.0);
+            energy[1][sb] = 0.2 / (sb as f64 + 1.0);
+        }
+        let budget = layer2_frame_payload_bits(96, 48_000, false, 2, table);
+        let alloc = allocate_bits_layer2(&energy, 2, table, budget);
+        for ch in 0..2 {
+            for sb in 0..table.sblimit() {
+                if alloc[ch][sb] != 0 {
+                    assert!(
+                        table.quant_class(sb, alloc[ch][sb]).is_some(),
+                        "ch{ch} sb{sb} chose illegal alloc {}",
+                        alloc[ch][sb],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layer2_allocate_total_cost_fits_budget() {
+        // Sum the per-(ch, sb) costs of the produced allocation and
+        // assert the total stays within budget. This is the §C.1.5.2.7
+        // safety property — the loop must not "spend bits it doesn't
+        // have".
+        let h = header_layer2(44_100, 192, TestMode::Stereo);
+        let table = layer2_bit_allocation_table(&h);
+        let mut energy = [[0.0f64; SUBBANDS]; 2];
+        for sb in 0..table.sblimit() {
+            energy[0][sb] = 0.4 / (sb as f64 + 1.0);
+            energy[1][sb] = 0.4 / (sb as f64 + 1.0);
+        }
+        let budget = layer2_frame_payload_bits(192, 44_100, false, 2, table);
+        let alloc = allocate_bits_layer2(&energy, 2, table, budget);
+
+        let mut spent = 0usize;
+        for ch in 0..2 {
+            for sb in 0..table.sblimit() {
+                if alloc[ch][sb] == 0 {
+                    continue;
+                }
+                let cls = table.quant_class(sb, alloc[ch][sb]).unwrap();
+                spent += layer2_class_cost_bits(cls) + LAYER2_PER_SUBBAND_OVERHEAD_BITS;
+            }
+        }
+        assert!(spent <= budget, "spent {spent} > budget {budget}");
     }
 }

@@ -283,6 +283,50 @@ fn lookup_class(nlevels: u16) -> Option<&'static QuantClass> {
     QUANT_CLASSES.iter().find(|c| c.nlevels == nlevels)
 }
 
+// ---- Table C.5 "Layer II Signal-to-Noise Ratios" ----------------
+
+/// Look up the §C.1.5.2.7 signal-to-noise ratio (in dB) for one of the
+/// Layer II `nlevels` values from Table C.5 of ISO/IEC 11172-3 (1993),
+/// informative Annex C (PDF page 76).
+///
+/// Indexed by `nlevels` (the number of quantization steps). The Layer
+/// II ladder uses the same SNR values as Layer I's Table C.2 wherever
+/// the `nlevels` values overlap (3 → 7.00, 7 → 16.00, 15 → 25.28, …),
+/// and adds three intermediate rows that only Layer II uses:
+/// `nlevels = 5 → 11.00 dB`, `nlevels = 9 → 20.84 dB`, and the
+/// `nlevels = 65535 → 98.01 dB` row at the top of the ladder.
+///
+/// `nlevels = 0` (no samples allocated) returns `0.0`. An unrecognised
+/// `nlevels` value returns `None`; the bit allocator clamps to the
+/// nearest defined ladder step.
+pub fn layer2_snr_db(nlevels: u16) -> Option<f64> {
+    // Table C.5 — verbatim from PDF page 76, in dB. Values cross-checked
+    // against Table C.2 (Layer I SNR) at the shared `nlevels` rows: the
+    // tables agree at every overlap (3, 7, 15, 31, 63, 127, 255, 511,
+    // 1023, 2047, 4095, 8191, 16383, 32767).
+    match nlevels {
+        0 => Some(0.00),
+        3 => Some(7.00),
+        5 => Some(11.00),
+        7 => Some(16.00),
+        9 => Some(20.84),
+        15 => Some(25.28),
+        31 => Some(31.59),
+        63 => Some(37.75),
+        127 => Some(43.84),
+        255 => Some(49.89),
+        511 => Some(55.93),
+        1023 => Some(61.96),
+        2047 => Some(67.98),
+        4095 => Some(74.01),
+        8191 => Some(80.03),
+        16383 => Some(86.05),
+        32767 => Some(92.01),
+        65535 => Some(98.01),
+        _ => None,
+    }
+}
+
 // ---- Table 3-B.2a (sblimit=27, sum_of_nbal=88) -----------------
 
 /// `Some(n)` for a tabulated nlevels at column position
@@ -731,5 +775,75 @@ mod tests {
         // 64 kbit/s stereo at 44.1 kHz -> per-channel 32 -> B.2c.
         let t = layer2_bit_allocation_table(&header_mp1(44_100, 64, crate::header::Mode::Stereo));
         assert_eq!(t.sblimit(), 8);
+    }
+
+    // ---- Table C.5 (Layer II SNR) ---------------------------------
+
+    #[test]
+    fn layer2_snr_table_known_rows() {
+        // §C.1.5.2.7 / Table C.5 anchor rows transcribed verbatim from
+        // PDF page 76.
+        assert_eq!(layer2_snr_db(0), Some(0.00));
+        assert_eq!(layer2_snr_db(3), Some(7.00));
+        assert_eq!(layer2_snr_db(5), Some(11.00));
+        assert_eq!(layer2_snr_db(7), Some(16.00));
+        assert_eq!(layer2_snr_db(9), Some(20.84));
+        assert_eq!(layer2_snr_db(15), Some(25.28));
+        assert_eq!(layer2_snr_db(65535), Some(98.01));
+        // Out-of-table input.
+        assert_eq!(layer2_snr_db(4), None);
+        assert_eq!(layer2_snr_db(100), None);
+    }
+
+    #[test]
+    fn layer2_snr_overlaps_layer1_table() {
+        // Layer II Table C.5 and Layer I Table C.2 agree at every
+        // shared `nlevels` row. The Layer I table indexes by `nb`; map
+        // `nlevels = 2^nb - 1` to the matching Layer I row and confirm.
+        use crate::tables::SNR_DB;
+        for (nb, nlevels) in [
+            (2u8, 3u16),
+            (3, 7),
+            (4, 15),
+            (5, 31),
+            (6, 63),
+            (7, 127),
+            (8, 255),
+            (9, 511),
+            (10, 1023),
+            (11, 2047),
+            (12, 4095),
+            (13, 8191),
+            (14, 16383),
+            (15, 32767),
+        ] {
+            let l1 = SNR_DB[nb as usize];
+            let l2 = layer2_snr_db(nlevels).expect("Layer II row exists");
+            assert!(
+                (l1 - l2).abs() < 1e-9,
+                "nlevels={nlevels} (nb={nb}): L1 {l1} vs L2 {l2}",
+            );
+        }
+    }
+
+    #[test]
+    fn layer2_snr_monotonic_in_nlevels() {
+        // Loudness/SNR must be strictly increasing as the quantizer
+        // gets finer (Table C.5 columns).
+        let ladder = [
+            3u16, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535,
+        ];
+        for w in ladder.windows(2) {
+            let a = layer2_snr_db(w[0]).unwrap();
+            let b = layer2_snr_db(w[1]).unwrap();
+            assert!(
+                b > a,
+                "SNR decreased: {} -> {} ({} -> {} dB)",
+                w[0],
+                w[1],
+                a,
+                b
+            );
+        }
     }
 }
