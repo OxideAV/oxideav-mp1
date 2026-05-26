@@ -443,3 +443,255 @@ fn lsf_encoded_frame_layout_24khz() {
     assert_eq!(h.sampling_frequency, sample_rate);
     assert_eq!(h.bitrate, oxideav_mp1::Bitrate::Fixed(bitrate_kbps as u16));
 }
+
+// ---- 9. LSF stereo round-trip ----------------------------------
+//
+// 13818-3 §2.4.2.3 LSF stereo: the same Layer I encode + decode path
+// run with `channels = 2` at an LSF sampling rate (16 / 22.05 / 24
+// kHz). The decoder's §2.4.1.5 audio_data path is sample-rate-
+// agnostic, so this exercises the encoder factory's LSF default
+// `channels == 2` bitrate (128 kbit/s) plus the stereo allocation /
+// scalefactor / sample interleave at the LSF ladder.
+
+#[test]
+fn lsf_stereo_tone_roundtrips_with_bounded_error_24khz() {
+    // Two independent tones, one per channel, at LSF 24 kHz / 128 kbit/s
+    // (the LSF stereo factory default). The §2.4.1.5 SAMPLES region is
+    // sb-major, ch-minor for every allocated subband — exercising both
+    // channels at every slot.
+    let n_frames = 16;
+    let n = SAMPLES_PER_FRAME as usize * n_frames;
+    let fs = 24_000.0f64;
+    let left: Vec<f64> = (0..n)
+        .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / fs).sin())
+        .collect();
+    let right: Vec<f64> = (0..n)
+        .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 1500.0 * (i as f64) / fs).cos())
+        .collect();
+    let (_, pcm) = pcm_s16_interleaved(&[left, right]);
+    let out = encode_decode_stream(&pcm, 2, 24_000, 128);
+    let rms = rms_per_channel(&pcm, &out, 2);
+    // LSF 24 kHz has half the audio bandwidth of MPEG-1 48 kHz, so the
+    // per-subband perceptual budget at 128 kbit/s stereo is comparable
+    // to MPEG-1 256 kbit/s stereo; the bound mirrors the MPEG-1 stereo
+    // tone test.
+    assert!(rms < 0.05, "LSF 24 kHz stereo tone RMS {rms} too large");
+}
+
+#[test]
+fn lsf_stereo_silence_roundtrips_to_near_silence() {
+    // Stereo silence at each of the three LSF rates with the LSF stereo
+    // factory-default bitrate. With a zero input every subband is
+    // silent, the allocator hands out zero bits, and every decoded
+    // byte must be exactly zero.
+    for &(fs, bitrate) in &[(16_000u32, 128u32), (22_050, 128), (24_000, 128)] {
+        let n_frames = 4;
+        let n = SAMPLES_PER_FRAME as usize * n_frames;
+        let left = vec![0.0f64; n];
+        let right = vec![0.0f64; n];
+        let (_, pcm) = pcm_s16_interleaved(&[left, right]);
+        let out = encode_decode_stream(&pcm, 2, fs, bitrate);
+        for &b in &out {
+            assert_eq!(
+                b, 0,
+                "LSF stereo fs={fs} bitrate={bitrate}: non-silent byte"
+            );
+        }
+    }
+}
+
+#[test]
+fn lsf_stereo_encoded_frame_carries_lsf_id_bit() {
+    // Sanity: a stereo LSF encode writes `ID == 0` in the header and
+    // the §2.4.2.3 LSF sampling-frequency code, matching the bitrate
+    // ladder's 128 kbit/s position (LSF index for 128 is `8`).
+    let n = SAMPLES_PER_FRAME as usize;
+    let sig = vec![0.0f64; n];
+    let (_, pcm) = pcm_s16_interleaved(&[sig.clone(), sig]);
+    let (mut enc, _dec) = make_pair(2, 22_050, 128);
+    let frame = AudioFrame {
+        samples: SAMPLES_PER_FRAME,
+        pts: Some(0),
+        data: vec![pcm],
+    };
+    enc.send_frame(&Frame::Audio(frame)).unwrap();
+    let pkt: Packet = enc.receive_packet().unwrap();
+    // §2.4.2.3: ID bit = 0 for LSF, sampling_frequency code 0b00 for
+    // 22.05 kHz; the header's `Mode` round-trips as `Stereo`.
+    assert_eq!(pkt.data[1] & 0x08, 0, "expected LSF ID bit (0)");
+    let h = oxideav_mp1::FrameHeader::parse(&pkt.data).unwrap();
+    assert!(h.is_lsf());
+    assert_eq!(h.sampling_frequency, 22_050);
+    assert_eq!(h.bitrate, oxideav_mp1::Bitrate::Fixed(128));
+    assert_eq!(h.mode, oxideav_mp1::Mode::Stereo);
+}
+
+// ---- 10. Planar S16P encoder input layout ----------------------
+//
+// The `Mp1Encoder::frame_to_pcm` path (codec.rs) accepts both
+// interleaved S16 (`data.len() == 1`) and planar S16P
+// (`data.len() == nch`, one byte-vector per channel). Every test
+// above feeds the interleaved shape; these tests pin the planar
+// branch and the per-plane size validation.
+
+/// Pack a per-channel `f64` signal as a per-plane S16 byte vector,
+/// one plane per channel (the planar S16P layout the encoder accepts).
+fn pcm_s16_planar(channels: &[Vec<f64>]) -> (u32, Vec<Vec<u8>>) {
+    let nch = channels.len();
+    let n = channels[0].len();
+    for ch in channels {
+        assert_eq!(ch.len(), n);
+    }
+    let mut planes: Vec<Vec<u8>> = (0..nch).map(|_| Vec::with_capacity(n * 2)).collect();
+    for (ch, channel) in channels.iter().enumerate() {
+        for &sample in channel.iter() {
+            let v = (sample * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            planes[ch].extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    (n as u32, planes)
+}
+
+#[test]
+fn encoder_accepts_planar_s16p_layout() {
+    // Same 1 kHz tone the mono interleaved test uses, but fed as a
+    // single-plane S16P frame. The resulting packet must match the
+    // interleaved-encode shape byte-for-byte: identical inputs decoded
+    // by the same per-channel deinterleave reach the analysis filter
+    // with the same sample sequence, so the encoder output is identical.
+    let n_frames = 4;
+    let n = SAMPLES_PER_FRAME as usize * n_frames;
+    let fs = 48_000.0f64;
+    let sig: Vec<f64> = (0..n)
+        .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / fs).sin())
+        .collect();
+
+    let (_, inter_pcm) = pcm_s16_interleaved(std::slice::from_ref(&sig));
+    let (_, planar_pcm) = pcm_s16_planar(std::slice::from_ref(&sig));
+    assert_eq!(planar_pcm.len(), 1, "mono -> single plane");
+
+    let (mut enc_inter, _) = make_pair(1, 48_000, 192);
+    let (mut enc_planar, _) = make_pair(1, 48_000, 192);
+
+    let bytes_per_frame = SAMPLES_PER_FRAME as usize * 2; // mono S16
+    for f in 0..n_frames {
+        let s = f * bytes_per_frame;
+        let e = s + bytes_per_frame;
+        let inter_frame = AudioFrame {
+            samples: SAMPLES_PER_FRAME,
+            pts: Some((f as i64) * SAMPLES_PER_FRAME as i64),
+            data: vec![inter_pcm[s..e].to_vec()],
+        };
+        let planar_frame = AudioFrame {
+            samples: SAMPLES_PER_FRAME,
+            pts: Some((f as i64) * SAMPLES_PER_FRAME as i64),
+            data: vec![planar_pcm[0][s..e].to_vec()],
+        };
+        enc_inter.send_frame(&Frame::Audio(inter_frame)).unwrap();
+        enc_planar.send_frame(&Frame::Audio(planar_frame)).unwrap();
+        let pkt_i = enc_inter.receive_packet().unwrap();
+        let pkt_p = enc_planar.receive_packet().unwrap();
+        assert_eq!(
+            pkt_i.data, pkt_p.data,
+            "interleaved vs planar mono produced different bytes on frame {f}"
+        );
+    }
+}
+
+#[test]
+fn encoder_accepts_planar_s16p_stereo_layout() {
+    // Stereo planar: two independent tones, one per plane. Compare
+    // byte-for-byte against an equivalent interleaved encode. This
+    // exercises the `for (ch, plane) in frame.data.iter().enumerate()`
+    // deinterleave branch (codec.rs) at the proper nch = 2 fanout.
+    let n_frames = 4;
+    let n = SAMPLES_PER_FRAME as usize * n_frames;
+    let fs = 48_000.0f64;
+    let left: Vec<f64> = (0..n)
+        .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 1000.0 * (i as f64) / fs).sin())
+        .collect();
+    let right: Vec<f64> = (0..n)
+        .map(|i| 0.4 * (2.0 * std::f64::consts::PI * 1500.0 * (i as f64) / fs).cos())
+        .collect();
+
+    let (_, inter_pcm) = pcm_s16_interleaved(&[left.clone(), right.clone()]);
+    let (_, planar_pcm) = pcm_s16_planar(&[left, right]);
+    assert_eq!(planar_pcm.len(), 2, "stereo -> two planes");
+
+    let (mut enc_inter, _) = make_pair(2, 48_000, 256);
+    let (mut enc_planar, _) = make_pair(2, 48_000, 256);
+
+    let bytes_per_frame_inter = SAMPLES_PER_FRAME as usize * 2 * 2; // stereo S16 interleaved
+    let bytes_per_plane = SAMPLES_PER_FRAME as usize * 2; // per-channel S16
+    for f in 0..n_frames {
+        let inter_frame = AudioFrame {
+            samples: SAMPLES_PER_FRAME,
+            pts: Some((f as i64) * SAMPLES_PER_FRAME as i64),
+            data: vec![
+                inter_pcm[f * bytes_per_frame_inter..(f + 1) * bytes_per_frame_inter].to_vec(),
+            ],
+        };
+        let planar_frame = AudioFrame {
+            samples: SAMPLES_PER_FRAME,
+            pts: Some((f as i64) * SAMPLES_PER_FRAME as i64),
+            data: vec![
+                planar_pcm[0][f * bytes_per_plane..(f + 1) * bytes_per_plane].to_vec(),
+                planar_pcm[1][f * bytes_per_plane..(f + 1) * bytes_per_plane].to_vec(),
+            ],
+        };
+        enc_inter.send_frame(&Frame::Audio(inter_frame)).unwrap();
+        enc_planar.send_frame(&Frame::Audio(planar_frame)).unwrap();
+        let pkt_i = enc_inter.receive_packet().unwrap();
+        let pkt_p = enc_planar.receive_packet().unwrap();
+        assert_eq!(
+            pkt_i.data, pkt_p.data,
+            "interleaved vs planar stereo produced different bytes on frame {f}"
+        );
+    }
+}
+
+#[test]
+fn encoder_rejects_wrong_plane_count() {
+    // `frame.data.len()` must be exactly `1` (interleaved) or `nch`
+    // (planar). A 3-plane vector for a stereo encoder must be rejected
+    // as a typed error rather than silently mis-deinterleaving.
+    let n = SAMPLES_PER_FRAME as usize;
+    let plane = vec![0u8; n * 2];
+    let (mut enc, _) = make_pair(2, 48_000, 256);
+    let bad_frame = AudioFrame {
+        samples: SAMPLES_PER_FRAME,
+        pts: Some(0),
+        data: vec![plane.clone(), plane.clone(), plane],
+    };
+    let err = enc.send_frame(&Frame::Audio(bad_frame));
+    // send_frame stashes; the error surfaces on receive_packet (per the
+    // codec.rs encoder, `frame_to_pcm` runs at receive time).
+    if err.is_ok() {
+        let pkt_err = enc.receive_packet();
+        assert!(
+            pkt_err.is_err(),
+            "expected wrong-plane-count rejection, got Ok"
+        );
+    }
+}
+
+#[test]
+fn encoder_rejects_wrong_plane_size() {
+    // A planar frame whose per-plane byte count does not equal
+    // `samples * 2` is rejected with a typed error (the planar branch
+    // of `frame_to_pcm` validates `plane.len() == samples * 2`).
+    let n = SAMPLES_PER_FRAME as usize;
+    let good_plane = vec![0u8; n * 2];
+    let short_plane = vec![0u8; n * 2 - 4];
+    let (mut enc, _) = make_pair(2, 48_000, 256);
+    let bad_frame = AudioFrame {
+        samples: SAMPLES_PER_FRAME,
+        pts: Some(0),
+        data: vec![good_plane, short_plane],
+    };
+    let err = enc.send_frame(&Frame::Audio(bad_frame));
+    if err.is_ok() {
+        let pkt_err = enc.receive_packet();
+        assert!(pkt_err.is_err(), "expected short-plane rejection, got Ok");
+    }
+}

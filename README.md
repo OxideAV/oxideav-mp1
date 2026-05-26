@@ -204,7 +204,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-153 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+160 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
@@ -235,8 +235,14 @@ reserved-rate rejection, the full LSF Layer I ladder, the
 MPEG-1-vs-LSF divergence at index 2, and three LSF frame-length cases),
 and the self-roundtrip integration tests (silence, mono tone, stereo
 tone, white noise, frame shape, output-params, registry round-trip,
-plus LSF silence + tone round-trips at 16 / 22.05 / 24 kHz and an LSF
-frame-layout / header-round-trip check), and the direct-factory
+plus LSF silence + tone round-trips at 16 / 22.05 / 24 kHz, an LSF
+frame-layout / header-round-trip check, LSF stereo silence at all three
+LSF rates and an LSF stereo 24 kHz tone round-trip exercising the
+§2.4.1.5 sb-major / ch-minor SAMPLES region at the LSF stereo factory
+default, and the planar S16P encoder-input branch — mono and stereo
+planar inputs produce byte-identical packets to their interleaved
+counterparts, with the wrong-plane-count and short-plane rejection
+paths covered as well), and the direct-factory
 endpoints (`decoder::make_decoder` drives a real mono decode and
 `encoder::make_encoder` a real stereo encode through the boxed trait
 objects, `decoder::make_decoder_with_concealment` carries the chosen

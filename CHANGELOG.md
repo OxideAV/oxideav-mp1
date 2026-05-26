@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MPEG-2 LSF stereo round-trip coverage and planar-S16P encoder
+  input coverage** in `tests/roundtrip.rs`. No new spec material —
+  every code path exercised is already covered by ISO/IEC 11172-3
+  (1993) §2.4.1.5 and ISO/IEC 13818-3 (1997) §2.4.2.3; the additions
+  pin uncovered behaviour of the existing `Mp1Encoder` /
+  `Mp1Decoder` against regressions.
+  - `lsf_stereo_tone_roundtrips_with_bounded_error_24khz` — two
+    independent tones (one per channel) at LSF 24 kHz / 128 kbit/s
+    (the LSF stereo factory default) confirm the §2.4.1.5 sb-major /
+    ch-minor SAMPLES region encodes + decodes round-trip cleanly
+    with `rms < 0.05` of full scale.
+  - `lsf_stereo_silence_roundtrips_to_near_silence` — stereo silence
+    at all three LSF rates (16 / 22.05 / 24 kHz, all at 128 kbit/s
+    per the LSF stereo factory default) decodes to exact zero bytes,
+    confirming the allocator drops every subband at the LSF stereo
+    ladder.
+  - `lsf_stereo_encoded_frame_carries_lsf_id_bit` — header round-trip
+    check: a stereo 22.05 kHz encode emits `ID == 0` (LSF), the
+    correct §2.4.2.3 LSF `sampling_frequency` code, and the
+    `Mode::Stereo` field.
+  - `encoder_accepts_planar_s16p_layout` and
+    `encoder_accepts_planar_s16p_stereo_layout` — the
+    `Mp1Encoder::frame_to_pcm` planar branch (codec.rs,
+    `frame.data.len() == nch`) was uncovered. Both tests build the
+    same PCM in interleaved and planar shapes and confirm the
+    encoder produces byte-identical packets across the two layouts,
+    pinning the planar deinterleave loop.
+  - `encoder_rejects_wrong_plane_count` and
+    `encoder_rejects_wrong_plane_size` — pin the typed-error
+    rejection paths in `frame_to_pcm` when the caller passes neither
+    `1` nor `nch` planes, or a plane whose byte count does not equal
+    `samples * 2`.
+  - 160 tests total (135 unit + 20 integration roundtrip + 3 integration
+    layer2_mono + 2 doc), up from 153 (+7 from the planar / LSF-stereo
+    coverage).
 - **Optional §2.4.1.4 CRC `error_check()` emission on the Layer I
   encode side**, closing the long-standing followup recorded against
   the prior CRC verification work. The encoder previously always wrote
