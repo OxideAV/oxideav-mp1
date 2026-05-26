@@ -401,6 +401,7 @@ fn allocation_code(nb: u8) -> u8 {
 
 // ---- Layer II bit allocation (§C.1.5.2.7) ----------------------
 
+use crate::header::{Emphasis, ModeExtension};
 use crate::tables_layer2::{layer2_snr_db, AllocationTable, QuantClass};
 
 /// Per-frame, per-channel, per-subband **Layer II** allocation indices.
@@ -600,6 +601,237 @@ pub fn allocate_bits_layer2(
         }
     }
     alloc
+}
+
+// ---- Layer II frame-header writer (§2.4.2.3) -------------------
+
+/// Errors raised while packing a Layer II frame header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer2HeaderError {
+    /// `sampling_frequency` is not on the MPEG-1 (44.1 / 48 / 32 kHz)
+    /// nor the MPEG-2 LSF (16 / 22.05 / 24 kHz) Layer II tables.
+    UnsupportedSamplingFrequency(u32),
+    /// `bitrate` is not a fixed value on the §2.4.2.3 Layer II ladder
+    /// matching the implied `ID` bit (MPEG-1 vs LSF).
+    UnsupportedBitrate(u16),
+    /// `bitrate` is a `Free` / `Forbidden` enum rather than a fixed
+    /// value; the writer only emits fixed-rate Layer II headers.
+    NonFixedBitrate,
+}
+
+impl core::fmt::Display for Layer2HeaderError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Layer2HeaderError::UnsupportedSamplingFrequency(hz) => {
+                write!(f, "Layer II header: unsupported sampling frequency {hz} Hz")
+            }
+            Layer2HeaderError::UnsupportedBitrate(kbps) => {
+                write!(f, "Layer II header: unsupported bitrate {kbps} kbit/s")
+            }
+            Layer2HeaderError::NonFixedBitrate => {
+                write!(f, "Layer II header: non-fixed bitrate (Free / Forbidden)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Layer2HeaderError {}
+
+/// The §2.4.2.3 Layer II `bitrate_index` for a fixed bitrate in kbit/s,
+/// given the `ID` bit (`1` → MPEG-1 ladder, `0` → MPEG-2 LSF ladder),
+/// or `None` when the bitrate is not on that ladder.
+///
+/// MPEG-1 Layer II ladder (11172-3 §2.4.2.3): `32 / 48 / 56 / 64 / 80 /
+/// 96 / 112 / 128 / 160 / 192 / 224 / 256 / 320 / 384` kbit/s, encoded
+/// at indices `0b0001..=0b1110`. LSF Layer II/III ladder (13818-3
+/// §2.4.2.3, shared between Layer II and Layer III for the LSF
+/// edition): `8 / 16 / 24 / 32 / 40 / 48 / 56 / 64 / 80 / 96 / 112 /
+/// 128 / 144 / 160` kbit/s, encoded at indices `0b0001..=0b1110`.
+///
+/// Index `0b0000` (free format) and `0b1111` (forbidden) are never
+/// returned: callers stage free format separately, and forbidden is
+/// not a writable value.
+pub fn bitrate_index_layer2(kbps: u16, id_bit: u8) -> Option<u8> {
+    const L2_MPEG1: [u16; 14] = [
+        32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    ];
+    const L2_LSF: [u16; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let ladder: &[u16] = if id_bit == 1 { &L2_MPEG1 } else { &L2_LSF };
+    ladder
+        .iter()
+        .position(|&k| k == kbps)
+        .map(|p| (p + 1) as u8)
+}
+
+/// Parameters required to write a Layer II frame header (§2.4.2.3).
+///
+/// Mirrors the thirteen fields in the §2.4.1.3 syntax verbatim. The
+/// caller chooses every field; the writer never invents a default
+/// beyond what the round-tripping `FrameHeader::parse` requires.
+///
+/// `sampling_frequency` and `bitrate_kbps` together imply the `ID`
+/// bit:
+///
+/// * `44_100 / 48_000 / 32_000` Hz → `ID == 1` (MPEG-1), and
+///   `bitrate_kbps` must be on the MPEG-1 Layer II ladder.
+/// * `22_050 / 24_000 / 16_000` Hz → `ID == 0` (MPEG-2 LSF), and
+///   `bitrate_kbps` must be on the LSF Layer II/III ladder.
+///
+/// `padding_bit`, `private_bit`, `copyright`, `original` and
+/// `mode_extension` are carried verbatim; the writer does not
+/// recompute padding from the per-frame byte budget.
+#[derive(Debug, Clone, Copy)]
+pub struct Layer2HeaderParams {
+    /// Sampling frequency in Hz; must be one of the six allowed
+    /// values listed above.
+    pub sampling_frequency: u32,
+    /// Layer II bitrate in kbit/s; must be on the §2.4.2.3 ladder
+    /// matching the implied `ID` bit.
+    pub bitrate_kbps: u16,
+    /// Channel mode (`mode` field).
+    pub mode: Mode,
+    /// Raw two-bit `mode_extension` value; only meaningful when
+    /// `mode == Mode::JointStereo`.
+    pub mode_extension: ModeExtension,
+    /// `padding_bit`: `true` adds one extra slot to the frame.
+    pub padding: bool,
+    /// `private_bit`: reserved for private use, never assigned by ISO.
+    pub private: bool,
+    /// `copyright`: `true` if copyright-protected.
+    pub copyright: bool,
+    /// `original/copy`: `true` if this is the original (not a copy).
+    pub original: bool,
+    /// `emphasis` field (de-emphasis type).
+    pub emphasis: Emphasis,
+    /// `true` if the optional §2.4.1.4 `error_check()` CRC field is
+    /// present in the frame; controls the `protection_bit`. The CRC
+    /// word itself is **not** written by this function — callers
+    /// reserve a placeholder after the header and patch it once the
+    /// allocation/scfsi fields have been emitted (see
+    /// [`Mp1FrameEncoder::encode_frame`] for the Layer I template).
+    pub has_crc: bool,
+}
+
+impl Layer2HeaderParams {
+    /// Build a minimal Layer II header parameter set: the three
+    /// "mandatory" fields (sampling frequency, bitrate, channel mode)
+    /// and `emphasis = None`. Every other field defaults to its zero
+    /// value (no padding, not private, not copyright, original = 1,
+    /// no CRC, mode_extension = 0).
+    pub fn new(sampling_frequency: u32, bitrate_kbps: u16, mode: Mode) -> Layer2HeaderParams {
+        Layer2HeaderParams {
+            sampling_frequency,
+            bitrate_kbps,
+            mode,
+            mode_extension: ModeExtension(0),
+            padding: false,
+            private: false,
+            copyright: false,
+            original: true,
+            emphasis: Emphasis::None,
+            has_crc: false,
+        }
+    }
+}
+
+/// The two-bit code for an [`Emphasis`] (§2.4.2.3).
+fn emphasis_code(e: Emphasis) -> u8 {
+    match e {
+        Emphasis::None => 0b00,
+        Emphasis::Ms5015 => 0b01,
+        Emphasis::Reserved => 0b10,
+        Emphasis::CcittJ17 => 0b11,
+    }
+}
+
+/// The two-bit code for a [`Mode`] (§2.4.2.3).
+fn mode_code(m: Mode) -> u8 {
+    match m {
+        Mode::Stereo => 0b00,
+        Mode::JointStereo => 0b01,
+        Mode::DualChannel => 0b10,
+        Mode::SingleChannel => 0b11,
+    }
+}
+
+/// Pack a Layer II frame header (§2.4.2.3) into a four-byte big-endian
+/// word.
+///
+/// Returns the four header bytes ready to write at the start of a
+/// Layer II frame. The order of fields and their bit widths come
+/// **directly** from §2.4.1.3:
+///
+/// | bits | field                | width |
+/// |------|----------------------|-------|
+/// | 31:20 | syncword            | 12    |
+/// | 19    | ID                  | 1     |
+/// | 18:17 | layer (`0b10` = II) | 2     |
+/// | 16    | protection_bit      | 1     |
+/// | 15:12 | bitrate_index       | 4     |
+/// | 11:10 | sampling_frequency  | 2     |
+/// | 9     | padding_bit         | 1     |
+/// | 8     | private_bit         | 1     |
+/// | 7:6   | mode                | 2     |
+/// | 5:4   | mode_extension      | 2     |
+/// | 3     | copyright           | 1     |
+/// | 2     | original/copy       | 1     |
+/// | 1:0   | emphasis            | 2     |
+///
+/// The `ID` and `sampling_frequency` codes are resolved from `params.
+/// sampling_frequency` via the §2.4.2.3 table; the `bitrate_index` is
+/// resolved from `params.bitrate_kbps` against the Layer II ladder
+/// matching the chosen `ID` (see [`bitrate_index_layer2`]). The
+/// `protection_bit` is `0` when `params.has_crc` is true, `1`
+/// otherwise — per §2.4.2.3 the bit indicates redundancy *has* been
+/// added (`'0'`) or has not (`'1'`).
+///
+/// Errors:
+///
+/// * [`Layer2HeaderError::UnsupportedSamplingFrequency`] — `params.
+///   sampling_frequency` is not on the §2.4.2.3 table.
+/// * [`Layer2HeaderError::UnsupportedBitrate`] — `params.bitrate_kbps`
+///   is not on the Layer II ladder for the implied `ID`.
+pub fn pack_layer2_header(params: &Layer2HeaderParams) -> Result<[u8; 4], Layer2HeaderError> {
+    let (id_bit, samp_code) = sampling_code(params.sampling_frequency).ok_or(
+        Layer2HeaderError::UnsupportedSamplingFrequency(params.sampling_frequency),
+    )?;
+    let brate_idx = bitrate_index_layer2(params.bitrate_kbps, id_bit)
+        .ok_or(Layer2HeaderError::UnsupportedBitrate(params.bitrate_kbps))?;
+
+    // Pack MSB-first into a 32-bit big-endian word per §2.4.1.3. The
+    // syncword sits in bits 31..20 (top 12 bits = 0xFFF). Every
+    // subsequent field shifts in at its (32 - top_bit) position.
+    let word: u32 = (0xFFFu32 << 20)
+        | ((id_bit as u32 & 0x1) << 19)
+        | (0b10u32 << 17) // layer II
+        | (if params.has_crc { 0 } else { 1u32 } << 16)
+        | ((brate_idx as u32 & 0xF) << 12)
+        | ((samp_code as u32 & 0x3) << 10)
+        | ((u32::from(params.padding)) << 9)
+        | ((u32::from(params.private)) << 8)
+        | ((mode_code(params.mode) as u32 & 0x3) << 6)
+        | ((params.mode_extension.0 as u32 & 0x3) << 4)
+        | ((u32::from(params.copyright)) << 3)
+        | ((u32::from(params.original)) << 2)
+        | (emphasis_code(params.emphasis) as u32 & 0x3);
+    Ok(word.to_be_bytes())
+}
+
+/// Append a packed Layer II frame header (§2.4.2.3) to `bw` MSB-first.
+///
+/// Convenience wrapper around [`pack_layer2_header`] for callers that
+/// are already streaming bits into a [`BitWriter`]; the four header
+/// bytes are pushed exactly as if `pack_layer2_header(params).unwrap()`
+/// had been written byte-by-byte. Bit width: 32.
+pub fn write_layer2_header(
+    bw: &mut BitWriter,
+    params: &Layer2HeaderParams,
+) -> Result<(), Layer2HeaderError> {
+    let bytes = pack_layer2_header(params)?;
+    for b in bytes {
+        bw.put(b as u32, 8);
+    }
+    Ok(())
 }
 
 /// Parameters for a single Layer I encode: the target bitrate and the
@@ -1523,5 +1755,249 @@ mod tests {
             }
         }
         assert!(spent <= budget, "spent {spent} > budget {budget}");
+    }
+
+    // ---- Layer II frame-header writer (§2.4.2.3) ------------------
+
+    #[test]
+    fn bitrate_index_layer2_mpeg1_ladder_endpoints() {
+        // Spec §2.4.2.3 ladder (MPEG-1 Layer II): smallest is 32 → 1,
+        // largest is 384 → 14. A value outside the ladder is rejected.
+        assert_eq!(bitrate_index_layer2(32, 1), Some(1));
+        assert_eq!(bitrate_index_layer2(48, 1), Some(2));
+        assert_eq!(bitrate_index_layer2(384, 1), Some(14));
+        assert_eq!(bitrate_index_layer2(33, 1), None);
+        // 448 is on the Layer I ladder but NOT Layer II — must reject.
+        assert_eq!(bitrate_index_layer2(448, 1), None);
+    }
+
+    #[test]
+    fn bitrate_index_layer2_lsf_ladder_endpoints() {
+        // LSF Layer II/III ladder (13818-3 §2.4.2.3): 8 → 1, 160 → 14.
+        assert_eq!(bitrate_index_layer2(8, 0), Some(1));
+        assert_eq!(bitrate_index_layer2(16, 0), Some(2));
+        assert_eq!(bitrate_index_layer2(160, 0), Some(14));
+        // 256 is on the LSF Layer I ladder but NOT the LSF L2/L3
+        // ladder — must reject.
+        assert_eq!(bitrate_index_layer2(256, 0), None);
+    }
+
+    #[test]
+    fn pack_layer2_header_known_bits() {
+        // 128 kbit/s mono at 44.1 kHz, no CRC, no padding, original,
+        // no emphasis. The expected 32-bit big-endian word is built
+        // field-by-field from §2.4.1.3:
+        //   syncword (0xFFF)        = 0xFFF00000
+        //   ID = 1                  -> bit 19 set
+        //   layer 0b10              -> bits 18..17
+        //   protection_bit = 1      -> bit 16 (NO CRC)
+        //   bitrate_index = 0b1000  -> 128 kbit/s on L2 MPEG-1 ladder
+        //   sampling = 0b00         -> 44.1 kHz
+        //   padding = 0
+        //   private = 0
+        //   mode = 0b11             -> single_channel
+        //   mode_ext = 0
+        //   copyright = 0
+        //   original = 1
+        //   emphasis = 0
+        let params = Layer2HeaderParams::new(44_100, 128, Mode::SingleChannel);
+        let bytes = pack_layer2_header(&params).expect("pack");
+        let word = u32::from_be_bytes(bytes);
+
+        // syncword
+        assert_eq!(word >> 20, 0xFFF);
+        // ID
+        assert_eq!((word >> 19) & 0x1, 1);
+        // layer = II = 0b10
+        assert_eq!((word >> 17) & 0x3, 0b10);
+        // protection_bit = 1 (no CRC, the default)
+        assert_eq!((word >> 16) & 0x1, 1);
+        // bitrate_index for 128 kbit/s on the L2 MPEG-1 ladder. Ladder
+        // is {32,48,56,64,80,96,112,128,...} so index 8 → bits 0b1000.
+        assert_eq!((word >> 12) & 0xF, 0b1000);
+        // sampling = 0b00 (44.1 kHz on the MPEG-1 table)
+        assert_eq!((word >> 10) & 0x3, 0b00);
+        // mode = 0b11 (single_channel)
+        assert_eq!((word >> 6) & 0x3, 0b11);
+        // original = 1
+        assert_eq!((word >> 2) & 0x1, 1);
+    }
+
+    #[test]
+    fn pack_layer2_header_with_crc_clears_protection_bit() {
+        // §2.4.2.3: protection_bit `'0'` indicates redundancy has been
+        // added. The writer flips the bit accordingly when has_crc is
+        // set on the params.
+        let mut params = Layer2HeaderParams::new(44_100, 128, Mode::SingleChannel);
+        params.has_crc = true;
+        let bytes = pack_layer2_header(&params).expect("pack");
+        let word = u32::from_be_bytes(bytes);
+        assert_eq!((word >> 16) & 0x1, 0, "protection_bit must clear on CRC");
+        // Parse-back must report the bit (FrameHeader::protection is
+        // `true` when NO redundancy was added).
+        let h = crate::header::FrameHeader::parse(&bytes).unwrap();
+        assert!(!h.protection, "FrameHeader::protection must be false");
+        assert!(h.has_crc(), "FrameHeader::has_crc must be true");
+    }
+
+    #[test]
+    fn pack_layer2_header_lsf_id_bit() {
+        // Any LSF sampling frequency (16 / 22.05 / 24 kHz) must set
+        // ID == 0 and pick a bitrate from the LSF ladder.
+        for fs in [16_000u32, 22_050, 24_000] {
+            let params = Layer2HeaderParams::new(fs, 64, Mode::Stereo);
+            let bytes = pack_layer2_header(&params).expect("pack");
+            let word = u32::from_be_bytes(bytes);
+            assert_eq!((word >> 19) & 0x1, 0, "ID must be 0 for LSF Fs={fs}");
+            let h = crate::header::FrameHeader::parse(&bytes).unwrap();
+            assert!(h.is_lsf(), "FrameHeader::is_lsf must hold for Fs={fs}");
+            assert_eq!(h.sampling_frequency, fs);
+        }
+    }
+
+    #[test]
+    fn pack_layer2_header_rejects_off_ladder_bitrate() {
+        // 448 kbit/s is on Layer I (MPEG-1) but NOT Layer II.
+        let params = Layer2HeaderParams::new(44_100, 448, Mode::Stereo);
+        match pack_layer2_header(&params) {
+            Err(Layer2HeaderError::UnsupportedBitrate(448)) => {}
+            other => panic!("expected UnsupportedBitrate(448), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_layer2_header_rejects_unknown_sampling() {
+        let params = Layer2HeaderParams::new(11_025, 128, Mode::Stereo);
+        match pack_layer2_header(&params) {
+            Err(Layer2HeaderError::UnsupportedSamplingFrequency(11_025)) => {}
+            other => panic!("expected UnsupportedSamplingFrequency(11_025), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pack_layer2_header_mpeg1_matrix_roundtrips_through_parse() {
+        // The §2.4.2.3 MPEG-1 Layer II header carries 14 bitrates
+        // (the full ladder), 3 sampling frequencies, and 4 channel
+        // modes — 168 (bitrate, fs, mode) combinations. Each must
+        // pack and re-parse to the same FrameHeader fields.
+        use crate::header::{Bitrate, FrameHeader, Layer};
+        const L2_MPEG1: [u16; 14] = [
+            32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+        ];
+        const SAMPS: [u32; 3] = [44_100, 48_000, 32_000];
+        const MODES: [Mode; 4] = [
+            Mode::Stereo,
+            Mode::JointStereo,
+            Mode::DualChannel,
+            Mode::SingleChannel,
+        ];
+        for &kbps in L2_MPEG1.iter() {
+            for &fs in SAMPS.iter() {
+                for &mode in MODES.iter() {
+                    let params = Layer2HeaderParams::new(fs, kbps, mode);
+                    let bytes = pack_layer2_header(&params)
+                        .unwrap_or_else(|_| panic!("pack fs={fs} kbps={kbps}"));
+                    let h = FrameHeader::parse(&bytes)
+                        .unwrap_or_else(|_| panic!("parse fs={fs} kbps={kbps}"));
+                    assert_eq!(h.layer, Layer::II);
+                    assert_eq!(h.bitrate, Bitrate::Fixed(kbps));
+                    assert_eq!(h.sampling_frequency, fs);
+                    assert_eq!(h.mode, mode);
+                    assert!(h.protection, "default params: no CRC");
+                    assert!(!h.padding);
+                    assert!(!h.copyright);
+                    assert!(h.original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_layer2_header_lsf_matrix_roundtrips_through_parse() {
+        // Same matrix shape, but the LSF ladder and LSF sampling
+        // table from 13818-3 §2.4.2.3.
+        use crate::header::{Bitrate, FrameHeader, Layer};
+        const L2_LSF: [u16; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+        const SAMPS: [u32; 3] = [16_000, 22_050, 24_000];
+        const MODES: [Mode; 4] = [
+            Mode::Stereo,
+            Mode::JointStereo,
+            Mode::DualChannel,
+            Mode::SingleChannel,
+        ];
+        for &kbps in L2_LSF.iter() {
+            for &fs in SAMPS.iter() {
+                for &mode in MODES.iter() {
+                    let params = Layer2HeaderParams::new(fs, kbps, mode);
+                    let bytes = pack_layer2_header(&params)
+                        .unwrap_or_else(|_| panic!("pack fs={fs} kbps={kbps}"));
+                    let h = FrameHeader::parse(&bytes)
+                        .unwrap_or_else(|_| panic!("parse fs={fs} kbps={kbps}"));
+                    assert_eq!(h.layer, Layer::II);
+                    assert!(h.is_lsf());
+                    assert_eq!(h.bitrate, Bitrate::Fixed(kbps));
+                    assert_eq!(h.sampling_frequency, fs);
+                    assert_eq!(h.mode, mode);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_layer2_header_carries_padding_private_copyright_emphasis() {
+        // Each of the four "free-form" boolean fields toggles
+        // independently and round-trips through FrameHeader::parse.
+        use crate::header::{Emphasis as H, FrameHeader};
+        let mut params = Layer2HeaderParams::new(48_000, 96, Mode::JointStereo);
+        params.padding = true;
+        params.private = true;
+        params.copyright = true;
+        params.original = false;
+        params.emphasis = H::CcittJ17;
+        params.mode_extension = ModeExtension(0b10); // bound = 12
+        let bytes = pack_layer2_header(&params).expect("pack");
+        let h = FrameHeader::parse(&bytes).expect("parse");
+        assert!(h.padding);
+        assert!(h.private);
+        assert!(h.copyright);
+        assert!(!h.original);
+        assert_eq!(h.emphasis, H::CcittJ17);
+        assert_eq!(h.mode_extension.0 & 0b11, 0b10);
+        assert_eq!(h.mode, Mode::JointStereo);
+    }
+
+    #[test]
+    fn write_layer2_header_matches_pack_layer2_header() {
+        // The streaming BitWriter convenience and the byte-returning
+        // pack function must emit identical bytes.
+        let params = Layer2HeaderParams::new(44_100, 192, Mode::Stereo);
+        let mut bw = BitWriter::new();
+        write_layer2_header(&mut bw, &params).expect("write");
+        // After 32 bits of header the byte buffer is exactly 4 bytes.
+        let streamed = bw.finish();
+        let packed = pack_layer2_header(&params).expect("pack");
+        assert_eq!(streamed, packed.to_vec());
+        assert_eq!(streamed.len(), 4);
+    }
+
+    #[test]
+    fn write_layer2_header_then_more_bits_stays_msb_first() {
+        // Append an extra 10 bits after the 32-bit header and confirm
+        // they pack MSB-first into bytes 4..6 — exercises the
+        // BitWriter interaction (the header must not leave the writer
+        // with a partial trailing byte).
+        let params = Layer2HeaderParams::new(44_100, 128, Mode::SingleChannel);
+        let mut bw = BitWriter::new();
+        write_layer2_header(&mut bw, &params).expect("write");
+        assert_eq!(bw.byte_len(), 4, "32-bit header → 4 full bytes");
+        // After the header, the next bits start at the MSB of byte 4.
+        // Write 0b1010101010 (10 bits) — should become 0b10101010
+        // (=0xAA) at byte 4 with the trailing 0b10 (zero-padded to
+        // 0b1000_0000 = 0x80) at byte 5.
+        bw.put(0b1010101010, 10);
+        let bytes = bw.finish();
+        assert_eq!(bytes.len(), 6);
+        assert_eq!(bytes[4], 0xAA);
+        assert_eq!(bytes[5], 0x80);
     }
 }

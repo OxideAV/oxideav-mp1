@@ -158,6 +158,40 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   allocation codes, the §C.1.5.1.6 step budget (`12·(nb_new − nb_old)`
   sample bits plus +6 scalefactor bits on the 0→2 jump), and the Table
   C.2 SNR ladder per `nb` drive the loop.
+- **Layer II §2.4.2.3 frame-header writer**: a clean-room pack of the
+  thirteen §2.4.1.3 header fields into the four header bytes for a
+  Layer II frame. New `encode::pack_layer2_header(&Layer2HeaderParams)
+  -> Result<[u8; 4], Layer2HeaderError>` builds the 32-bit big-endian
+  word verbatim from §2.4.1.3 (syncword `0xFFF`, `ID` resolved from
+  `sampling_frequency` against the §2.4.2.3 / 13818-3 §2.4.2.3
+  table, `layer = 0b10`, `protection_bit` driven by `has_crc`,
+  `bitrate_index` resolved against the chosen Layer II ladder, plus
+  every other field carried verbatim from the caller). New
+  `encode::write_layer2_header(&mut BitWriter, &Layer2HeaderParams)`
+  streams the same four bytes MSB-first into a `BitWriter` so the
+  caller can immediately continue with the §2.4.1.6 allocation
+  field, and new `encode::bitrate_index_layer2(kbps, id_bit)`
+  exposes the Layer II bitrate-index lookup standalone — the
+  MPEG-1 Layer II ladder `{32, 48, 56, 64, 80, 96, 112, 128, 160,
+  192, 224, 256, 320, 384}` kbit/s under `ID == 1`, and the LSF
+  Layer II/III ladder `{8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112,
+  128, 144, 160}` kbit/s under `ID == 0`.
+  - Twelve new lib-tests cover: `bitrate_index_layer2` endpoints on
+    both ladders (with a cross-rejection sanity check — 448 kbit/s
+    is on Layer I but not Layer II), the known bit-by-bit pack of a
+    128 kbit/s mono 44.1 kHz header, the `protection_bit` flip when
+    `has_crc` is set, the LSF `ID == 0` bit for the three LSF
+    sampling frequencies, off-ladder bitrate rejection, unknown
+    sampling-frequency rejection, the **full 14 × 3 × 4 (= 168)
+    bitrate × sampling-frequency × mode matrix** for the MPEG-1
+    Layer II header, the same 14 × 3 × 4 matrix for the LSF Layer
+    II header, the padding / private / copyright / original /
+    emphasis / mode_extension carry path (each toggled
+    independently and round-tripped through `FrameHeader::parse`),
+    and the `BitWriter` streaming variant matching the byte-array
+    pack byte-for-byte while keeping subsequent MSB-first writes
+    byte-aligned.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **146 → 158**.
 - **Layer II bit allocation core** (§C.1.5.2.7): the iterative
   Layer-II allocator that walks each subband's Table 3-B.2x column
   ladder (skipping `-` cells), accounting for the §2.4.2.1 frame

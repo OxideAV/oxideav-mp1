@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II §2.4.2.3 frame-header writer**. New
+  `encode::pack_layer2_header(&Layer2HeaderParams) -> Result<[u8; 4],
+  Layer2HeaderError>` packs the thirteen §2.4.1.3 header fields into
+  the four big-endian header bytes for a Layer II frame; new
+  `encode::write_layer2_header(&mut BitWriter, …)` streams the same
+  bytes MSB-first into an in-progress `BitWriter`; new
+  `encode::bitrate_index_layer2(kbps, id_bit)` exposes the §2.4.2.3
+  Layer II bitrate-index lookup standalone, covering the MPEG-1
+  Layer II ladder (`32 / 48 / 56 / 64 / 80 / 96 / 112 / 128 / 160 /
+  192 / 224 / 256 / 320 / 384` kbit/s under `ID == 1`) and the
+  shared LSF Layer II/III ladder (`8 / 16 / 24 / 32 / 40 / 48 / 56 /
+  64 / 80 / 96 / 112 / 128 / 144 / 160` kbit/s under `ID == 0`).
+  `Layer2HeaderParams::new(sampling_frequency, bitrate_kbps, mode)`
+  builds a minimal parameter set (no padding, no CRC, no copyright,
+  `original = 1`, `emphasis = None`); the `padding`, `private`,
+  `copyright`, `original`, `emphasis`, `mode_extension` and
+  `has_crc` fields are then set freely. The implied `ID` bit is
+  resolved from `sampling_frequency` against the MPEG-1 (44.1 / 48
+  / 32 kHz) and 13818-3 §2.4.2.3 LSF (16 / 22.05 / 24 kHz) tables;
+  the `bitrate_index` is then resolved against the matching
+  ladder. The writer emits no CRC word — the caller reserves a
+  16-bit placeholder after the header when `has_crc` is set and
+  patches it once the §2.4.1.6 allocation/scfsi region has been
+  written, mirroring the Layer I `Mp1FrameEncoder::encode_frame`
+  CRC patch path.
+  - Twelve new lib-tests: `bitrate_index_layer2` ladder endpoints
+    on both MPEG-1 and LSF (with the 448-kbit/s Layer-I-only and
+    256-kbit/s LSF-Layer-I-only cross-rejection sanity checks); a
+    known bit-by-bit pack of the canonical 128 kbit/s mono 44.1
+    kHz header against the §2.4.1.3 field offsets; the
+    `protection_bit` flip when `has_crc` is set and the
+    `FrameHeader::has_crc` parse-back round-trip; the LSF `ID == 0`
+    bit for the three LSF sampling frequencies; off-ladder bitrate
+    rejection (`UnsupportedBitrate`) and unknown sampling-frequency
+    rejection (`UnsupportedSamplingFrequency`); the full
+    **14 × 3 × 4 = 168 bitrate × sampling-frequency × mode matrix**
+    for both the MPEG-1 Layer II ladder and the LSF Layer II/III
+    ladder, each entry packed and re-parsed through
+    `FrameHeader::parse` to confirm every field round-trips
+    bit-exact; the padding / private / copyright / original /
+    emphasis / mode_extension carry path (each toggled
+    independently); and the `BitWriter` streaming variant matching
+    the byte-array pack byte-for-byte with subsequent MSB-first
+    writes staying byte-aligned.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **146 → 158**.
+
 - **Layer II §C.1.5.2.7 bit-allocation core** plus the §C.1.5.2 /
   Table C.5 "Layer II Signal-to-Noise Ratios" table needed to drive
   it. New `tables_layer2::layer2_snr_db(nlevels) -> Option<f64>`
