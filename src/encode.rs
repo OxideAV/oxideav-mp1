@@ -1089,6 +1089,377 @@ pub fn write_layer2_allocation_field(
     Ok(())
 }
 
+/// The §2.4.1.6 scfsi-and-scalefactor write input: per-(ch, sb) `scfsi`
+/// 2-bit codes (one per non-zero allocation), and per-(ch, sb, part) the
+/// three 6-bit Table 3-B.1 scalefactor indices the decoder reads
+/// according to the `scfsi` schedule.
+///
+/// `scfsi[ch][sb]` is meaningful only when `alloc[ch][sb] != 0`; the
+/// writer ignores its value otherwise. Likewise `scalefactor_indices[ch][sb]`
+/// is only emitted for non-zero allocations. The three parts cover the
+/// three §2.4.3.3.2 scalefactor groups (granules 0..4, 4..8, 8..12).
+///
+/// `scfsi` selects the §2.4.2.6 emission schedule:
+///
+/// * `0b00`: three separate scalefactors are written (parts 0, 1, 2).
+/// * `0b01`: two scalefactors written; `scalefactor_indices[ch][sb][0]`
+///   then `scalefactor_indices[ch][sb][2]`. Caller must set parts 0
+///   and 1 equal (one value covers both).
+/// * `0b10`: one scalefactor written
+///   (`scalefactor_indices[ch][sb][0]`). Caller must set all three
+///   parts equal.
+/// * `0b11`: two scalefactors written;
+///   `scalefactor_indices[ch][sb][0]` then
+///   `scalefactor_indices[ch][sb][1]`. Caller must set parts 1 and 2
+///   equal (one value covers both).
+#[derive(Debug, Clone, Copy)]
+pub struct Layer2ScalefactorFieldInput {
+    /// `scfsi[ch][sb]`: the 2-bit §2.4.1.6 SCFSI code for each
+    /// allocated (ch, sb).
+    pub scfsi: [[u8; SUBBANDS]; 2],
+    /// `scalefactor_indices[ch][sb][part]`: the 6-bit Table 3-B.1
+    /// indices for parts 0/1/2 of each allocated (ch, sb).
+    pub scalefactor_indices: [[[u8; 3]; SUBBANDS]; 2],
+}
+
+impl Default for Layer2ScalefactorFieldInput {
+    fn default() -> Self {
+        Layer2ScalefactorFieldInput {
+            scfsi: [[0u8; SUBBANDS]; 2],
+            scalefactor_indices: [[[0u8; 3]; SUBBANDS]; 2],
+        }
+    }
+}
+
+/// Errors raised by [`write_layer2_scalefactor_field`].
+///
+/// All shapes are validated before any bit is written; on error nothing
+/// is appended to the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer2ScalefactorFieldError {
+    /// `nch` was not `1` or `2`.
+    UnsupportedChannelCount(usize),
+    /// `bound > table.sblimit()`. The intensity-stereo bound cannot
+    /// exceed the in-stream subband count.
+    BoundExceedsSblimit {
+        /// The supplied `bound`.
+        bound: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+    },
+    /// `bound < sblimit` with `nch == 1`. Mono frames must use
+    /// `bound == sblimit` (no shared upper band exists).
+    MonoBoundBelowSblimit {
+        /// The supplied `bound`.
+        bound: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+    },
+    /// A `scfsi[ch][sb]` value did not fit in two bits (i.e. was `≥ 4`).
+    InvalidScfsiCode {
+        /// Channel of the offending value.
+        channel: usize,
+        /// Subband of the offending value.
+        subband: usize,
+        /// The supplied scfsi value.
+        scfsi: u8,
+    },
+    /// A `scalefactor_indices[ch][sb][part]` value was `≥ 63`. The
+    /// six-bit field encodes 0..=63, but the standard reserves `63` —
+    /// conformant encoders must not emit it.
+    InvalidScalefactorIndex {
+        /// Channel of the offending index.
+        channel: usize,
+        /// Subband of the offending index.
+        subband: usize,
+        /// Part (0, 1 or 2) of the offending index.
+        part: usize,
+        /// The supplied 6-bit value.
+        index: u8,
+    },
+    /// `scfsi == 0b01` but `scalefactor_indices[ch][sb][0] !=
+    /// scalefactor_indices[ch][sb][1]`. Under that SCFSI code the
+    /// decoder reads one value and replays it across parts 0 and 1, so
+    /// the caller's per-part array must already have those two parts
+    /// equal — otherwise the encode would silently lose information.
+    ScfsiPartsInconsistent01 {
+        /// Channel of the offending entry.
+        channel: usize,
+        /// Subband of the offending entry.
+        subband: usize,
+        /// `scalefactor_indices[ch][sb][0]`.
+        part0: u8,
+        /// `scalefactor_indices[ch][sb][1]`.
+        part1: u8,
+    },
+    /// `scfsi == 0b10` but the three parts are not all equal. Under
+    /// that SCFSI code the decoder reads one value and replays it
+    /// across all three parts.
+    ScfsiPartsInconsistent10 {
+        /// Channel of the offending entry.
+        channel: usize,
+        /// Subband of the offending entry.
+        subband: usize,
+        /// `scalefactor_indices[ch][sb]`.
+        parts: [u8; 3],
+    },
+    /// `scfsi == 0b11` but `scalefactor_indices[ch][sb][1] !=
+    /// scalefactor_indices[ch][sb][2]`. Under that SCFSI code the
+    /// decoder reads one value and replays it across parts 1 and 2.
+    ScfsiPartsInconsistent11 {
+        /// Channel of the offending entry.
+        channel: usize,
+        /// Subband of the offending entry.
+        subband: usize,
+        /// `scalefactor_indices[ch][sb][1]`.
+        part1: u8,
+        /// `scalefactor_indices[ch][sb][2]`.
+        part2: u8,
+    },
+}
+
+impl core::fmt::Display for Layer2ScalefactorFieldError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Layer2ScalefactorFieldError::UnsupportedChannelCount(n) => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: unsupported channel count {n}"
+                )
+            }
+            Layer2ScalefactorFieldError::BoundExceedsSblimit { bound, sblimit } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: bound {bound} exceeds sblimit {sblimit}"
+                )
+            }
+            Layer2ScalefactorFieldError::MonoBoundBelowSblimit { bound, sblimit } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: mono bound {bound} < sblimit {sblimit}"
+                )
+            }
+            Layer2ScalefactorFieldError::InvalidScfsiCode {
+                channel,
+                subband,
+                scfsi,
+            } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: scfsi={scfsi} at sb={subband} ch={channel} \
+                     does not fit in two bits"
+                )
+            }
+            Layer2ScalefactorFieldError::InvalidScalefactorIndex {
+                channel,
+                subband,
+                part,
+                index,
+            } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: scalefactor index {index} at sb={subband} \
+                     ch={channel} part={part} is out of range (must be < 63)"
+                )
+            }
+            Layer2ScalefactorFieldError::ScfsiPartsInconsistent01 {
+                channel,
+                subband,
+                part0,
+                part1,
+            } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: scfsi=01 at sb={subband} ch={channel} but \
+                     parts 0/1 differ ({part0} vs {part1})"
+                )
+            }
+            Layer2ScalefactorFieldError::ScfsiPartsInconsistent10 {
+                channel,
+                subband,
+                parts,
+            } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: scfsi=10 at sb={subband} ch={channel} but \
+                     parts are not all equal ({}, {}, {})",
+                    parts[0], parts[1], parts[2]
+                )
+            }
+            Layer2ScalefactorFieldError::ScfsiPartsInconsistent11 {
+                channel,
+                subband,
+                part1,
+                part2,
+            } => {
+                write!(
+                    f,
+                    "Layer II scalefactor field: scfsi=11 at sb={subband} ch={channel} but \
+                     parts 1/2 differ ({part1} vs {part2})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Layer2ScalefactorFieldError {}
+
+/// Write the §2.4.1.6 Layer II `scfsi` + `scalefactor` fields into `bw`,
+/// MSB-first — the bitstream region that immediately follows the
+/// `allocation` field (see [`write_layer2_allocation_field`]) and
+/// precedes the §2.4.1.6 `sample` triplets.
+///
+/// The §2.4.1.6 syntax has two phases:
+///
+/// 1. **SCFSI**: for every `(ch, sb)` with `alloc[ch][sb] != 0`, write
+///    a 2-bit `scfsi` code. The decoder loops sb-major / ch-minor over
+///    `[0, sblimit)`, reading two bits whenever an allocation is non-
+///    zero. In the intensity_stereo upper band `[bound, sblimit)` the
+///    decoder copies the *allocation* across channels but still reads
+///    one scfsi *per channel*, so the writer mirrors that order.
+/// 2. **Scalefactors**: for every `(ch, sb)` with `alloc[ch][sb] != 0`,
+///    write 1..3 six-bit Table 3-B.1 scalefactor indices per the
+///    §2.4.2.6 SCFSI schedule (one for `scfsi == 0b10`, two for
+///    `0b01`/`0b11`, three for `0b00`).
+///
+/// Pre-flight validation:
+/// * `nch ∈ {1, 2}`.
+/// * `bound ≤ table.sblimit()`.
+/// * For `nch == 1`, `bound == sblimit`.
+/// * Every scfsi value fits in two bits.
+/// * Every scalefactor index is `< 63` (the spec leaves `63` undefined
+///   and conformant encoders must not emit it).
+/// * For each `scfsi` code, the parts the decoder will collapse to a
+///   single value must already match in the caller's per-part array:
+///   `0b01` → parts 0 == 1; `0b10` → all three parts equal; `0b11` →
+///   parts 1 == 2. The writer refuses to silently drop information.
+///
+/// On error nothing is written to `bw`.
+// The §2.4.1.6 syntax is a sb-major / ch-minor double loop with the
+// 'first scfsi, then scalefactors' phase split; rewriting as iterator
+// chains hides the spec structure.
+#[allow(clippy::needless_range_loop)]
+pub fn write_layer2_scalefactor_field(
+    bw: &mut BitWriter,
+    table: &AllocationTable,
+    alloc: &Layer2Allocation,
+    input: &Layer2ScalefactorFieldInput,
+    nch: usize,
+    bound: usize,
+) -> Result<(), Layer2ScalefactorFieldError> {
+    if !(nch == 1 || nch == 2) {
+        return Err(Layer2ScalefactorFieldError::UnsupportedChannelCount(nch));
+    }
+    let sblimit = table.sblimit();
+    if bound > sblimit {
+        return Err(Layer2ScalefactorFieldError::BoundExceedsSblimit { bound, sblimit });
+    }
+    if nch == 1 && bound != sblimit {
+        return Err(Layer2ScalefactorFieldError::MonoBoundBelowSblimit { bound, sblimit });
+    }
+
+    // Pre-flight: validate every cell before writing a single bit.
+    for sb in 0..sblimit {
+        for ch in 0..nch {
+            if alloc[ch][sb] == 0 {
+                continue;
+            }
+            let s = input.scfsi[ch][sb];
+            if s >= 4 {
+                return Err(Layer2ScalefactorFieldError::InvalidScfsiCode {
+                    channel: ch,
+                    subband: sb,
+                    scfsi: s,
+                });
+            }
+            let parts = input.scalefactor_indices[ch][sb];
+            for part in 0..3 {
+                if parts[part] >= 63 {
+                    return Err(Layer2ScalefactorFieldError::InvalidScalefactorIndex {
+                        channel: ch,
+                        subband: sb,
+                        part,
+                        index: parts[part],
+                    });
+                }
+            }
+            match s {
+                0b00 => {} // three parts: any combination is legal.
+                0b01 => {
+                    if parts[0] != parts[1] {
+                        return Err(Layer2ScalefactorFieldError::ScfsiPartsInconsistent01 {
+                            channel: ch,
+                            subband: sb,
+                            part0: parts[0],
+                            part1: parts[1],
+                        });
+                    }
+                }
+                0b10 => {
+                    if !(parts[0] == parts[1] && parts[1] == parts[2]) {
+                        return Err(Layer2ScalefactorFieldError::ScfsiPartsInconsistent10 {
+                            channel: ch,
+                            subband: sb,
+                            parts,
+                        });
+                    }
+                }
+                _ => {
+                    // 0b11
+                    if parts[1] != parts[2] {
+                        return Err(Layer2ScalefactorFieldError::ScfsiPartsInconsistent11 {
+                            channel: ch,
+                            subband: sb,
+                            part1: parts[1],
+                            part2: parts[2],
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-flight passed: emit the SCFSI region first.
+    for sb in 0..sblimit {
+        for ch in 0..nch {
+            if alloc[ch][sb] != 0 {
+                bw.put(input.scfsi[ch][sb] as u32, 2);
+            }
+        }
+    }
+
+    // Then the scalefactor region, per the §2.4.2.6 SCFSI schedule.
+    for sb in 0..sblimit {
+        for ch in 0..nch {
+            if alloc[ch][sb] == 0 {
+                continue;
+            }
+            let parts = input.scalefactor_indices[ch][sb];
+            match input.scfsi[ch][sb] {
+                0b00 => {
+                    bw.put(parts[0] as u32, 6);
+                    bw.put(parts[1] as u32, 6);
+                    bw.put(parts[2] as u32, 6);
+                }
+                0b01 => {
+                    bw.put(parts[0] as u32, 6);
+                    bw.put(parts[2] as u32, 6);
+                }
+                0b10 => {
+                    bw.put(parts[0] as u32, 6);
+                }
+                _ => {
+                    // 0b11
+                    bw.put(parts[0] as u32, 6);
+                    bw.put(parts[1] as u32, 6);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// The §2.4.1.6 intensity_stereo bound for a Layer II frame: the first
 /// subband whose `allocation` field is shared between channels.
 ///
@@ -2589,5 +2960,452 @@ mod tests {
             assert_eq!(got, alloc[0][sb], "shared sb={sb}");
             assert_eq!(got, alloc[1][sb], "shared sb={sb}");
         }
+    }
+
+    // ---- §2.4.1.6 scfsi + scalefactor field writer ----------------
+
+    /// Helper: build a stereo allocation with the smallest legal
+    /// non-zero code in every subband below `sblimit`, mirrored across
+    /// channels in `[bound, sblimit)`. Used by the scfsi-and-scalefactor
+    /// tests below so every (ch, sb) carries an allocation and therefore
+    /// emits scfsi + scalefactor bits.
+    fn dense_layer2_alloc(table: &AllocationTable, bound: usize, nch: usize) -> Layer2Allocation {
+        let sblimit = table.sblimit();
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        for sb in 0..sblimit {
+            let nbal = table.nbal(sb);
+            if nbal == 0 {
+                continue;
+            }
+            let mut chosen = 0u8;
+            for a in 1u8..(1u8 << nbal) {
+                if table.quant_class(sb, a).is_some() {
+                    chosen = a;
+                    break;
+                }
+            }
+            for ch in 0..nch {
+                if sb < bound {
+                    alloc[ch][sb] = chosen;
+                } else {
+                    // Shared upper band: write the same value to every
+                    // channel so the alloc-field writer accepts it; the
+                    // scalefactor writer still reads per-channel scfsi.
+                    alloc[ch][sb] = chosen;
+                }
+            }
+        }
+        alloc
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_zero_alloc_writes_no_bits() {
+        // When every subband is unallocated the §2.4.1.6 scfsi and
+        // scalefactor fields are empty: the writer emits zero bits.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Layer2ScalefactorFieldInput::default();
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, table.sblimit())
+            .expect("write");
+        // No data byte should be buffered when no bits were appended.
+        assert_eq!(bw.byte_len(), 0);
+        let bytes = bw.finish();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_bit_count_matches_schedule() {
+        // For a dense stereo allocation the §2.4.1.6 scfsi field is
+        // 2 bits per (ch, sb) with non-zero allocation, and the scfs
+        // field is { 0b00 → 18, 0b01 → 12, 0b10 → 6, 0b11 → 12 } bits
+        // per (ch, sb). Verify the writer's total byte count tracks
+        // that exact sum.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo); // B.2b, sblimit=30
+        let table = layer2_bit_allocation_table(&header);
+        let nch = 2usize;
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let alloc = dense_layer2_alloc(table, bound, nch);
+        // Mix scfsi codes across (ch, sb): cycle through 00, 01, 10, 11.
+        let mut input = Layer2ScalefactorFieldInput::default();
+        let mut expected_bits = 0usize;
+        let mut k = 0u8;
+        for sb in 0..table.sblimit() {
+            for ch in 0..nch {
+                if alloc[ch][sb] == 0 {
+                    continue;
+                }
+                let code = k & 0b11;
+                input.scfsi[ch][sb] = code;
+                // Keep all three parts equal so any schedule is legal,
+                // including 0b10 (single-value broadcast).
+                let v = 7u8;
+                input.scalefactor_indices[ch][sb] = [v, v, v];
+                expected_bits += 2; // scfsi
+                expected_bits += match code {
+                    0b00 => 18,
+                    0b01 => 12,
+                    0b10 => 6,
+                    _ => 12, // 0b11
+                };
+                k = k.wrapping_add(1);
+            }
+        }
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, nch, bound).expect("write");
+        let bytes = bw.finish();
+        assert_eq!(bytes.len(), expected_bits.div_ceil(8));
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_round_trips_against_bitreader() {
+        // The §2.4.1.6 decoder reads scfsi (sb-major / ch-minor over all
+        // sb < sblimit, two bits per non-zero allocation) then the
+        // scalefactors per the §2.4.2.6 schedule. Replay both phases
+        // through the BitReader and confirm every value we wrote
+        // round-trips bit-exact under every scfsi code.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(48_000, 192, Mode::Stereo); // B.2a, sblimit=27
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let nch = 2usize;
+        let bound = layer2_stereo_bound(&header, sblimit);
+        let alloc = dense_layer2_alloc(table, bound, nch);
+        // Synthetic but legal input: alternate scfsi values, with the
+        // per-part array set so every schedule's "collapse" rule is
+        // satisfied.
+        let mut input = Layer2ScalefactorFieldInput::default();
+        let scfsi_cycle = [0b00u8, 0b01, 0b10, 0b11];
+        let mut idx = 0usize;
+        for sb in 0..sblimit {
+            for ch in 0..nch {
+                if alloc[ch][sb] == 0 {
+                    continue;
+                }
+                let s = scfsi_cycle[idx % 4];
+                input.scfsi[ch][sb] = s;
+                // Pick parts that satisfy the §2.4.2.6 collapse rules.
+                let p0 = ((idx * 3 + 7) % 60) as u8;
+                let p1 = ((idx * 5 + 11) % 60) as u8;
+                let p2 = ((idx * 7 + 13) % 60) as u8;
+                input.scalefactor_indices[ch][sb] = match s {
+                    0b00 => [p0, p1, p2],
+                    0b01 => [p0, p0, p2], // parts 0 and 1 equal
+                    0b10 => [p0, p0, p0], // all three equal
+                    _ => [p0, p1, p1],    // parts 1 and 2 equal
+                };
+                idx += 1;
+            }
+        }
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, nch, bound).expect("write");
+        let bytes = bw.finish();
+        let mut reader = crate::decode::BitReader::new(&bytes);
+        // Phase 1: scfsi.
+        let mut got_scfsi = [[0u8; SUBBANDS]; 2];
+        for sb in 0..sblimit {
+            for ch in 0..nch {
+                if alloc[ch][sb] != 0 {
+                    got_scfsi[ch][sb] = reader.read_bits(2).expect("read scfsi") as u8;
+                    assert_eq!(got_scfsi[ch][sb], input.scfsi[ch][sb], "sb={sb} ch={ch}");
+                }
+            }
+        }
+        // Phase 2: scalefactors per the §2.4.2.6 schedule. Reconstruct
+        // the full per-part triplet the decoder would expose and check
+        // it equals what we fed the writer.
+        for sb in 0..sblimit {
+            for ch in 0..nch {
+                if alloc[ch][sb] == 0 {
+                    continue;
+                }
+                let s = got_scfsi[ch][sb];
+                let got_parts = match s {
+                    0b00 => {
+                        let a = reader.read_bits(6).expect("p0") as u8;
+                        let b = reader.read_bits(6).expect("p1") as u8;
+                        let c = reader.read_bits(6).expect("p2") as u8;
+                        [a, b, c]
+                    }
+                    0b01 => {
+                        let a = reader.read_bits(6).expect("p01") as u8;
+                        let c = reader.read_bits(6).expect("p2") as u8;
+                        [a, a, c]
+                    }
+                    0b10 => {
+                        let a = reader.read_bits(6).expect("p012") as u8;
+                        [a, a, a]
+                    }
+                    _ => {
+                        let a = reader.read_bits(6).expect("p0") as u8;
+                        let b = reader.read_bits(6).expect("p12") as u8;
+                        [a, b, b]
+                    }
+                };
+                assert_eq!(
+                    got_parts, input.scalefactor_indices[ch][sb],
+                    "sb={sb} ch={ch} scfsi={s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_known_two_subband_pattern() {
+        // Hand-trace the smallest possible scfsi+scalefactor region:
+        // a mono frame whose only allocated subband is sb=0 with
+        // scfsi=0b00 and parts {1, 2, 3}. Expected bitstream is
+        // 2 + 18 = 20 bits: `00 000001 000010 000011`, packed MSB-first
+        // into ceil(20/8) = 3 bytes.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        // Pick a mono header that lands on B.2c so the smallest legal
+        // allocation in sb=0 is straightforward.
+        let header = header_l2(44_100, 64, Mode::SingleChannel); // → B.2c
+        let table = layer2_bit_allocation_table(&header);
+        let nch = 1usize;
+        let bound = table.sblimit();
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        // Smallest legal code in sb=0 (first Some in the row).
+        let nbal0 = table.nbal(0);
+        let mut chosen = 0u8;
+        for a in 1u8..(1u8 << nbal0) {
+            if table.quant_class(0, a).is_some() {
+                chosen = a;
+                break;
+            }
+        }
+        alloc[0][0] = chosen;
+        let mut input = Layer2ScalefactorFieldInput::default();
+        input.scfsi[0][0] = 0b00;
+        input.scalefactor_indices[0][0] = [1, 2, 3];
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, nch, bound).expect("write");
+        let bytes = bw.finish();
+        // 20 bits → 3 bytes.
+        assert_eq!(bytes.len(), 3);
+        // Reconstruct the expected stream MSB-first:
+        //   scfsi=00       (2 bits)  → '00'
+        //   part0=1=000001 (6 bits)
+        //   part1=2=000010 (6 bits)
+        //   part2=3=000011 (6 bits)
+        // Concatenated: '00 000001 000010 000011' = 20 bits.
+        // Pack MSB-first into 24 bits, low 4 bits zero-padded:
+        //   byte0 = 0b0000_0001 = 0x01
+        //   byte1 = 0b0000_0010 = 0x02 ... wait, need to lay out carefully.
+        // Bit stream (left-to-right):
+        // 00 000001 000010 000011 0000
+        // Group into bytes of 8:
+        // 00000001 00001000 00110000
+        // = 0x01 0x08 0x30
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[1], 0x08);
+        assert_eq!(bytes[2], 0x30);
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_bad_channel_count() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Layer2ScalefactorFieldInput::default();
+        let mut bw = BitWriter::new();
+        let err =
+            write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 0, table.sblimit())
+                .expect_err("nch=0");
+        assert_eq!(err, Layer2ScalefactorFieldError::UnsupportedChannelCount(0));
+        let err =
+            write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 3, table.sblimit())
+                .expect_err("nch=3");
+        assert_eq!(err, Layer2ScalefactorFieldError::UnsupportedChannelCount(3));
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_bound_above_sblimit() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Layer2ScalefactorFieldInput::default();
+        let mut bw = BitWriter::new();
+        let err =
+            write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, table.sblimit() + 1)
+                .expect_err("bound > sblimit");
+        assert!(matches!(
+            err,
+            Layer2ScalefactorFieldError::BoundExceedsSblimit { .. }
+        ));
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_mono_with_shared_upper_band() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Layer2ScalefactorFieldInput::default();
+        let mut bw = BitWriter::new();
+        let err = write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 1, 4)
+            .expect_err("mono bound < sblimit");
+        assert!(matches!(
+            err,
+            Layer2ScalefactorFieldError::MonoBoundBelowSblimit { .. }
+        ));
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_oversize_scfsi_code() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let alloc = dense_layer2_alloc(table, bound, 2);
+        let mut input = Layer2ScalefactorFieldInput::default();
+        // 4 doesn't fit in 2 bits.
+        input.scfsi[1][0] = 4;
+        let mut bw = BitWriter::new();
+        let err = write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, bound)
+            .expect_err("scfsi=4");
+        assert_eq!(
+            err,
+            Layer2ScalefactorFieldError::InvalidScfsiCode {
+                channel: 1,
+                subband: 0,
+                scfsi: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_invalid_scalefactor_index() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let alloc = dense_layer2_alloc(table, bound, 2);
+        let mut input = Layer2ScalefactorFieldInput::default();
+        // 63 is reserved per §2.4.3.2 prose.
+        input.scalefactor_indices[0][0][2] = 63;
+        let mut bw = BitWriter::new();
+        let err = write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, bound)
+            .expect_err("scf=63");
+        assert_eq!(
+            err,
+            Layer2ScalefactorFieldError::InvalidScalefactorIndex {
+                channel: 0,
+                subband: 0,
+                part: 2,
+                index: 63,
+            }
+        );
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_inconsistent_scfsi_01() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let alloc = dense_layer2_alloc(table, bound, 2);
+        let mut input = Layer2ScalefactorFieldInput::default();
+        input.scfsi[0][0] = 0b01;
+        // scfsi=01 broadcasts part0 over parts 0+1: differing part0/part1
+        // means the writer would lose part1.
+        input.scalefactor_indices[0][0] = [3, 5, 7];
+        let mut bw = BitWriter::new();
+        let err = write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, bound)
+            .expect_err("inconsistent 01");
+        assert_eq!(
+            err,
+            Layer2ScalefactorFieldError::ScfsiPartsInconsistent01 {
+                channel: 0,
+                subband: 0,
+                part0: 3,
+                part1: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_inconsistent_scfsi_10() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let alloc = dense_layer2_alloc(table, bound, 2);
+        let mut input = Layer2ScalefactorFieldInput::default();
+        input.scfsi[0][0] = 0b10;
+        // scfsi=10 broadcasts part0 over all three parts: any divergence
+        // means information would be silently lost.
+        input.scalefactor_indices[0][0] = [3, 3, 4];
+        let mut bw = BitWriter::new();
+        let err = write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, bound)
+            .expect_err("inconsistent 10");
+        assert_eq!(
+            err,
+            Layer2ScalefactorFieldError::ScfsiPartsInconsistent10 {
+                channel: 0,
+                subband: 0,
+                parts: [3, 3, 4],
+            }
+        );
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_rejects_inconsistent_scfsi_11() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let alloc = dense_layer2_alloc(table, bound, 2);
+        let mut input = Layer2ScalefactorFieldInput::default();
+        input.scfsi[0][0] = 0b11;
+        // scfsi=11 broadcasts part1 over parts 1+2: differing values lose
+        // information.
+        input.scalefactor_indices[0][0] = [3, 5, 7];
+        let mut bw = BitWriter::new();
+        let err = write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 2, bound)
+            .expect_err("inconsistent 11");
+        assert_eq!(
+            err,
+            Layer2ScalefactorFieldError::ScfsiPartsInconsistent11 {
+                channel: 0,
+                subband: 0,
+                part1: 5,
+                part2: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn write_layer2_scalefactor_field_skips_unallocated_subbands() {
+        // Only sb=0 is allocated in a mono frame; only that subband
+        // contributes scfsi + scalefactor bits. The writer must emit
+        // no bits for the (many) unallocated subbands.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let nbal0 = table.nbal(0);
+        for a in 1u8..(1u8 << nbal0) {
+            if table.quant_class(0, a).is_some() {
+                alloc[0][0] = a;
+                break;
+            }
+        }
+        let mut input = Layer2ScalefactorFieldInput::default();
+        input.scfsi[0][0] = 0b10; // single scalefactor read
+        input.scalefactor_indices[0][0] = [9, 9, 9];
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 1, bound).expect("write");
+        let bytes = bw.finish();
+        // 2 scfsi bits + 6 scf bits = 8 bits = exactly one byte.
+        assert_eq!(bytes.len(), 1);
+        // Stream MSB-first: '10 001001' = 0b10001001 = 0x89.
+        assert_eq!(bytes[0], 0x89);
     }
 }

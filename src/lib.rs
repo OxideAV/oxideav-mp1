@@ -92,9 +92,11 @@ pub use decode_layer2::{
 pub use decoder::make_decoder_with_concealment;
 pub use encode::{
     allocate_bits, allocate_bits_layer2, bitrate_index_layer2, layer2_frame_payload_bits,
-    pack_layer2_header, quantize, select_scalefactor, sum_nbal_per_channel, write_layer2_header,
-    Allocation, AnalysisFilter, BitWriter, EncodeError, EncodeParams, Layer2Allocation,
-    Layer2HeaderError, Layer2HeaderParams, Mp1FrameEncoder,
+    layer2_stereo_bound, pack_layer2_header, quantize, select_scalefactor, sum_nbal_per_channel,
+    write_layer2_allocation_field, write_layer2_header, write_layer2_scalefactor_field, Allocation,
+    AnalysisFilter, BitWriter, EncodeError, EncodeParams, Layer2Allocation,
+    Layer2AllocationFieldError, Layer2HeaderError, Layer2HeaderParams, Layer2ScalefactorFieldError,
+    Layer2ScalefactorFieldInput, Mp1FrameEncoder,
 };
 pub use encoder::make_encoder_with_crc;
 pub use header::{

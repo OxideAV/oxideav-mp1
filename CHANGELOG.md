@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II §2.4.1.6 scfsi + scalefactor field writer**. New
+  `encode::write_layer2_scalefactor_field(&mut BitWriter,
+  &AllocationTable, &Layer2Allocation, &Layer2ScalefactorFieldInput,
+  nch, bound) -> Result<(), Layer2ScalefactorFieldError>` emits the
+  two §2.4.1.6 bitstream regions that immediately follow the
+  allocation field — the per-(ch, sb) 2-bit `scfsi` codes (one per
+  non-zero allocation, sb-major / ch-minor over `[0, sblimit)`,
+  including one scfsi per channel in the intensity_stereo upper band
+  where the *allocation* is shared but `scfsi` is still read per
+  channel), followed by the 1..3 six-bit Table 3-B.1 scalefactor
+  indices per (ch, sb) emitted per the §2.4.2.6 SCFSI schedule
+  (`0b00`: three reads; `0b01`: two reads — part 0 broadcast over
+  parts 0+1, then part 2; `0b10`: one read broadcast over all three
+  parts; `0b11`: part 0 then one read broadcast over parts 1+2). New
+  input type `encode::Layer2ScalefactorFieldInput { scfsi: [[u8;
+  SUBBANDS]; 2], scalefactor_indices: [[[u8; 3]; SUBBANDS]; 2] }`
+  carries the per-(ch, sb) scfsi codes and per-(ch, sb, part) Table
+  3-B.1 indices. The function pre-validates every cell before writing
+  a single bit and surfaces:
+  `UnsupportedChannelCount` (`nch ∉ {1, 2}`),
+  `BoundExceedsSblimit`, `MonoBoundBelowSblimit` (mono frames must
+  use `bound == sblimit`), `InvalidScfsiCode` (scfsi value `≥ 4`),
+  `InvalidScalefactorIndex` (any 6-bit value `≥ 63` — the
+  reserved/forbidden index that conformant encoders must not emit,
+  per §2.4.3.2 prose), and three SCFSI-collapse checks
+  (`ScfsiPartsInconsistent01`, `ScfsiPartsInconsistent10`,
+  `ScfsiPartsInconsistent11`) for SCFSI codes whose collapse rule
+  the caller's per-part array does not already satisfy — refusing to
+  silently lose information that the decoder would not be able to
+  recover. Together with the prior `write_layer2_header` and
+  `write_layer2_allocation_field` this completes the §2.4.1.6 control
+  region of a Layer II frame; the remaining Layer II encode followup
+  is the §2.4.1.6 SAMPLES region (12 syntax-granules of triplets per
+  (sb, ch)) and the §C.1.5.2.5 / Table C.4 SCFSI selection (still a
+  PDF-image DOCS-GAP, hence the writer takes scfsi as caller input).
+  Round-trip tested against the decode-path `BitReader` for every
+  (ch, sb) scfsi and per-part index of a B.2a stereo frame cycling
+  all four SCFSI codes, with per-error-case rejection coverage and
+  two known-bit hand-traces (mono `scfsi=0b10` → 1 byte `0x89`,
+  mono `scfsi=0b00` parts=[1,2,3] → 3 bytes `0x01 0x08 0x30`).
+  Thirteen new lib-tests; `cargo test -p oxideav-mp1 --lib` count:
+  **169 → 182**.
+
 - **Layer II §2.4.1.6 allocation-field writer**. New
   `encode::write_layer2_allocation_field(&mut BitWriter, &AllocationTable,
   &Layer2Allocation, nch, bound) -> Result<(), Layer2AllocationFieldError>`

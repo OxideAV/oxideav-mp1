@@ -230,6 +230,50 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     plus a `BitReader` round-trip that re-reads every emitted cell of
     a joint_stereo frame and recovers the exact allocation code.
   - Total `cargo test -p oxideav-mp1 --lib` count: **158 → 169**.
+- **Layer II §2.4.1.6 scfsi + scalefactor field writer**: a clean-room
+  emitter for the two §2.4.1.6 bitstream regions that follow the
+  allocation field — first the per-(ch, sb) 2-bit `scfsi` codes (one
+  per non-zero allocation, sb-major / ch-minor over `[0, sblimit)`,
+  including the intensity_stereo upper band where the *allocation* is
+  shared between channels but `scfsi` is still read once per channel),
+  then the 1..3 six-bit Table 3-B.1 scalefactor indices per (ch, sb)
+  emitted per the §2.4.2.6 SCFSI schedule (`0b00`: three reads,
+  `0b01`: two reads broadcast over parts 0+1 then part 2 alone,
+  `0b10`: one read broadcast over all three parts, `0b11`: part 0 alone
+  then one read broadcast over parts 1+2). New
+  `encode::write_layer2_scalefactor_field(&mut BitWriter, table, alloc,
+  input, nch, bound) -> Result<(), Layer2ScalefactorFieldError>` packs
+  both phases MSB-first; the function pre-flights every cell before
+  writing a single bit and surfaces every edge case as a typed error
+  (`UnsupportedChannelCount`, `BoundExceedsSblimit`,
+  `MonoBoundBelowSblimit`, `InvalidScfsiCode` for `scfsi ≥ 4`,
+  `InvalidScalefactorIndex` for any 6-bit value `≥ 63` — the
+  reserved/forbidden index that conformant encoders must not emit —
+  and `ScfsiPartsInconsistent01` / `…10` / `…11` for SCFSI codes whose
+  collapse rule the caller's per-part array does not already
+  satisfy, refusing to silently lose information). New input struct
+  `Layer2ScalefactorFieldInput { scfsi, scalefactor_indices }` carries
+  the per-(ch, sb) scfsi codes and per-(ch, sb, part) Table 3-B.1
+  indices.
+  - Thirteen new lib-tests cover: an all-zero allocation writing zero
+    bits (the §2.4.1.6 region collapses when no subband is allocated);
+    a dense-allocation bit-count check that mixes all four SCFSI codes
+    across (ch, sb) and confirms the writer's byte count matches the
+    closed-form `2·N_alloc + Σ schedule[scfsi[i]]` total (`schedule =
+    {18, 12, 6, 12}` for `scfsi ∈ {0b00, 0b01, 0b10, 0b11}`); a
+    `BitReader` round-trip over a B.2a stereo frame that cycles all
+    four SCFSI codes per (ch, sb) and recovers every scfsi value and
+    every per-part scalefactor index bit-exact; a known-bit two-byte
+    trace (mono, scfsi=`0b10`, parts=[9, 9, 9] → `0x89`); a known
+    three-byte trace (mono, scfsi=`0b00`, parts=[1, 2, 3] → `0x01 0x08
+    0x30`); a sparse-allocation test confirming unallocated subbands
+    emit zero bits; every typed rejection path
+    (`UnsupportedChannelCount` at 0 and 3, `BoundExceedsSblimit`,
+    `MonoBoundBelowSblimit`, `InvalidScfsiCode` for `scfsi = 4`,
+    `InvalidScalefactorIndex` for `index = 63`, and each of
+    `ScfsiPartsInconsistent01`, `ScfsiPartsInconsistent10`,
+    `ScfsiPartsInconsistent11` for diverging per-part inputs).
+  - Total `cargo test -p oxideav-mp1 --lib` count: **169 → 182**.
 - **Layer II bit allocation core** (§C.1.5.2.7): the iterative
   Layer-II allocator that walks each subband's Table 3-B.2x column
   ladder (skipping `-` cells), accounting for the §2.4.2.1 frame
