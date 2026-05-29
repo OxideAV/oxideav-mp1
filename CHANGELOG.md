@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II §2.4.1.6 allocation-field writer**. New
+  `encode::write_layer2_allocation_field(&mut BitWriter, &AllocationTable,
+  &Layer2Allocation, nch, bound) -> Result<(), Layer2AllocationFieldError>`
+  emits the §2.4.1.6 per-(ch, sb) `allocation` bits MSB-first into an
+  in-progress `BitWriter`, sized exactly per the Table 3-B.2x `nbal[sb]`
+  widths: low band `[0, bound)` carries `nch · Σ nbal[sb]` bits
+  (per-channel allocations) and the intensity_stereo upper band
+  `[bound, sblimit)` carries one `nbal[sb]` slot per subband (shared
+  between channels). The function pre-validates every cell before
+  writing a single bit and surfaces:
+  `UnsupportedChannelCount` (`nch ∉ {1, 2}`),
+  `BoundExceedsSblimit`, `MonoBoundBelowSblimit` (mono frames must use
+  `bound == sblimit`), `InvalidAllocationCode` (allocation does not fit
+  in `nbal[sb]` bits or selects a `-` cell of the Table 3-B.2x row),
+  `NonZeroAllocationAboveSblimit` (silent-drop guard for `sb ≥
+  sblimit`), and `UpperBandChannelsDisagree` (shared upper-band cells
+  whose two channels carry different values). Companion helper
+  `encode::layer2_stereo_bound(&FrameHeader, sblimit)` exposes the
+  §2.4.1.6 bound resolution (mode_extension lookup for joint_stereo,
+  `sblimit` for every other mode, clamped to `sblimit`) so callers that
+  already parsed a `FrameHeader` can drive the writer without
+  duplicating the decode-side logic. Round-trip tested against the
+  decode-path `BitReader` for every (sb, ch) cell of a joint_stereo
+  frame, with per-error-case rejection coverage. Eleven new lib-tests;
+  `cargo test -p oxideav-mp1 --lib` count: **158 → 169**.
+
 - **Layer II §2.4.2.3 frame-header writer**. New
   `encode::pack_layer2_header(&Layer2HeaderParams) -> Result<[u8; 4],
   Layer2HeaderError>` packs the thirteen §2.4.1.3 header fields into

@@ -192,6 +192,44 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     pack byte-for-byte while keeping subsequent MSB-first writes
     byte-aligned.
   - Total `cargo test -p oxideav-mp1 --lib` count: **146 → 158**.
+- **Layer II §2.4.1.6 allocation-field writer**: a clean-room emitter
+  for the `allocation[ch][sb]` bits a Layer II frame carries after the
+  header. New
+  `encode::write_layer2_allocation_field(&mut BitWriter, table, alloc,
+  nch, bound) -> Result<(), Layer2AllocationFieldError>` packs MSB-first
+  per the §2.4.1.6 syntax: the low band `[0, bound)` writes `nch ·
+  Σ nbal[sb]` bits (per-channel `nbal`-bit allocations) and the
+  intensity_stereo upper band `[bound, sblimit)` writes one shared
+  `nbal[sb]` slot per subband (mirrored into both channels by the
+  decoder). The function pre-flights every cell before writing a single
+  bit and surfaces every edge case as a typed error
+  (`UnsupportedChannelCount`, `BoundExceedsSblimit`,
+  `MonoBoundBelowSblimit`, `InvalidAllocationCode` for out-of-`nbal`
+  values or `-` cells in the Table 3-B.2x row, `NonZeroAllocationAboveSblimit`
+  for the silent-drop guard, and `UpperBandChannelsDisagree` for shared
+  upper-band cells whose two channels carry different values).
+  Companion helper `encode::layer2_stereo_bound(&FrameHeader, sblimit)`
+  exposes the §2.4.1.6 bound resolution (the joint_stereo
+  `mode_extension` lookup of `{4, 8, 12, 16}` clamped to `sblimit`,
+  `sblimit` for every other mode) so callers driving the writer from
+  an already-parsed [`FrameHeader`] don't duplicate the decoder's
+  bound-derivation logic.
+  - Eleven new lib-tests cover: the bound helper across all four
+    [`Mode`] variants and every joint_stereo `mode_extension` code
+    (including the `mode_extension == '11'` clamp to `sblimit = 8`
+    under B.2c), the all-zero stereo write whose payload size matches
+    `nch · Σ nbal[sb]` exactly, a known-bit B.2a low-band pattern at
+    48 kHz / 192 kbit/s stereo confirming sb-major / ch-minor packing
+    (sb 0 ch 0 in the high nibble of byte 0, sb 0 ch 1 in the low
+    nibble), a joint_stereo B.2c write whose total payload is shorter
+    than the unshared layout by exactly `Σ_{bound..sblimit} nbal[sb]`,
+    every typed rejection path (`UnsupportedChannelCount` at 0 and 3,
+    `BoundExceedsSblimit`, `MonoBoundBelowSblimit`,
+    `InvalidAllocationCode` for an oversize 3-bit code,
+    `NonZeroAllocationAboveSblimit`, and `UpperBandChannelsDisagree`),
+    plus a `BitReader` round-trip that re-reads every emitted cell of
+    a joint_stereo frame and recovers the exact allocation code.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **158 → 169**.
 - **Layer II bit allocation core** (§C.1.5.2.7): the iterative
   Layer-II allocator that walks each subband's Table 3-B.2x column
   ladder (skipping `-` cells), accounting for the §2.4.2.1 frame
@@ -256,7 +294,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-160 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+171 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-

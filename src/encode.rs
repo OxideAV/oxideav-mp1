@@ -834,6 +834,280 @@ pub fn write_layer2_header(
     Ok(())
 }
 
+// ---- Layer II allocation-field writer (§2.4.1.6) ---------------
+
+/// Errors raised while writing the §2.4.1.6 Layer II allocation field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer2AllocationFieldError {
+    /// `nch` was not `1` or `2`.
+    UnsupportedChannelCount(usize),
+    /// `bound > table.sblimit()`. The intensity-stereo bound cannot
+    /// exceed the in-stream subband count.
+    BoundExceedsSblimit {
+        /// The supplied `bound`.
+        bound: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+    },
+    /// `bound < sblimit` with `nch == 1`. Mono frames never share an
+    /// allocation field across "two" channels; callers that build a mono
+    /// header must pass `bound == sblimit`.
+    MonoBoundBelowSblimit {
+        /// The supplied `bound`.
+        bound: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+    },
+    /// A non-zero allocation was set for a subband at or above
+    /// `table.sblimit()`. The §2.4.1.6 syntax never emits a bit for
+    /// those subbands.
+    NonZeroAllocationAboveSblimit {
+        /// Subband index that carried a non-zero allocation.
+        subband: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+        /// Channel that carried the non-zero allocation.
+        channel: usize,
+    },
+    /// A per-(ch, sb) allocation does not fit in `nbal` bits, or selects
+    /// a `-` cell of the Table 3-B.2x row. Either case is rejected by
+    /// the decoder's `quant_class` lookup as well.
+    InvalidAllocationCode {
+        /// Channel of the offending allocation.
+        channel: usize,
+        /// Subband of the offending allocation.
+        subband: usize,
+        /// The supplied allocation value.
+        allocation: u8,
+    },
+    /// In the intensity_stereo upper band `[bound, sblimit)` the
+    /// §2.4.1.6 syntax stores **one** allocation value per subband
+    /// (shared between channels). The caller passed differing
+    /// `alloc[0][sb]` and `alloc[1][sb]`, which the writer refuses to
+    /// silently collapse.
+    UpperBandChannelsDisagree {
+        /// Subband index in the shared upper band.
+        subband: usize,
+        /// `alloc[0][sb]`.
+        left: u8,
+        /// `alloc[1][sb]`.
+        right: u8,
+    },
+}
+
+impl core::fmt::Display for Layer2AllocationFieldError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Layer2AllocationFieldError::UnsupportedChannelCount(n) => {
+                write!(
+                    f,
+                    "Layer II allocation field: unsupported channel count {n}"
+                )
+            }
+            Layer2AllocationFieldError::BoundExceedsSblimit { bound, sblimit } => {
+                write!(
+                    f,
+                    "Layer II allocation field: bound {bound} exceeds sblimit {sblimit}"
+                )
+            }
+            Layer2AllocationFieldError::MonoBoundBelowSblimit { bound, sblimit } => {
+                write!(
+                    f,
+                    "Layer II allocation field: mono bound {bound} < sblimit {sblimit}"
+                )
+            }
+            Layer2AllocationFieldError::NonZeroAllocationAboveSblimit {
+                subband,
+                sblimit,
+                channel,
+            } => {
+                write!(
+                    f,
+                    "Layer II allocation field: non-zero allocation at \
+                     sb={subband} ch={channel} (sblimit={sblimit})"
+                )
+            }
+            Layer2AllocationFieldError::InvalidAllocationCode {
+                channel,
+                subband,
+                allocation,
+            } => {
+                write!(
+                    f,
+                    "Layer II allocation field: invalid allocation code \
+                     {allocation} at sb={subband} ch={channel}"
+                )
+            }
+            Layer2AllocationFieldError::UpperBandChannelsDisagree {
+                subband,
+                left,
+                right,
+            } => {
+                write!(
+                    f,
+                    "Layer II allocation field: upper-band sb={subband} \
+                     allocations differ between channels ({left} vs {right})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Layer2AllocationFieldError {}
+
+/// Write the §2.4.1.6 Layer II `allocation[ch][sb]` field into `bw`,
+/// MSB-first.
+///
+/// The §2.4.1.6 syntax sizes one `nbal[sb]`-bit `allocation` slot per
+/// channel for subbands `[0, bound)` and one shared `nbal[sb]`-bit slot
+/// for subbands `[bound, sblimit)` (intensity_stereo: both channels
+/// share one upper-band allocation). Subbands at or above `sblimit` are
+/// never written. The total bit width is
+/// `nch · Σ_{sb < bound} nbal[sb] + Σ_{bound ≤ sb < sblimit} nbal[sb]`
+/// — `bbal` in the §C.1.5.2.7 budget breakdown.
+///
+/// `bound` is the intensity_stereo bound: `sblimit` for mono / stereo /
+/// dual_channel, the `mode_extension` bound (`{4, 8, 12, 16}`) clamped
+/// to `sblimit` for joint_stereo. Callers that already parsed a
+/// [`FrameHeader`] can compute it with [`layer2_stereo_bound`].
+///
+/// The function validates:
+/// * `nch ∈ {1, 2}`.
+/// * `bound ≤ table.sblimit()`.
+/// * For `nch == 1`, `bound == sblimit` (a mono frame has no shared
+///   upper band).
+/// * Every `alloc[ch][sb]` fits in `nbal[sb]` bits and either is `0` or
+///   resolves to a valid Table 3-B.2x quantization class (so the
+///   decoder's [`AllocationTable::quant_class`] lookup will accept it).
+/// * For sb in `[bound, sblimit)`, `alloc[0][sb] == alloc[1][sb]`.
+/// * `alloc[ch][sb] == 0` for `sb ≥ sblimit` (a non-zero value there
+///   would be silently dropped without this check).
+///
+/// On error nothing is written to `bw`: the function buffers all checks
+/// before any `put` call.
+// The §2.4.1.6 syntax is a sb-major / ch-minor double loop with sb-only
+// upper-band sharing; rewriting as iterator chains hides the spec
+// structure (the bound-driven branch shape is the explicit assertion).
+#[allow(clippy::needless_range_loop)]
+pub fn write_layer2_allocation_field(
+    bw: &mut BitWriter,
+    table: &AllocationTable,
+    alloc: &Layer2Allocation,
+    nch: usize,
+    bound: usize,
+) -> Result<(), Layer2AllocationFieldError> {
+    if !(nch == 1 || nch == 2) {
+        return Err(Layer2AllocationFieldError::UnsupportedChannelCount(nch));
+    }
+    let sblimit = table.sblimit();
+    if bound > sblimit {
+        return Err(Layer2AllocationFieldError::BoundExceedsSblimit { bound, sblimit });
+    }
+    if nch == 1 && bound != sblimit {
+        return Err(Layer2AllocationFieldError::MonoBoundBelowSblimit { bound, sblimit });
+    }
+
+    // Pre-flight: validate every cell before writing a single bit.
+    // Low band (per-channel allocations).
+    for sb in 0..bound {
+        let nbal = table.nbal(sb);
+        let max = 1u8 << nbal;
+        for ch in 0..nch {
+            let a = alloc[ch][sb];
+            if a >= max {
+                return Err(Layer2AllocationFieldError::InvalidAllocationCode {
+                    channel: ch,
+                    subband: sb,
+                    allocation: a,
+                });
+            }
+            if a != 0 && table.quant_class(sb, a).is_none() {
+                return Err(Layer2AllocationFieldError::InvalidAllocationCode {
+                    channel: ch,
+                    subband: sb,
+                    allocation: a,
+                });
+            }
+        }
+    }
+    // Upper band (shared allocations).
+    for sb in bound..sblimit {
+        let nbal = table.nbal(sb);
+        let max = 1u8 << nbal;
+        // nch is in {1, 2} and bound == sblimit for nch == 1, so this
+        // upper-band loop only ever runs for nch == 2.
+        let a0 = alloc[0][sb];
+        let a1 = alloc[1][sb];
+        if a0 != a1 {
+            return Err(Layer2AllocationFieldError::UpperBandChannelsDisagree {
+                subband: sb,
+                left: a0,
+                right: a1,
+            });
+        }
+        if a0 >= max {
+            return Err(Layer2AllocationFieldError::InvalidAllocationCode {
+                channel: 0,
+                subband: sb,
+                allocation: a0,
+            });
+        }
+        if a0 != 0 && table.quant_class(sb, a0).is_none() {
+            return Err(Layer2AllocationFieldError::InvalidAllocationCode {
+                channel: 0,
+                subband: sb,
+                allocation: a0,
+            });
+        }
+    }
+    // Subbands at or above sblimit must not carry an allocation. The
+    // §2.4.1.6 syntax never writes a bit for those, so a non-zero entry
+    // would be silently dropped — refuse it.
+    for sb in sblimit..SUBBANDS {
+        for ch in 0..nch {
+            if alloc[ch][sb] != 0 {
+                return Err(Layer2AllocationFieldError::NonZeroAllocationAboveSblimit {
+                    subband: sb,
+                    sblimit,
+                    channel: ch,
+                });
+            }
+        }
+    }
+
+    // Pre-flight passed: emit the bits.
+    for sb in 0..bound {
+        let nbal = table.nbal(sb);
+        for ch in 0..nch {
+            bw.put(alloc[ch][sb] as u32, nbal);
+        }
+    }
+    for sb in bound..sblimit {
+        let nbal = table.nbal(sb);
+        bw.put(alloc[0][sb] as u32, nbal);
+    }
+    Ok(())
+}
+
+/// The §2.4.1.6 intensity_stereo bound for a Layer II frame: the first
+/// subband whose `allocation` field is shared between channels.
+///
+/// `joint_stereo` frames read the bound from `mode_extension`
+/// (§2.4.2.3: `{4, 8, 12, 16}`); every other [`Mode`] uses `sblimit`
+/// (no upper-band sharing). The result is clamped to `sblimit` so a
+/// joint_stereo header whose `mode_extension` bound exceeds the
+/// frame's `sblimit` collapses to "no shared band".
+///
+/// `sblimit` must come from the §2.4.1.6 allocation table for `header`
+/// — typically `crate::tables_layer2::layer2_bit_allocation_table(header).sblimit()`.
+pub fn layer2_stereo_bound(header: &FrameHeader, sblimit: usize) -> usize {
+    let raw = match header.mode {
+        Mode::JointStereo => header.mode_extension.bound() as usize,
+        _ => SUBBANDS,
+    };
+    raw.min(sblimit)
+}
+
 /// Parameters for a single Layer I encode: the target bitrate and the
 /// stream's sampling frequency and channel mode.
 #[derive(Debug, Clone, Copy)]
@@ -1999,5 +2273,321 @@ mod tests {
         assert_eq!(bytes.len(), 6);
         assert_eq!(bytes[4], 0xAA);
         assert_eq!(bytes[5], 0x80);
+    }
+
+    // ---- Layer II allocation-field writer (§2.4.1.6) -----------
+
+    // Local FrameHeader builder for tests in this module — mirrors the
+    // `header_mp1` helper used by the tables_layer2 tests, repeated here
+    // so the encode tests don't depend on a private item from a sibling
+    // module's tests submodule.
+    fn header_l2(fs: u32, kbps: u16, mode: Mode) -> FrameHeader {
+        FrameHeader {
+            id: crate::header::Id::Mpeg,
+            layer: crate::header::Layer::II,
+            protection: true,
+            bitrate: crate::header::Bitrate::Fixed(kbps),
+            sampling_frequency: fs,
+            padding: false,
+            private: false,
+            mode,
+            mode_extension: crate::header::ModeExtension(0),
+            copyright: false,
+            original: true,
+            emphasis: crate::header::Emphasis::None,
+        }
+    }
+
+    fn header_l2_joint(fs: u32, kbps: u16, bound_code: u8) -> FrameHeader {
+        let mut h = header_l2(fs, kbps, Mode::JointStereo);
+        h.mode_extension = crate::header::ModeExtension(bound_code & 0b11);
+        h
+    }
+
+    #[test]
+    fn layer2_stereo_bound_matches_decode_path() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        // Stereo / dual_channel / mono never share an upper band.
+        let h_st = header_l2(44_100, 192, Mode::Stereo);
+        let t_st = layer2_bit_allocation_table(&h_st);
+        assert_eq!(layer2_stereo_bound(&h_st, t_st.sblimit()), t_st.sblimit());
+        let h_du = header_l2(44_100, 192, Mode::DualChannel);
+        assert_eq!(layer2_stereo_bound(&h_du, t_st.sblimit()), t_st.sblimit());
+        let h_mo = header_l2(44_100, 64, Mode::SingleChannel);
+        let t_mo = layer2_bit_allocation_table(&h_mo);
+        assert_eq!(layer2_stereo_bound(&h_mo, t_mo.sblimit()), t_mo.sblimit());
+        // Joint stereo: ModeExtension code → bound, clamped to sblimit.
+        // 64 kbit/s stereo @ 44.1 kHz → B.2c (sblimit = 8).
+        let h_js = header_l2_joint(44_100, 64, 0b00); // raw bound = 4
+        let t_js = layer2_bit_allocation_table(&h_js);
+        assert_eq!(layer2_stereo_bound(&h_js, t_js.sblimit()), 4);
+        let h_js2 = header_l2_joint(44_100, 64, 0b11); // raw bound = 16 → clamp to sblimit = 8
+        assert_eq!(layer2_stereo_bound(&h_js2, t_js.sblimit()), t_js.sblimit());
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_stereo_zero_bits_match_sum_nbal() {
+        // An all-zero allocation under any (Fs, bitrate, mode) writes
+        // exactly `nch · Σ nbal[sb]` zero bits — the `bbal` budget the
+        // §C.1.5.2.7 formula deducts from the frame payload.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let nch = header.channels() as usize;
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        let mut bw = BitWriter::new();
+        write_layer2_allocation_field(&mut bw, table, &alloc, nch, bound).expect("write");
+        // bbal in bits, since alloc field bits sum exactly to nch·Σ nbal
+        // when bound == sblimit (stereo, no shared upper band).
+        let expected_bits = nch * sum_nbal_per_channel(table);
+        let bytes = bw.finish();
+        // All zero contents.
+        assert!(bytes.iter().all(|&b| b == 0));
+        // The packed size must be ceil(expected_bits / 8).
+        assert_eq!(bytes.len(), expected_bits.div_ceil(8));
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_known_low_band_pattern() {
+        // Take Table B.2a (sblimit = 27): sb 0..11 have nbal = 4, sb
+        // 11..23 have nbal = 3, sb 23..27 have nbal = 2. Pick a few
+        // non-zero codes and confirm the bitstream layout reads them
+        // back in the same order with sb-major, ch-minor packing
+        // (§2.4.1.6 low-band loop). 48 kHz @ 192 kbit/s stereo (96
+        // kbit/s/channel) lands on B.2a per the §2.4.2.3 footnote.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(48_000, 192, Mode::Stereo); // → B.2a, sblimit = 27
+        let table = layer2_bit_allocation_table(&header);
+        assert_eq!(table.sblimit(), 27);
+        assert_eq!(table.nbal(0), 4);
+        assert_eq!(table.nbal(11), 3);
+        assert_eq!(table.nbal(23), 2);
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[0][0] = 0b0011; // valid: small allocation
+        alloc[1][0] = 0b0101;
+        alloc[0][11] = 0b010; // 3-bit code
+        alloc[1][11] = 0b001;
+        alloc[0][23] = 0b10; // 2-bit code
+        alloc[1][23] = 0b01;
+        let mut bw = BitWriter::new();
+        write_layer2_allocation_field(&mut bw, table, &alloc, 2, table.sblimit()).expect("write");
+        let bytes = bw.finish();
+        // sb=0, ch=0: high 4 bits of byte 0 = 0b0011 = 0x3.
+        assert_eq!(bytes[0] >> 4, 0b0011);
+        // sb=0, ch=1: low 4 bits of byte 0 = 0b0101 = 0x5.
+        assert_eq!(bytes[0] & 0xF, 0b0101);
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_joint_stereo_shared_upper_band() {
+        // joint_stereo with bound = 4 (mode_extension '00'): subbands
+        // [0, 4) write nch × nbal bits, subbands [4, sblimit) write
+        // exactly one nbal bits each. Verify the total payload bits
+        // matches that breakdown.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        // 32 kbit/s mono @ 44.1 kHz puts us on B.2c (sblimit = 8). To
+        // exercise joint_stereo we need a stereo header; 64 kbit/s
+        // stereo @ 44.1 kHz also resolves to B.2c (32 kbit/s/channel).
+        let header = header_l2_joint(44_100, 64, 0b00); // bound = 4
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let bound = layer2_stereo_bound(&header, sblimit);
+        assert!(
+            bound > 0 && bound < sblimit,
+            "bound={bound} sblimit={sblimit}"
+        );
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let mut bw = BitWriter::new();
+        write_layer2_allocation_field(&mut bw, table, &alloc, 2, bound).expect("write");
+        let total_bits: usize = (0..bound)
+            .map(|sb| 2 * table.nbal(sb) as usize)
+            .sum::<usize>()
+            + (bound..sblimit)
+                .map(|sb| table.nbal(sb) as usize)
+                .sum::<usize>();
+        let bytes = bw.finish();
+        assert_eq!(bytes.len(), total_bits.div_ceil(8));
+        // Smaller than the unshared payload by exactly Σ_{bound..sblimit} nbal[sb].
+        let unshared: usize = (0..sblimit).map(|sb| 2 * table.nbal(sb) as usize).sum();
+        assert_eq!(
+            unshared - total_bits,
+            (bound..sblimit)
+                .map(|sb| table.nbal(sb) as usize)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_rejects_bad_channel_count() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let mut bw = BitWriter::new();
+        let err = write_layer2_allocation_field(&mut bw, table, &alloc, 0, table.sblimit())
+            .expect_err("nch=0");
+        assert_eq!(err, Layer2AllocationFieldError::UnsupportedChannelCount(0));
+        let err = write_layer2_allocation_field(&mut bw, table, &alloc, 3, table.sblimit())
+            .expect_err("nch=3");
+        assert_eq!(err, Layer2AllocationFieldError::UnsupportedChannelCount(3));
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_rejects_bound_above_sblimit() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo); // B.2b, sblimit = 30
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let mut bw = BitWriter::new();
+        let err = write_layer2_allocation_field(&mut bw, table, &alloc, 2, table.sblimit() + 1)
+            .expect_err("bound > sblimit");
+        assert!(matches!(
+            err,
+            Layer2AllocationFieldError::BoundExceedsSblimit { .. }
+        ));
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_rejects_mono_with_shared_upper_band() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let mut bw = BitWriter::new();
+        // Mono must use bound == sblimit (no upper-band sharing exists
+        // because there are no channels to share between).
+        let err = write_layer2_allocation_field(&mut bw, table, &alloc, 1, 4)
+            .expect_err("mono bound < sblimit");
+        assert!(matches!(
+            err,
+            Layer2AllocationFieldError::MonoBoundBelowSblimit { .. }
+        ));
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_rejects_oversize_allocation_code() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        // sb=11 has nbal=3 under B.2b; values >= 8 don't fit.
+        assert_eq!(table.nbal(11), 3);
+        alloc[0][11] = 8;
+        let mut bw = BitWriter::new();
+        let err = write_layer2_allocation_field(&mut bw, table, &alloc, 2, table.sblimit())
+            .expect_err("alloc too wide");
+        assert_eq!(
+            err,
+            Layer2AllocationFieldError::InvalidAllocationCode {
+                channel: 0,
+                subband: 11,
+                allocation: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_rejects_non_zero_above_sblimit() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        // B.2c stereo @ 44.1 kHz (64 kbit/s) → sblimit = 8.
+        let header = header_l2(44_100, 64, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        assert_eq!(table.sblimit(), 8);
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[1][20] = 1; // above sblimit
+        let mut bw = BitWriter::new();
+        let err = write_layer2_allocation_field(&mut bw, table, &alloc, 2, table.sblimit())
+            .expect_err("above sblimit");
+        assert!(matches!(
+            err,
+            Layer2AllocationFieldError::NonZeroAllocationAboveSblimit { .. }
+        ));
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_rejects_upper_band_disagreement() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2_joint(44_100, 64, 0b00); // bound = 4
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let bound = layer2_stereo_bound(&header, sblimit);
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        // Pick an upper-band subband and give the two channels different
+        // codes — the writer refuses to silently collapse them.
+        alloc[0][bound] = 1;
+        alloc[1][bound] = 2;
+        let mut bw = BitWriter::new();
+        let err =
+            write_layer2_allocation_field(&mut bw, table, &alloc, 2, bound).expect_err("disagree");
+        assert!(matches!(
+            err,
+            Layer2AllocationFieldError::UpperBandChannelsDisagree {
+                subband: _,
+                left: 1,
+                right: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn write_layer2_allocation_field_round_trips_through_decoder_read() {
+        // Encode every (ch, sb) allocation, then decode the bits back
+        // using the same MSB-first BitReader semantics and recover the
+        // exact codes. Exercises both the low-band and upper-band paths.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2_joint(44_100, 64, 0b01); // bound = 8 → clamped to sblimit=8
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let bound = layer2_stereo_bound(&header, sblimit);
+        // For each subband, pick the smallest legal non-zero allocation
+        // (smallest valid Table 3-B.2x level) and the symmetric shared
+        // value in [bound, sblimit). Smallest legal index is the first
+        // `Some` entry in the row's levels array; alloc = idx + 1.
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        for sb in 0..sblimit {
+            let nbal = table.nbal(sb);
+            if nbal == 0 {
+                continue;
+            }
+            // Find the smallest alloc > 0 with a valid quant_class.
+            let mut chosen = 0u8;
+            for a in 1u8..(1u8 << nbal) {
+                if table.quant_class(sb, a).is_some() {
+                    chosen = a;
+                    break;
+                }
+            }
+            if sb < bound {
+                alloc[0][sb] = chosen;
+                alloc[1][sb] = chosen;
+            } else {
+                // Shared: both channels must hold the same code, but the
+                // writer only emits one slot.
+                alloc[0][sb] = chosen;
+                alloc[1][sb] = chosen;
+            }
+        }
+        let mut bw = BitWriter::new();
+        write_layer2_allocation_field(&mut bw, table, &alloc, 2, bound).expect("write");
+        let bytes = bw.finish();
+        // Replay the §2.4.1.6 low-band per-channel read followed by the
+        // shared upper-band read; every recovered code must match the
+        // value we wrote (low band per channel, upper band single read
+        // mirrored into both channels).
+        let mut reader = crate::decode::BitReader::new(&bytes);
+        for sb in 0..bound {
+            let nbal = table.nbal(sb);
+            for ch in 0..2 {
+                let got = reader.read_bits(nbal).expect("read low") as u8;
+                assert_eq!(got, alloc[ch][sb], "sb={sb} ch={ch}");
+            }
+        }
+        for sb in bound..sblimit {
+            let nbal = table.nbal(sb);
+            let got = reader.read_bits(nbal).expect("read upper") as u8;
+            assert_eq!(got, alloc[0][sb], "shared sb={sb}");
+            assert_eq!(got, alloc[1][sb], "shared sb={sb}");
+        }
     }
 }
