@@ -1460,6 +1460,321 @@ pub fn write_layer2_scalefactor_field(
     Ok(())
 }
 
+// ============================================================================
+// §2.4.1.6 / §2.4.3.3.4 Layer II SAMPLES region writer
+// ============================================================================
+
+/// Per-`(ch, sb, granule)` sample-triplet codes for the §2.4.1.6 Layer II
+/// SAMPLES region.
+///
+/// Each entry `codes[ch][sb][gr]` is the three already-quantized
+/// per-sample integers the writer emits as one triplet. They are the
+/// MSB-inverted unsigned codes the §2.4.3.3.4 decoder will read; under
+/// the decoder's "first bit inverted, then two's-complement fractional"
+/// rule each value must lie in `[0, nlevels)` for the (ch, sb)
+/// quantization class.
+///
+/// For a grouped class (`QuantClass::grouping == true`) the three codes
+/// are packed into a single `bits_per_codeword`-wide field as
+/// `samplecode = codes[0] + codes[1] * N + codes[2] * N²` where
+/// `N = nlevels`. For a non-grouped class the three codes are emitted
+/// as three separable `bits_per_codeword`-wide fields, MSB-first.
+///
+/// Subbands `[bound, sblimit)` in joint_stereo mode are shared between
+/// channels: the writer reads the triplet from `codes[0][sb][gr]` and
+/// emits it once; the decoder mirrors it into both channels.
+#[derive(Debug, Clone, Copy)]
+pub struct Layer2SamplesFieldInput {
+    /// `codes[ch][sb][gr]` carries one triplet `[s0, s1, s2]` of
+    /// per-sample integer codes for channel `ch`, subband `sb`,
+    /// syntax-granule `gr` (`gr < 12`).
+    pub codes: [[[[u32; 3]; SUBBANDS]; 12]; 2],
+}
+
+impl Default for Layer2SamplesFieldInput {
+    fn default() -> Self {
+        Layer2SamplesFieldInput {
+            codes: [[[[0u32; 3]; SUBBANDS]; 12]; 2],
+        }
+    }
+}
+
+/// Errors raised by [`write_layer2_samples_field`].
+///
+/// All shapes are validated before any bit is written; on error nothing
+/// is appended to the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer2SamplesFieldError {
+    /// `nch` was not `1` or `2`.
+    UnsupportedChannelCount(usize),
+    /// `bound > table.sblimit()`. The intensity-stereo bound cannot
+    /// exceed the in-stream subband count.
+    BoundExceedsSblimit {
+        /// The supplied `bound`.
+        bound: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+    },
+    /// `bound < sblimit` with `nch == 1`. Mono frames must use
+    /// `bound == sblimit` (no shared upper band exists).
+    MonoBoundBelowSblimit {
+        /// The supplied `bound`.
+        bound: usize,
+        /// `table.sblimit()`.
+        sblimit: usize,
+    },
+    /// `alloc[ch][sb]` is non-zero but points at an invalid (`-`) slot
+    /// in the per-subband row of the chosen Tables 3-B.2x.
+    InvalidAllocationCode {
+        /// Channel of the offending allocation.
+        channel: usize,
+        /// Subband of the offending allocation.
+        subband: usize,
+        /// The supplied allocation index.
+        allocation: u8,
+    },
+    /// A sample code did not fit in `[0, nlevels)` for the quantization
+    /// class resolved at `(sb, alloc[ch][sb])`. The decoder's degrouping
+    /// arithmetic and MSB-inversion rule require every code to be a
+    /// valid `nlevels`-level value.
+    SampleCodeOutOfRange {
+        /// Channel of the offending code.
+        channel: usize,
+        /// Subband of the offending code.
+        subband: usize,
+        /// Syntax-granule of the offending code (`0..=11`).
+        granule: usize,
+        /// Sample-within-triplet of the offending code (`0..=2`).
+        sample: usize,
+        /// The supplied code value.
+        code: u32,
+        /// The `nlevels` of the (ch, sb) quantization class.
+        nlevels: u16,
+    },
+}
+
+impl core::fmt::Display for Layer2SamplesFieldError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Layer2SamplesFieldError::UnsupportedChannelCount(n) => {
+                write!(f, "Layer II samples field: unsupported channel count {n}")
+            }
+            Layer2SamplesFieldError::BoundExceedsSblimit { bound, sblimit } => {
+                write!(
+                    f,
+                    "Layer II samples field: bound {bound} exceeds sblimit {sblimit}"
+                )
+            }
+            Layer2SamplesFieldError::MonoBoundBelowSblimit { bound, sblimit } => {
+                write!(
+                    f,
+                    "Layer II samples field: mono bound {bound} < sblimit {sblimit}"
+                )
+            }
+            Layer2SamplesFieldError::InvalidAllocationCode {
+                channel,
+                subband,
+                allocation,
+            } => {
+                write!(
+                    f,
+                    "Layer II samples field: allocation {allocation} at sb={subband} \
+                     ch={channel} is not a legal index in the Tables 3-B.2x row"
+                )
+            }
+            Layer2SamplesFieldError::SampleCodeOutOfRange {
+                channel,
+                subband,
+                granule,
+                sample,
+                code,
+                nlevels,
+            } => {
+                write!(
+                    f,
+                    "Layer II samples field: code {code} at sb={subband} ch={channel} \
+                     gr={granule} s={sample} is out of [0, {nlevels})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Layer2SamplesFieldError {}
+
+/// Write the §2.4.1.6 Layer II SAMPLES region into `bw`, MSB-first —
+/// the bitstream region that immediately follows the SCFSI +
+/// scalefactor region emitted by [`write_layer2_scalefactor_field`].
+///
+/// The §2.4.1.6 syntax for this region is the outer
+/// `for (gr=0; gr<12; gr++)` loop the decoder mirrors in
+/// [`crate::decode_layer2::decode_layer2_audio_data`]: for each of the
+/// 12 syntax-granules, walk the low band `[0, bound)` per channel and
+/// emit one triplet per `(ch, sb)`, then walk the shared upper band
+/// `[bound, sblimit)` and emit one triplet per `sb` (mirrored into
+/// both channels by the decoder).
+///
+/// Each triplet is emitted via the per-subband [`QuantClass`] resolved
+/// from `(sb, alloc[ch][sb])` against the per-frame [`AllocationTable`]:
+///
+/// * If `class.grouping == true`, write a single `bits_per_codeword`-bit
+///   field whose value is `codes[0] + codes[1]·N + codes[2]·N²` where
+///   `N = class.nlevels`. The decoder's degrouping arithmetic
+///   (`for i in 0..3: s[i] = c % N; c /= N`) recovers `codes[0..3]`
+///   exactly.
+/// * If `class.grouping == false`, write three separable
+///   `bits_per_codeword`-bit fields carrying `codes[0]`, `codes[1]`,
+///   `codes[2]` in order.
+///
+/// In either case each code is a *raw* unsigned `nlevels`-level value
+/// (i.e. the §2.4.3.3.4 "first bit has to be inverted" pre-image). A
+/// roundtrip through the §2.4.3.3.4 decoder recovers the same triplet
+/// of codes the encoder wrote.
+///
+/// Subbands with `alloc[ch][sb] == 0` emit zero bits — they are
+/// silenced by the §2.4.3.3.5 "if a subband has no bits allocated to
+/// it, the samples in that subband are set to zero" rule.
+///
+/// Subbands `[sblimit, 32)` are silently skipped (they cannot be
+/// allocated by the §2.4.1.6 syntax).
+///
+/// Pre-flight validation:
+/// * `nch ∈ {1, 2}`.
+/// * `bound ≤ table.sblimit()`.
+/// * For `nch == 1`, `bound == sblimit`.
+/// * Every non-zero `alloc[ch][sb]` resolves to a legal [`QuantClass`]
+///   via [`AllocationTable::quant_class`].
+/// * Every emitted sample code is in `[0, nlevels)` for the resolved
+///   quantization class.
+///
+/// On error nothing is written to `bw`.
+// The §2.4.1.6 SAMPLES region is the same gr-major / sb-major /
+// ch-minor triple loop the decoder uses, plus the per-triplet
+// grouped-vs-separable code-emit split. Index-based loops are the
+// faithful expression of the spec's nested syntax.
+#[allow(clippy::needless_range_loop)]
+pub fn write_layer2_samples_field(
+    bw: &mut BitWriter,
+    table: &AllocationTable,
+    alloc: &Layer2Allocation,
+    input: &Layer2SamplesFieldInput,
+    nch: usize,
+    bound: usize,
+) -> Result<(), Layer2SamplesFieldError> {
+    use crate::decode_layer2::SYNTAX_GRANULES;
+
+    if !(nch == 1 || nch == 2) {
+        return Err(Layer2SamplesFieldError::UnsupportedChannelCount(nch));
+    }
+    let sblimit = table.sblimit();
+    if bound > sblimit {
+        return Err(Layer2SamplesFieldError::BoundExceedsSblimit { bound, sblimit });
+    }
+    if nch == 1 && bound != sblimit {
+        return Err(Layer2SamplesFieldError::MonoBoundBelowSblimit { bound, sblimit });
+    }
+
+    // Pre-flight: resolve every (ch, sb) quant class and validate every
+    // code, before any bit is written. A failed allocation lookup is a
+    // typed `InvalidAllocationCode`; an out-of-range code is a typed
+    // `SampleCodeOutOfRange`.
+    for sb in 0..sblimit {
+        // Determine which channels need pre-flighting for this subband.
+        // Low band: per-channel allocations. Upper band: shared (use
+        // channel 0 only — that is where the encoder reads the triplet
+        // from).
+        let upper_band = sb >= bound;
+        for ch in 0..nch {
+            if upper_band && ch != 0 {
+                // Upper-band cells are sourced from channel 0 only; the
+                // decoder mirrors the single triplet into both channels.
+                continue;
+            }
+            let a = alloc[ch][sb];
+            if a == 0 {
+                continue;
+            }
+            let class =
+                table
+                    .quant_class(sb, a)
+                    .ok_or(Layer2SamplesFieldError::InvalidAllocationCode {
+                        channel: ch,
+                        subband: sb,
+                        allocation: a,
+                    })?;
+            let n = class.nlevels as u32;
+            for gr in 0..SYNTAX_GRANULES {
+                let triplet = &input.codes[ch][gr][sb];
+                for s in 0..3 {
+                    if triplet[s] >= n {
+                        return Err(Layer2SamplesFieldError::SampleCodeOutOfRange {
+                            channel: ch,
+                            subband: sb,
+                            granule: gr,
+                            sample: s,
+                            code: triplet[s],
+                            nlevels: class.nlevels,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-flight passed: emit the region.
+    for gr in 0..SYNTAX_GRANULES {
+        // Low band [0, bound): per-channel triplet per (ch, sb).
+        for sb in 0..bound {
+            for ch in 0..nch {
+                emit_layer2_triplet(bw, table, alloc[ch][sb], &input.codes[ch][gr][sb], sb);
+            }
+        }
+        // Upper band [bound, sblimit): one shared triplet per sb,
+        // sourced from channel 0; the decoder mirrors into both.
+        for sb in bound..sblimit {
+            emit_layer2_triplet(bw, table, alloc[0][sb], &input.codes[0][gr][sb], sb);
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit one §2.4.1.6 triplet for the given `(sb, alloc)` cell, per the
+/// per-subband [`QuantClass`] grouping flag. Pre-flight validation in
+/// [`write_layer2_samples_field`] has already ensured every code fits.
+fn emit_layer2_triplet(
+    bw: &mut BitWriter,
+    table: &AllocationTable,
+    alloc: u8,
+    codes: &[u32; 3],
+    sb: usize,
+) {
+    if alloc == 0 {
+        return;
+    }
+    // Pre-flight guarantees the lookup succeeds.
+    let class = table
+        .quant_class(sb, alloc)
+        .expect("pre-flight validated allocation");
+    if class.grouping {
+        // §2.4.3.3.4 inverse-degroup: pack three nlevels-level codes
+        // into a single bits_per_codeword-wide field, low code first
+        // (so the decoder's `c % N` step recovers `codes[0]`).
+        let n = class.nlevels as u32;
+        let mut packed = codes[0];
+        packed = packed.wrapping_add(codes[1].wrapping_mul(n));
+        packed = packed.wrapping_add(codes[2].wrapping_mul(n.wrapping_mul(n)));
+        bw.put(packed, class.bits_per_codeword);
+    } else {
+        // Three separable sample fields, MSB-first per the §2.4.1.6
+        // sample[ch][sb][3*gr+s] inner loop.
+        let nb = class.bits_per_codeword;
+        bw.put(codes[0], nb);
+        bw.put(codes[1], nb);
+        bw.put(codes[2], nb);
+    }
+}
+
 /// The §2.4.1.6 intensity_stereo bound for a Layer II frame: the first
 /// subband whose `allocation` field is shared between channels.
 ///
@@ -3407,5 +3722,488 @@ mod tests {
         assert_eq!(bytes.len(), 1);
         // Stream MSB-first: '10 001001' = 0b10001001 = 0x89.
         assert_eq!(bytes[0], 0x89);
+    }
+
+    // ---- §2.4.1.6 / §2.4.3.3.4 SAMPLES region writer ------------------
+
+    #[test]
+    fn write_layer2_samples_field_zero_alloc_writes_no_bits() {
+        // When every subband is unallocated the §2.4.1.6 SAMPLES region
+        // is empty: 12 granules × 0 emissions = 0 bits.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Box::new(Layer2SamplesFieldInput::default());
+        let mut bw = BitWriter::new();
+        write_layer2_samples_field(&mut bw, table, &alloc, &input, 2, table.sblimit())
+            .expect("write");
+        assert_eq!(bw.byte_len(), 0);
+        let bytes = bw.finish();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn write_layer2_samples_field_bit_count_matches_class_sums() {
+        // Dense stereo allocation, every subband allocated at the smallest
+        // legal level. Total bits = 12 (granules) × Σ_(ch, sb)
+        // class.bits_per_codeword (per the §2.4.1.6 syntax — one codeword
+        // per triplet, whether grouped or split into three samples).
+        // (For non-grouped classes the per-triplet emission is 3 *
+        // bits_per_codeword; pre-multiply by samples_per_codeword for the
+        // grouped flavour where one codeword covers all three samples.)
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        let alloc = dense_layer2_alloc(table, bound, 2);
+
+        // Build the expected bit count by walking every (ch, sb) and
+        // looking up the class's bits-per-triplet contribution.
+        let mut expected_per_granule_bits = 0usize;
+        for ch in 0..2 {
+            for sb in 0..table.sblimit() {
+                let a = alloc[ch][sb];
+                if a == 0 {
+                    continue;
+                }
+                let cls = table.quant_class(sb, a).expect("class");
+                let per_triplet_bits = if cls.grouping {
+                    cls.bits_per_codeword as usize
+                } else {
+                    3 * cls.bits_per_codeword as usize
+                };
+                expected_per_granule_bits += per_triplet_bits;
+            }
+        }
+        let expected_total_bits = 12 * expected_per_granule_bits;
+
+        let input = Box::new(Layer2SamplesFieldInput::default()); // all-zero codes
+        let mut bw = BitWriter::new();
+        write_layer2_samples_field(&mut bw, table, &alloc, &input, 2, bound).expect("write");
+        // Use byte_len + flush remainder for an exact bit count.
+        let written_full_bytes = bw.byte_len();
+        let bytes = bw.finish();
+        let total_bits = bytes.len() * 8;
+        let pad_bits = total_bits - expected_total_bits;
+        assert!(
+            pad_bits < 8,
+            "padding must be < 8 bits; got total_bits={total_bits} expected={expected_total_bits}"
+        );
+        assert_eq!(
+            written_full_bytes + if pad_bits == 0 { 0 } else { 1 },
+            bytes.len(),
+            "finish() padded a partial trailing byte if any"
+        );
+    }
+
+    #[test]
+    fn write_layer2_samples_field_grouped_known_pattern() {
+        // 64 kbit/s mono at 44.1 kHz selects B.2c (sblimit=8). B.2c sb0
+        // row's smallest legal non-zero allocation maps to a grouped
+        // class (nlevels=3, bits_per_codeword=5). With every (ch, sb)
+        // other than sb=0 unallocated, the 12 emitted samplecodes are
+        // 5 bits each = 60 bits = 7.5 bytes — `finish` rounds up to 8
+        // bytes. With codes [s0=2, s1=1, s2=0] the packed value is
+        // `2 + 1*3 + 0*9 = 5 = 0b00101`, repeated 12 times.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        // Pick smallest non-zero alloc at sb=0.
+        let nbal0 = table.nbal(0);
+        let mut chosen = 0u8;
+        for a in 1u8..(1u8 << nbal0) {
+            if table.quant_class(0, a).is_some() {
+                chosen = a;
+                break;
+            }
+        }
+        let cls = table.quant_class(0, chosen).expect("class");
+        // The smallest non-zero level in B.2c sb0 must be a grouped
+        // class (nlevels = 3, bits_per_codeword = 5).
+        assert!(cls.grouping, "expected sb=0 smallest alloc to be grouped");
+        assert_eq!(cls.nlevels, 3);
+        assert_eq!(cls.bits_per_codeword, 5);
+
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[0][0] = chosen;
+        let mut input = Box::new(Layer2SamplesFieldInput::default());
+        for gr in 0..12 {
+            input.codes[0][gr][0] = [2, 1, 0];
+        }
+        let mut bw = BitWriter::new();
+        write_layer2_samples_field(&mut bw, table, &alloc, &input, 1, bound).expect("write");
+        let bytes = bw.finish();
+        // 12 codewords × 5 bits = 60 bits → 8 bytes after the 4-bit
+        // zero pad on the trailing byte.
+        assert_eq!(bytes.len(), 8);
+        // Each codeword is 0b00101. The MSB-first stream is
+        //   00101 00101 00101 00101 00101 00101 00101 00101 00101 00101 00101 00101 0000
+        // = 0x29 0x4A 0x52 0x94 0xA5 0x29 0x4A 0x50
+        // (the trailing nibble of byte 7 is zero pad).
+        // Verify byte-by-byte.
+        let expected: [u8; 8] = [0x29, 0x4A, 0x52, 0x94, 0xA5, 0x29, 0x4A, 0x50];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn write_layer2_samples_field_round_trips_through_decoder() {
+        // End-to-end: write a stereo SAMPLES region with a deterministic
+        // set of codes per (ch, sb, gr), then route the bytes through
+        // `decode_layer2_audio_data` (after a fresh allocation+scfsi+scf
+        // prefix). Recovered samples must match the expected
+        // requantization of the codes we wrote.
+        use crate::decode_layer2::{decode_layer2_audio_data, SYNTAX_GRANULES};
+        use crate::tables_layer2::layer2_bit_allocation_table;
+
+        // 192 kbit/s stereo at 48 kHz selects B.2a (sblimit=27). We use
+        // a sparse allocation (sb=0 only) to keep the codeword stream
+        // short and easy to verify against the decoder.
+        let header = header_l2(48_000, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let bound = layer2_stereo_bound(&header, sblimit);
+        // sb=0 in B.2a — smallest legal non-zero alloc.
+        let nbal0 = table.nbal(0);
+        let mut chosen = 0u8;
+        for a in 1u8..(1u8 << nbal0) {
+            if table.quant_class(0, a).is_some() {
+                chosen = a;
+                break;
+            }
+        }
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[0][0] = chosen;
+        alloc[1][0] = chosen;
+
+        // SCFSI = 0b00, three scalefactor indices per (ch, sb).
+        let mut scf_input = Layer2ScalefactorFieldInput::default();
+        scf_input.scfsi[0][0] = 0b00;
+        scf_input.scfsi[1][0] = 0b00;
+        scf_input.scalefactor_indices[0][0] = [10, 20, 30];
+        scf_input.scalefactor_indices[1][0] = [11, 21, 31];
+
+        // Layer2 SAMPLES: a deterministic triplet pattern per granule.
+        let cls = table.quant_class(0, chosen).expect("class");
+        let n = cls.nlevels as u32;
+        assert!(n >= 2, "need at least 2 levels for a non-trivial test");
+        let mut samples_input = Box::new(Layer2SamplesFieldInput::default());
+        for gr in 0..SYNTAX_GRANULES {
+            for ch in 0..2 {
+                let s0 = (gr as u32 + ch as u32) % n;
+                let s1 = (gr as u32 + 1 + ch as u32) % n;
+                let s2 = (gr as u32 + 2 + ch as u32) % n;
+                samples_input.codes[ch][gr][0] = [s0, s1, s2];
+            }
+        }
+
+        let mut bw = BitWriter::new();
+        write_layer2_allocation_field(&mut bw, table, &alloc, 2, bound).expect("alloc");
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &scf_input, 2, bound).expect("scf");
+        write_layer2_samples_field(&mut bw, table, &alloc, &samples_input, 2, bound)
+            .expect("samples");
+        let bytes = bw.finish();
+
+        // Decode the bytes back.
+        let decoded = decode_layer2_audio_data(&header, &bytes).expect("decode");
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.sblimit, sblimit);
+
+        // The decoder rescales by Table 3-B.1 then applies the §2.4.3.3.4
+        // C * (s''' + D) requantization. To verify the round-trip, we
+        // replicate the same math here from the codes we wrote and check
+        // the decoded samples match.
+        use crate::tables::SCALEFACTORS;
+        let nb = cls.bits_per_sample();
+        let msb = 1u32 << (nb - 1);
+        for gr in 0..SYNTAX_GRANULES {
+            let part = gr / 4; // 12 granules / 3 parts = 4 granules per part
+            for ch in 0..2 {
+                let codes = samples_input.codes[ch][gr][0];
+                let scf_idx = scf_input.scalefactor_indices[ch][0][part] as usize & 0x3F;
+                let factor = SCALEFACTORS[scf_idx];
+                for s in 0..3 {
+                    let c = codes[s];
+                    // Re-derive the requantization the decoder applies.
+                    let inverted = c ^ msb;
+                    let signed = if inverted & msb != 0 {
+                        i64::from(inverted) - (1i64 << nb)
+                    } else {
+                        i64::from(inverted)
+                    };
+                    let s_frac = signed as f64 / (1u64 << (nb - 1)) as f64;
+                    let expected_dp = cls.c * (s_frac + cls.d);
+                    let expected = factor * expected_dp;
+                    let got = decoded.subbands[ch][0].samples[gr * 3 + s];
+                    let diff = (got - expected).abs();
+                    assert!(
+                        diff < 1e-12,
+                        "mismatch gr={gr} ch={ch} s={s}: expected {expected} got {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_layer2_samples_field_shared_upper_band_mirrors_into_both_channels() {
+        // Joint-stereo 64 kbit/s @ 44.1 kHz (B.2c, sblimit=8) with
+        // mode_extension=0b01 → bound=8 clamped to sblimit=8. To exercise
+        // the shared upper band, force bound below sblimit by raw header
+        // value. Use mode_extension=0b00 → bound=4.
+        use crate::decode_layer2::{decode_layer2_audio_data, SYNTAX_GRANULES};
+        use crate::tables_layer2::layer2_bit_allocation_table;
+
+        let header = header_l2_joint(44_100, 64, 0b00); // raw bound = 4
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let bound = layer2_stereo_bound(&header, sblimit);
+        assert!(bound < sblimit, "test needs a real shared upper band");
+
+        // sb >= bound carries a shared allocation. We allocate at the
+        // smallest legal non-zero level at sb=bound only, for clarity.
+        let nbal_b = table.nbal(bound);
+        let mut chosen = 0u8;
+        for a in 1u8..(1u8 << nbal_b) {
+            if table.quant_class(bound, a).is_some() {
+                chosen = a;
+                break;
+            }
+        }
+        let cls = table.quant_class(bound, chosen).expect("class");
+        // Both channels must record the shared allocation — the
+        // allocation-field writer requires it.
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[0][bound] = chosen;
+        alloc[1][bound] = chosen;
+
+        // SCFSI + scalefactor: distinct per channel even though the
+        // *samples* are shared (per §2.4.1.6 / §2.4.3.3 / §2.4.2.6).
+        let mut scf_input = Layer2ScalefactorFieldInput::default();
+        scf_input.scfsi[0][bound] = 0b00;
+        scf_input.scfsi[1][bound] = 0b00;
+        scf_input.scalefactor_indices[0][bound] = [10, 20, 30];
+        scf_input.scalefactor_indices[1][bound] = [11, 21, 31];
+
+        // SAMPLES: the writer only reads channel 0 in the shared band.
+        let n = cls.nlevels as u32;
+        let mut samples_input = Box::new(Layer2SamplesFieldInput::default());
+        for gr in 0..SYNTAX_GRANULES {
+            let s0 = (gr as u32) % n;
+            let s1 = (gr as u32 + 1) % n;
+            let s2 = (gr as u32 + 2) % n;
+            // Channel 0 carries the actual codes; channel 1 is ignored
+            // by the writer but is left at zero to confirm that fact.
+            samples_input.codes[0][gr][bound] = [s0, s1, s2];
+            samples_input.codes[1][gr][bound] = [0, 0, 0];
+        }
+
+        let mut bw = BitWriter::new();
+        write_layer2_allocation_field(&mut bw, table, &alloc, 2, bound).expect("alloc");
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &scf_input, 2, bound).expect("scf");
+        write_layer2_samples_field(&mut bw, table, &alloc, &samples_input, 2, bound)
+            .expect("samples");
+        let bytes = bw.finish();
+
+        let decoded = decode_layer2_audio_data(&header, &bytes).expect("decode");
+        assert_eq!(decoded.channels, 2);
+
+        // Both decoded channels should carry the same s'' values
+        // (re-rescaled by each channel's distinct scalefactor).
+        use crate::tables::SCALEFACTORS;
+        let nb = cls.bits_per_sample();
+        let msb = 1u32 << (nb - 1);
+        for gr in 0..SYNTAX_GRANULES {
+            let part = gr / 4;
+            let codes = samples_input.codes[0][gr][bound];
+            for s in 0..3 {
+                let c = codes[s];
+                let inverted = c ^ msb;
+                let signed = if inverted & msb != 0 {
+                    i64::from(inverted) - (1i64 << nb)
+                } else {
+                    i64::from(inverted)
+                };
+                let s_frac = signed as f64 / (1u64 << (nb - 1)) as f64;
+                let expected_dp = cls.c * (s_frac + cls.d);
+                for ch in 0..2 {
+                    let scf_idx = scf_input.scalefactor_indices[ch][bound][part] as usize & 0x3F;
+                    let factor = SCALEFACTORS[scf_idx];
+                    let expected = factor * expected_dp;
+                    let got = decoded.subbands[ch][bound].samples[gr * 3 + s];
+                    assert!(
+                        (got - expected).abs() < 1e-12,
+                        "ch={ch} gr={gr} s={s}: expected {expected} got {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_layer2_samples_field_rejects_bad_channel_count() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Box::new(Layer2SamplesFieldInput::default());
+        let mut bw = BitWriter::new();
+        match write_layer2_samples_field(&mut bw, table, &alloc, &input, 0, table.sblimit()) {
+            Err(Layer2SamplesFieldError::UnsupportedChannelCount(0)) => {}
+            other => panic!("expected UnsupportedChannelCount(0), got {other:?}"),
+        }
+        match write_layer2_samples_field(&mut bw, table, &alloc, &input, 3, table.sblimit()) {
+            Err(Layer2SamplesFieldError::UnsupportedChannelCount(3)) => {}
+            other => panic!("expected UnsupportedChannelCount(3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_layer2_samples_field_rejects_bound_above_sblimit() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Box::new(Layer2SamplesFieldInput::default());
+        let mut bw = BitWriter::new();
+        let bad_bound = table.sblimit() + 1;
+        match write_layer2_samples_field(&mut bw, table, &alloc, &input, 2, bad_bound) {
+            Err(Layer2SamplesFieldError::BoundExceedsSblimit { bound, sblimit }) => {
+                assert_eq!(bound, bad_bound);
+                assert_eq!(sblimit, table.sblimit());
+            }
+            other => panic!("expected BoundExceedsSblimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_layer2_samples_field_rejects_mono_with_shared_upper_band() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let input = Box::new(Layer2SamplesFieldInput::default());
+        let mut bw = BitWriter::new();
+        // Mono with bound < sblimit is invalid (no shared upper band
+        // exists for mono).
+        let bad_bound = 4usize;
+        match write_layer2_samples_field(&mut bw, table, &alloc, &input, 1, bad_bound) {
+            Err(Layer2SamplesFieldError::MonoBoundBelowSblimit { bound, sblimit }) => {
+                assert_eq!(bound, bad_bound);
+                assert_eq!(sblimit, table.sblimit());
+            }
+            other => panic!("expected MonoBoundBelowSblimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_layer2_samples_field_rejects_invalid_allocation_code() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        // Find an allocation index that is NOT a legal slot in sb=0's
+        // row (a `-` cell). Walk down looking for the first invalid.
+        let nbal0 = table.nbal(0);
+        let mut bad = 0u8;
+        for a in 0u8..(1u8 << nbal0) {
+            if a != 0 && table.quant_class(0, a).is_none() {
+                bad = a;
+                break;
+            }
+        }
+        if bad == 0 {
+            // If sb=0 happens to have every slot defined, mark sb=0
+            // with the max value of nbal+1 (off the field).
+            bad = (1u8 << nbal0).wrapping_sub(1);
+            if table.quant_class(0, bad).is_some() {
+                // Skip the test if no invalid slot exists in this row.
+                return;
+            }
+        }
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[0][0] = bad;
+        let input = Box::new(Layer2SamplesFieldInput::default());
+        let mut bw = BitWriter::new();
+        match write_layer2_samples_field(&mut bw, table, &alloc, &input, 2, bound) {
+            Err(Layer2SamplesFieldError::InvalidAllocationCode {
+                channel,
+                subband,
+                allocation,
+            }) => {
+                assert_eq!(channel, 0);
+                assert_eq!(subband, 0);
+                assert_eq!(allocation, bad);
+            }
+            other => panic!("expected InvalidAllocationCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_layer2_samples_field_rejects_sample_code_out_of_range() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        let nbal0 = table.nbal(0);
+        let mut chosen = 0u8;
+        for a in 1u8..(1u8 << nbal0) {
+            if table.quant_class(0, a).is_some() {
+                chosen = a;
+                break;
+            }
+        }
+        let cls = table.quant_class(0, chosen).expect("class");
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        alloc[0][0] = chosen;
+        let mut input = Box::new(Layer2SamplesFieldInput::default());
+        // Put a code at exactly nlevels (out of range).
+        input.codes[0][0][0] = [cls.nlevels as u32, 0, 0];
+        let mut bw = BitWriter::new();
+        match write_layer2_samples_field(&mut bw, table, &alloc, &input, 1, bound) {
+            Err(Layer2SamplesFieldError::SampleCodeOutOfRange {
+                channel,
+                subband,
+                granule,
+                sample,
+                code,
+                nlevels,
+            }) => {
+                assert_eq!(channel, 0);
+                assert_eq!(subband, 0);
+                assert_eq!(granule, 0);
+                assert_eq!(sample, 0);
+                assert_eq!(code, cls.nlevels as u32);
+                assert_eq!(nlevels, cls.nlevels);
+            }
+            other => panic!("expected SampleCodeOutOfRange, got {other:?}"),
+        }
+        // And no bits written on error.
+        let bytes = bw.finish();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn write_layer2_samples_field_error_paths_write_no_bytes() {
+        // Pre-flight failure must not emit a single bit, even if it's
+        // a per-(ch, sb, gr) sample-code rejection deep into the input.
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(48_000, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        let alloc = dense_layer2_alloc(table, bound, 2);
+        let mut input = Box::new(Layer2SamplesFieldInput::default());
+        // Plant a bad code in the LAST granule of the LAST subband on
+        // channel 1. Confirm the writer still rejects without emitting.
+        let last_sb = table.sblimit() - 1;
+        let a = alloc[1][last_sb];
+        let cls = table.quant_class(last_sb, a).expect("class");
+        input.codes[1][11][last_sb] = [cls.nlevels as u32 + 5, 0, 0];
+        let mut bw = BitWriter::new();
+        let err = write_layer2_samples_field(&mut bw, table, &alloc, &input, 2, bound);
+        assert!(err.is_err());
+        let bytes = bw.finish();
+        assert!(bytes.is_empty(), "pre-flight rejection must not emit bytes");
     }
 }

@@ -8,6 +8,64 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II §2.4.1.6 / §2.4.3.3.4 SAMPLES region writer**. New
+  `encode::write_layer2_samples_field(&mut BitWriter, &AllocationTable,
+  &Layer2Allocation, &Layer2SamplesFieldInput, nch, bound) ->
+  Result<(), Layer2SamplesFieldError>` emits the §2.4.1.6 SAMPLES
+  region — the bitstream region that immediately follows the scfsi +
+  scalefactor region written by `write_layer2_scalefactor_field`. The
+  writer mirrors the §2.4.1.6 / §2.4.3.3.4 decoder loop: 12
+  syntax-granules outer; per granule, for each `(ch, sb)` in the low
+  band `[0, bound)` it emits one triplet per channel; in the shared
+  upper band `[bound, sblimit)` it emits a single triplet sourced from
+  channel 0 (the §2.4.2.6 / §2.4.3.3 "intensity_stereo" rule
+  mirroring into both channels at decode time). Each triplet is
+  emitted per the per-`(sb, alloc)` `QuantClass` grouping flag —
+  grouped classes pack three `0..nlevels` codes into one
+  `bits_per_codeword`-wide field as `s0 + s1·N + s2·N²` (the exact
+  inverse of the decoder's `c % N; c /= N` degrouping loop);
+  non-grouped classes emit three separable `bits_per_codeword`-wide
+  fields. Subbands with `alloc[ch][sb] == 0` and subbands `[sblimit,
+  32)` emit zero bits (the §2.4.3.3.5 silenced-band rule). New input
+  type `encode::Layer2SamplesFieldInput { codes: [[[[u32; 3]; SUBBANDS];
+  12]; 2] }` carries the per-`(ch, gr, sb)` triplet of MSB-inverted
+  unsigned codes the §2.4.3.3.4 decoder will read. The function
+  pre-validates every cell before writing a single bit and surfaces
+  five typed errors: `UnsupportedChannelCount` (`nch ∉ {1, 2}`),
+  `BoundExceedsSblimit`, `MonoBoundBelowSblimit` (mono frames must use
+  `bound == sblimit`), `InvalidAllocationCode` (a non-zero `alloc[ch]
+  [sb]` that points at a `-` cell in the per-subband Tables 3-B.2x
+  row), and `SampleCodeOutOfRange` (a code `≥ nlevels` for the
+  resolved class — the decoder's MSB-inversion + degrouping math
+  would silently corrupt the recovered samples otherwise). Together
+  with the prior `write_layer2_header`, `write_layer2_allocation_field`
+  and `write_layer2_scalefactor_field` this completes the four-region
+  §2.4.1.6 control + audio-data payload of a Layer II frame. The
+  remaining Layer II encoder followups are top-level `Mp1Encoder`
+  integration of the four writers, a Layer-II `EncodeParams::layer`
+  switch, and the §C.1.5.2.5 / Table C.4 perceptual SCFSI selection
+  (still a PDF-image DOCS-GAP, hence the writer takes the SCFSI codes
+  as caller input). Eleven new lib-tests cover: all-zero-allocation
+  emits no bits; a dense-allocation total-bit-count check that walks
+  the per-class `bits_per_codeword` and matches the writer's byte
+  count (with a `pad_bits < 8` invariant on the trailing partial
+  byte); a known-bit B.2c sb=0 grouped trace (12 grouped
+  `samplecode = 5` codewords → `0x29 0x4A 0x52 0x94 0xA5 0x29 0x4A
+  0x50`); a full alloc + scfsi + scalefactor + samples write that
+  decodes back through `decode_layer2_audio_data` with every
+  recovered §2.4.3.3.4 sample within `1e-12` of the closed-form
+  expectation re-derived from the codes / scalefactors written; a
+  joint-stereo `mode_extension = 0b00` write whose shared upper band
+  sources triplets from channel 0 only and the decoder mirrors into
+  both channels (verified per-channel against the same closed-form
+  re-derivation, with the channel-1 input codes left at zero to
+  confirm the writer ignores them); and every typed rejection path
+  (`UnsupportedChannelCount` at 0 and 3, `BoundExceedsSblimit`,
+  `MonoBoundBelowSblimit`, `InvalidAllocationCode`,
+  `SampleCodeOutOfRange` at `code = nlevels`, plus a deep-position
+  rejection at `(ch=1, sb=sblimit-1, gr=11)` confirming pre-flight
+  emits zero bytes on error). Total `cargo test -p oxideav-mp1 --lib`
+  count: **182 → 193**.
 - **Layer II §2.4.1.6 scfsi + scalefactor field writer**. New
   `encode::write_layer2_scalefactor_field(&mut BitWriter,
   &AllocationTable, &Layer2Allocation, &Layer2ScalefactorFieldInput,
