@@ -6,6 +6,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mp1/releases/tag/v0.0.6) - 2026-05-30
+
+### Other
+
+- Annex D Phase-2 — §D.1 critical-band tables + Step 6/7 psy formulae
+- §2.4.1.6 / §2.4.3.3.4 Layer II SAMPLES region writer
+- §2.4.1.6 Layer II scfsi + scalefactor field writer
+- §2.4.1.6 Layer II allocation-field writer
+- §2.4.2.3 Layer II frame-header writer
+- §C.1.5.2.7 Layer II bit-allocation core + Table C.5 SNR ladder
+- LSF stereo round-trip + planar S16P encoder input coverage
+- optional §2.4.1.4 CRC emission on the Layer I encode side
+- verify §2.4.3.1 CRC-16 for Layer II (header bits 16…31 + alloc + scfsi)
+- Layer II (mp2) audio_data decode — PCM-match vs ffmpeg
+- selectable §2.4.3.1 CRC concealment (mute / repeat-previous)
+- verify §2.4.3.1 CRC-16 error_check + mute concealment
+- add direct factory API (decoder/encoder modules)
+- MPEG-2 LSF Layer I support (16 / 22.05 / 24 kHz)
+- clean-room Layer I encoder + self-roundtrip tests
+- complete Layer I decode to PCM (rescale + synthesis filterbank)
+- Layer I audio-data decode to requantized subband samples
+- fix redundant intra-doc link on Error::HeaderError ref
+- clean-room Layer I frame-header foundation (ISO/IEC 11172-3)
+- orphan rebuild — clean-room reset 2026-05-24
+
 ### Added
 
 - **Annex D — Psychoacoustic Model 1 building blocks**. New
