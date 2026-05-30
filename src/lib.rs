@@ -76,6 +76,7 @@ pub mod decoder;
 pub mod encode;
 pub mod encoder;
 pub mod header;
+pub mod psy;
 pub mod synthesis;
 pub mod tables;
 pub mod tables_layer2;

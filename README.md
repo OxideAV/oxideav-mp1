@@ -395,7 +395,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-193 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+222 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
@@ -477,23 +477,30 @@ default factory still keeps `protection_bit == 1` for byte-compatible
 output, opt in to flip the bit and have the encoder write the matching
 §2.4.3.1 CRC word.
 
-2. The **Annex D psychoacoustic models** are not implemented: the
-   encoder's bit allocator is signal-energy-driven rather than
-   perceptually driven. The staged 157-page `ISO_IEC_11172-3-MP3-1993.pdf`
-   carries the Annex D §D.1 (Psychoacoustic Model 1) prose — the
-   nine-step SMR algorithm, the masking-index / masking-function
-   formulae, the tonal/non-tonal labelling rules — in readable text,
-   but the essential numeric tables (D.1a/b/c "Frequencies, critical
-   band rates and absolute threshold" and D.2a/b/c "Critical band
-   boundaries" for Layer I) appear **only in an OCR-corrupted text
-   layer** where digits and decimal separators are unreliable
-   (e.g. index `7` rendered as `I`, `74` as `14`, `375,00` as
-   `315,oo`, threshold values mixing comma and period separators).
-   Transcribing a perceptual threshold table from that render would
-   silently introduce numeric errors with no clean source to validate
-   against, so the perceptual model is a DOCS-GAP awaiting clean
-   Annex D table renders (mirroring the existing `annex-b-renders/`
-   PNGs that unblocked Tables B.1 and B.3).
+2. **Annex D psychoacoustic models — partially unblocked, allocator
+   still energy-driven.** As of r191 the docs collaborator has
+   staged 200-DPI page renders for the dense Annex D tables under
+   `docs/audio/mp3/annex-d-renders/`, and the companion text extract
+   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` carries
+   the text-readable portions of §D.1 verbatim. The first batch of
+   Phase-2 building blocks is now in tree in the new [`psy`] module:
+   **Tables D.2a–f** (critical-band boundaries for Layer I and
+   Layer II at 32 / 44,1 / 48 kHz) as `psy::critical_band_table`,
+   the closed-form Step 6 masking-index `av_tm` / `av_nm`, the
+   four-piece Step 6 masking-function `vf(dz, X)`, the composite
+   Step 6 `LT_{tm,nm}` individual thresholds, the Step 7
+   power-domain `LTg` global-threshold sum, and the 33-row Table
+   D.5 coder partition table. The encoder's bit allocator itself
+   is **still** signal-energy-driven — wiring `LTg` into the SMR
+   loop additionally requires Tables **D.1a–f** (threshold in
+   quiet `LTq`) and the Model-2 Tables **D.3a–c** + **D.4a–c**
+   (calculation partition `ωlow / ωhigh / bval / minval / TMN` and
+   per-FFT-line absolute threshold), and those four-column dense
+   tables still live behind PNG renders the text layer does not
+   reliably extract. They are therefore DOCS-GAP awaiting a
+   higher-DPI or differently-OCR'd render pass, mirroring the
+   existing `annex-b-renders/` PNG → text transcription cycle that
+   unblocked Tables B.1 / B.3.
 
 ## License
 

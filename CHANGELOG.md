@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D — Psychoacoustic Model 1 building blocks**. New
+  `psy` module stages the text-extractable portions of ISO/IEC
+  11172-3:1993 Annex D for a future perceptually-driven encoder
+  allocator: **Tables D.2a–f** (critical-band boundaries — fully
+  text-extracted; 24/25/26 bands for Layer I at 32/44,1/48 kHz,
+  25/27/27 bands for Layer II at the same rates) exposed as
+  `psy::critical_band_table(Layer, fs) -> Option<&'static
+  [CriticalBand]>`; the **Step 6 closed-form masking-index**
+  `av_tm = -1.525 − 0.275·z − 4.5 dB` /
+  `av_nm = -1.525 − 0.175·z − 0.5 dB` as
+  `psy::masking_index_tonal(z)` / `psy::masking_index_non_tonal(z)`;
+  the **Step 6 four-piece masking-function** `vf(dz, X)` (low-far,
+  low-near, high-near, high-far) as `psy::masking_function(dz, x_db)
+  -> Option<f64>` returning `None` outside the spec's
+  `-3 ≤ dz < 8` Bark window; the composite individual thresholds
+  `psy::individual_threshold_tonal` / `…_non_tonal`; the
+  **Step 7 global-threshold power-domain sum**
+  `LTg = 10·log10(10^(LTq/10) + Σ 10^(LT/10))` as
+  `psy::global_threshold_db(ltq, tonal, non_tonal)`; and **Table
+  D.5** (the Layer I / Layer II coder partition table) as the 33-row
+  `psy::CODER_PARTITIONS` array. **Tables D.1a–f, D.3a–c and D.4a–c
+  are still PNG-only renders** and are deliberately NOT in tree —
+  Annex D's threshold-in-quiet `LTq` and the Model 2 calculation
+  partition + per-line absolute-threshold tables remain DOCS-GAP
+  pending high-DPI text-extractable renders, and the existing
+  signal-energy-driven [`encode::allocate_bits`] path is therefore
+  unchanged. 29 new lib-tests cover: D.2 band counts matching the
+  §D.1 prose (24/25/26 + 25/27/27), strict monotonicity of every
+  table on each of the three columns, endpoint values for D.2a /
+  D.2c / D.2d transcribed verbatim from the staged extract, every
+  band's top-edge frequency below the sampling-frequency Nyquist,
+  Annex D's MPEG-1-only scope (LSF rates 16 / 22.05 / 24 kHz are
+  rejected with `None`), each `av` formula at `z = 0` against the
+  closed-form constants, `av_tonal < av_non_tonal` for every
+  `z ≥ 0`, monotonic decay of both `av` functions over the band
+  range, classification of `dz` into each of the four `vf` branches
+  at every interval boundary (including the exact `dz = -1` / `0` /
+  `1` corners), the high-near branch matching `-17 · dz`
+  irrespective of `X`, the low-near branch passing through the
+  origin with slope `(0.4·X + 6)`, the low-far and high-far branches
+  matching their level-dependent closed forms, the masker-ignored
+  region returning `None`, the composite `LT_{tm,nm} = X + av + vf`
+  identity, the global-threshold reducing to `LTq` with no maskers,
+  two equal-dB powers summing to the textbook
+  `10·log10(2) ≈ 3.0103 dB` headroom, and the loudest-term-dominance
+  bound; plus Table D.5's 33-row length, `width = 0` for
+  partitions 0–12 / `width = 1` for 13–32, strictly monotonic
+  boundaries, and the +16 boundary step from `n = 1`. Total
+  `cargo test -p oxideav-mp1 --lib` count: **193 → 222**.
 - **Layer II §2.4.1.6 / §2.4.3.3.4 SAMPLES region writer**. New
   `encode::write_layer2_samples_field(&mut BitWriter, &AllocationTable,
   &Layer2Allocation, &Layer2SamplesFieldInput, nch, bound) ->
