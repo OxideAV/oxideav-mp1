@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **§C.1.5.1.4 Layer II scalefactor extraction** — new
+  [`select_layer2_scalefactors`] and supporting
+  [`layer2_subband_peak_per_part`] helpers compute the per-(ch, sb,
+  part) Table 3-B.1 scalefactor indices an encoder needs to populate
+  [`Layer2ScalefactorFieldInput::scalefactor_indices`]. The 36
+  analysed sub-band samples are split into three 12-slot §2.4.2.6
+  scalefactor parts (slots 0..12 / 12..24 / 24..36); for each part
+  the maximum of the absolute value is taken and fed through
+  [`select_scalefactor`] (§C.1.5.1.4: "the lowest value in Table
+  B.1 … which is larger than this maximum"). New
+  [`Layer2ScalefactorIndices`] and [`Layer2SubbandPeaks`] type aliases
+  match the §2.4.1.6 scalefactor-field input shape so the extracted
+  indices flow into [`write_layer2_scalefactor_field`] unchanged. The
+  SCFSI Table C.4 collapse remains a DOCS-GAP; callers continue to
+  emit `scfsi == 0b00` (three independent scalefactors). Five new
+  unit tests pin the part windowing, the `nch`/`sblimit` masking, the
+  per-part agreement with [`select_scalefactor`], the all-zero
+  fallback to the tiniest-multiplier index `62`, and a full extractor
+  → §2.4.1.6 field-writer → [`BitReader`] round-trip.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-mp1/releases/tag/v0.0.6) - 2026-05-30
 
 ### Other

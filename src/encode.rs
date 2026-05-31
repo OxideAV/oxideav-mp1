@@ -399,6 +399,121 @@ fn allocation_code(nb: u8) -> u8 {
     }
 }
 
+// ---- Layer II scalefactor extraction (§C.1.5.1.4 per part) -----
+
+/// Per-(ch, sb, part) Table 3-B.1 scalefactor *indices* the §2.4.1.6
+/// scalefactor field consumes. One index per scalefactor part: part 0
+/// covers slot range `0..12`, part 1 `12..24`, part 2 `24..36`
+/// (§2.4.2.6 / §2.4.3.3.2 — "three equal parts of 12 subband samples").
+///
+/// `indices[ch][sb][part]` is in `0..=62`; index `63` is the §2.4.2.6
+/// "undefined" reserved code and is never produced.
+pub type Layer2ScalefactorIndices = [[[u8; 3]; SUBBANDS]; 2];
+
+/// Per-(ch, sb, part) peak (maximum absolute analyzed sub-band sample)
+/// across the 12 sample-slots belonging to a single §2.4.2.6
+/// scalefactor part. The shape matches [`Layer2ScalefactorIndices`].
+///
+/// `peaks[ch][sb][part]` is the input quantity §C.1.5.1.4 calls
+/// "the maximum of the absolute value of these 12 samples", taken over
+/// the part-`part` granules (`gr in part*4 .. (part+1)*4`, three
+/// samples per granule).
+pub type Layer2SubbandPeaks = [[[f64; 3]; SUBBANDS]; 2];
+
+/// Compute the §C.1.5.1.4 per-part peak amplitudes for one Layer II
+/// frame.
+///
+/// `subbands[ch][sb]` is the 36-slot analysed sub-band trace for one
+/// (ch, sb), laid out `[s_0, s_1, …, s_35]` to match the decoder-side
+/// `Layer2Subband::samples` storage and the encoder analysis-filter
+/// output order (slot-major: slot 0 is the oldest, slot 35 the newest
+/// in the frame). Only the first `nch` rows are read; only the
+/// `0..sblimit` columns receive a non-zero peak (subbands above
+/// `sblimit` are §2.4.3.3.1 "forced to zero" by both sides and never
+/// carry a scalefactor).
+///
+/// The 36 slots are split into three §2.4.2.6 scalefactor parts of 12
+/// slots each: part `p` covers `slot in p*12 .. (p+1)*12`. The returned
+/// peak is the maximum of `|s_slot|` over that range. Above-`sblimit`
+/// and above-`nch` cells are zero.
+// The (ch, sb, part, slot) walk is naturally index-driven (the §2.4.2.6
+// part windowing is "slot range part*12..(part+1)*12"); an iterator
+// rewrite would obscure the spec mapping.
+#[allow(clippy::needless_range_loop)]
+pub fn layer2_subband_peak_per_part(
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    nch: usize,
+    sblimit: usize,
+) -> Layer2SubbandPeaks {
+    let mut peaks: Layer2SubbandPeaks = [[[0.0f64; 3]; SUBBANDS]; 2];
+    let nch = nch.min(2);
+    let sblimit = sblimit.min(SUBBANDS);
+    for ch in 0..nch {
+        for sb in 0..sblimit {
+            for part in 0..3 {
+                let mut m = 0.0f64;
+                for slot in part * 12..(part + 1) * 12 {
+                    let a = subbands[ch][sb][slot].abs();
+                    if a > m {
+                        m = a;
+                    }
+                }
+                peaks[ch][sb][part] = m;
+            }
+        }
+    }
+    peaks
+}
+
+/// Extract the per-(ch, sb, part) Table 3-B.1 scalefactor indices for
+/// one Layer II frame (§C.1.5.1.4 applied to each §2.4.2.6 scalefactor
+/// part independently).
+///
+/// For every (ch, sb, part) the maximum of the absolute value of the
+/// 12 sub-band samples belonging to that part is determined, then
+/// [`select_scalefactor`] picks the *lowest Table 3-B.1 value larger
+/// than this maximum* (equivalently, the *highest* index in `0..=62`
+/// whose multiplier still exceeds the peak — the table is monotonically
+/// decreasing). For all-zero parts the all-largest-index `62` is
+/// returned, mirroring the Layer I helper's "tiniest scalefactor"
+/// fallback.
+///
+/// The returned indices are intended to populate
+/// [`Layer2ScalefactorFieldInput::scalefactor_indices`] directly; the
+/// SCFSI selection that may collapse them to one or two values is a
+/// separate step (Table C.4 — DOCS-GAP) and is the caller's
+/// responsibility. Writing `scfsi == 0b00` (three independent
+/// scalefactors) consumes all three indices as produced.
+///
+/// `subbands[ch][sb]` carries the 36 analysed sub-band sample values
+/// the encoder's [`AnalysisFilter`] has produced for the frame, in
+/// slot-major order; the slot-to-part split is `part = slot / 12`.
+/// Only the first `nch` rows and the `0..sblimit` columns of the
+/// returned `[[[u8; 3]; SUBBANDS]; 2]` are meaningful (the rest stay at
+/// the "tiniest scalefactor" `62` index but the §2.4.1.6 writer will
+/// not emit them for `alloc == 0` / above-sblimit subbands).
+// Same (ch, sb, part) index loop as `layer2_subband_peak_per_part`; an
+// iterator rewrite would lose the spec mapping.
+#[allow(clippy::needless_range_loop)]
+pub fn select_layer2_scalefactors(
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    nch: usize,
+    sblimit: usize,
+) -> Layer2ScalefactorIndices {
+    let peaks = layer2_subband_peak_per_part(subbands, nch, sblimit);
+    let mut out: Layer2ScalefactorIndices = [[[MAX_SCF_INDEX as u8; 3]; SUBBANDS]; 2];
+    let nch = nch.min(2);
+    let sblimit = sblimit.min(SUBBANDS);
+    for ch in 0..nch {
+        for sb in 0..sblimit {
+            for part in 0..3 {
+                out[ch][sb][part] = select_scalefactor(peaks[ch][sb][part]);
+            }
+        }
+    }
+    out
+}
+
 // ---- Layer II bit allocation (§C.1.5.2.7) ----------------------
 
 use crate::header::{Emphasis, ModeExtension};
@@ -3722,6 +3837,157 @@ mod tests {
         assert_eq!(bytes.len(), 1);
         // Stream MSB-first: '10 001001' = 0b10001001 = 0x89.
         assert_eq!(bytes[0], 0x89);
+    }
+
+    // ---- §C.1.5.1.4 Layer II scalefactor extraction -------------------
+
+    fn zero_layer2_subbands() -> Box<[[[f64; 36]; SUBBANDS]; 2]> {
+        Box::new([[[0.0f64; 36]; SUBBANDS]; 2])
+    }
+
+    #[test]
+    fn layer2_subband_peak_per_part_splits_36_slots_into_three_12_blocks() {
+        // Per-part peaks must come from disjoint 12-slot windows: part 0
+        // sees only slots 0..12, part 1 only 12..24, part 2 only 24..36.
+        // Stamping a distinct peak into each window and zero elsewhere
+        // proves the windowing is correct.
+        let mut subbands = zero_layer2_subbands();
+        // sb=0, ch=0: peak 0.25 in part 0 (slot 5), 0.50 in part 1
+        // (slot 17), 0.10 in part 2 (slot 30). Other slots stay zero.
+        subbands[0][0][5] = 0.25;
+        subbands[0][0][17] = -0.50; // sign should not matter (absolute)
+        subbands[0][0][30] = 0.10;
+        // sb=7, ch=1: only part 2 carries energy at slot 24.
+        subbands[1][7][24] = 0.75;
+        let peaks = layer2_subband_peak_per_part(&subbands, 2, SUBBANDS);
+        assert_eq!(peaks[0][0][0], 0.25);
+        assert_eq!(peaks[0][0][1], 0.50);
+        assert_eq!(peaks[0][0][2], 0.10);
+        assert_eq!(peaks[1][7][0], 0.0);
+        assert_eq!(peaks[1][7][1], 0.0);
+        assert_eq!(peaks[1][7][2], 0.75);
+        // Untouched (ch, sb) cells remain zero.
+        assert_eq!(peaks[0][5][0], 0.0);
+        assert_eq!(peaks[1][0][2], 0.0);
+    }
+
+    #[test]
+    fn layer2_subband_peak_per_part_respects_nch_and_sblimit() {
+        // Cells outside `nch` rows or `0..sblimit` columns must not be
+        // sampled — even when data is sitting there in the input array.
+        let mut subbands = zero_layer2_subbands();
+        // ch=1 should be ignored when nch == 1.
+        subbands[1][0][0] = 0.9;
+        // sb=20 should be ignored when sblimit == 8.
+        subbands[0][20][0] = 0.9;
+        let peaks = layer2_subband_peak_per_part(&subbands, 1, 8);
+        assert_eq!(peaks[1][0][0], 0.0, "ch=1 must be skipped when nch=1");
+        assert_eq!(peaks[0][20][0], 0.0, "sb=20 must be skipped when sblimit=8");
+    }
+
+    #[test]
+    fn select_layer2_scalefactors_matches_layer_i_helper_per_part() {
+        // For each (ch, sb, part) the chosen Table 3-B.1 index must
+        // equal what `select_scalefactor` returns when applied to that
+        // part's peak in isolation — the Layer II extractor is exactly
+        // §C.1.5.1.4 applied three times (once per scalefactor part).
+        let mut subbands = zero_layer2_subbands();
+        subbands[0][3][2] = 0.9; // part 0, sb=3, ch=0
+        subbands[0][3][15] = 0.001; // part 1
+        subbands[0][3][27] = 1.5; // part 2 (over the SCF[1]=1.587… edge)
+        let idx = select_layer2_scalefactors(&subbands, 1, SUBBANDS);
+        // Cross-check each part's index against the per-part peak fed
+        // through the Layer I helper.
+        assert_eq!(idx[0][3][0], select_scalefactor(0.9));
+        assert_eq!(idx[0][3][1], select_scalefactor(0.001));
+        assert_eq!(idx[0][3][2], select_scalefactor(1.5));
+    }
+
+    #[test]
+    fn select_layer2_scalefactors_zero_signal_picks_tiniest_index() {
+        // An all-zero analysed sub-band trace must collapse to the
+        // tiniest-multiplier index (62, value ≈ 1.2e-6 — the smallest
+        // Table 3-B.1 multiplier still > 0). Index 63 is reserved and
+        // never produced.
+        let subbands = zero_layer2_subbands();
+        let idx = select_layer2_scalefactors(&subbands, 2, SUBBANDS);
+        for ch in 0..2 {
+            for sb in 0..SUBBANDS {
+                for part in 0..3 {
+                    assert_eq!(
+                        idx[ch][sb][part], 62,
+                        "zero-signal (ch={ch}, sb={sb}, part={part}) must pick index 62"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_layer2_scalefactors_feeds_write_layer2_scalefactor_field() {
+        // The extractor output is shaped exactly to drop into
+        // [`Layer2ScalefactorFieldInput::scalefactor_indices`]. Build a
+        // small canonical fixture (mono, sb=0, three distinct per-part
+        // peaks that round to three distinct Table 3-B.1 indices), feed
+        // the extractor → field-writer chain, and assert the bytes
+        // round-trip back to the same indices through the decoder
+        // [`crate::decode::BitReader`] when written with `scfsi == 0b00`.
+        use crate::decode::BitReader;
+        use crate::tables_layer2::layer2_bit_allocation_table;
+
+        // Three distinct part peaks that span the SCF table:
+        //   • part 0 peak 0.9 → SCF[3] = 1.0   → index 3
+        //   • part 1 peak 0.4 → SCF[5] = 0.5   → index 5 (next > 0.4)
+        //   • part 2 peak 0.1 → SCF[9] = 0.25 / SCF[10] = 0.198 / etc.
+        // We don't hard-code the exact indices — we re-derive them via
+        // `select_scalefactor` to keep the test honest against any
+        // future Table 3-B.1 audit. The cardinal property under test is
+        // that the SAME indices flow through the §2.4.1.6 field writer.
+        let mut subbands = zero_layer2_subbands();
+        subbands[0][0][0] = 0.9; // part 0
+        subbands[0][0][13] = 0.4; // part 1
+        subbands[0][0][29] = 0.1; // part 2
+        let idx = select_layer2_scalefactors(&subbands, 1, SUBBANDS);
+        let expect = [
+            select_scalefactor(0.9),
+            select_scalefactor(0.4),
+            select_scalefactor(0.1),
+        ];
+        assert_eq!(idx[0][0], expect);
+
+        // Allocate only sb=0 so the writer emits exactly one
+        // (scfsi, scf0, scf1, scf2) tuple — 2 + 3·6 = 20 bits.
+        let header = header_l2(44_100, 64, Mode::SingleChannel);
+        let table = layer2_bit_allocation_table(&header);
+        let bound = table.sblimit();
+        let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+        let nbal0 = table.nbal(0);
+        for a in 1u8..(1u8 << nbal0) {
+            if table.quant_class(0, a).is_some() {
+                alloc[0][0] = a;
+                break;
+            }
+        }
+        let mut input = Layer2ScalefactorFieldInput::default();
+        input.scfsi[0][0] = 0b00; // emit all three parts
+        input.scalefactor_indices[0][0] = idx[0][0];
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &input, 1, bound).expect("write");
+        let bytes = bw.finish();
+        // Exactly 20 bits → 3 bytes with 4 trailing pad bits.
+        assert_eq!(bytes.len(), 3);
+        // Read it back as the decoder would.
+        let mut rd = BitReader::new(&bytes);
+        let scfsi = rd.read_bits(2).expect("scfsi");
+        assert_eq!(scfsi, 0b00);
+        for part in 0..3 {
+            let i = rd.read_bits(6).expect("scf") as u8;
+            assert_eq!(
+                i, idx[0][0][part],
+                "round-trip part={part} expected={} got={i}",
+                idx[0][0][part]
+            );
+        }
     }
 
     // ---- §2.4.1.6 / §2.4.3.3.4 SAMPLES region writer ------------------

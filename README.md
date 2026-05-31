@@ -331,6 +331,38 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     (still a PDF-image DOCS-GAP, hence the writer takes the SCFSI
     codes as caller input).
   - Total `cargo test -p oxideav-mp1 --lib` count: **182 → 193**.
+- **Layer II scalefactor extraction** (§C.1.5.1.4 per part): a clean-room
+  encoder-side helper that turns the 36 analysed sub-band samples of
+  one Layer II frame into the three Table 3-B.1 scalefactor *indices*
+  the §2.4.1.6 scalefactor field consumes per (ch, sb). The 36 slots
+  are split into the three §2.4.2.6 / §2.4.3.3.2 scalefactor parts
+  (slots `0..12`, `12..24`, `24..36` — "three equal parts of 12 subband
+  samples"); for each part the maximum of the absolute value of the 12
+  samples is determined, then `select_scalefactor` picks "the lowest
+  value in Table B.1 … which is larger than this maximum". Exposed as
+  `encode::select_layer2_scalefactors(subbands, nch, sblimit) ->
+  Layer2ScalefactorIndices` plus the per-part-peak primitive
+  `encode::layer2_subband_peak_per_part(subbands, nch, sblimit) ->
+  Layer2SubbandPeaks`; both return shapes drop straight into
+  `Layer2ScalefactorFieldInput::scalefactor_indices` so the per-part
+  indices flow into `write_layer2_scalefactor_field` unchanged when
+  the encoder writes `scfsi == 0b00` (three independent scalefactors —
+  the Table C.4 SCFSI collapse remains a PDF-image DOCS-GAP). New
+  `Layer2ScalefactorIndices = [[[u8; 3]; SUBBANDS]; 2]` and
+  `Layer2SubbandPeaks = [[[f64; 3]; SUBBANDS]; 2]` type aliases name
+  the shape callers see.
+  - Five new lib-tests cover: the part-windowing split (stamping
+    distinct peaks into disjoint 12-slot windows and asserting each
+    part recovers only its own peak); the `nch` / `sblimit` masking
+    (peaks outside the active rows/columns stay zero even when data is
+    present); the per-part agreement with `select_scalefactor` (three
+    distinct peaks per part, three distinct indices); the all-zero
+    fallback to the tiniest-multiplier index `62` (index `63` is
+    §2.4.2.6 reserved and never produced); and a full extractor →
+    §2.4.1.6 field-writer → `BitReader` round-trip on a mono single-
+    subband fixture (3 bytes / 20 bits — scfsi + three scalefactors,
+    recovered bit-exact).
+  - Total `cargo test -p oxideav-mp1 --lib` count: **222 → 227**.
 - **Layer II bit allocation core** (§C.1.5.2.7): the iterative
   Layer-II allocator that walks each subband's Table 3-B.2x column
   ladder (skipping `-` cells), accounting for the §2.4.2.1 frame
