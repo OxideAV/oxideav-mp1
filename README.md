@@ -363,6 +363,36 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     subband fixture (3 bytes / 20 bits — scfsi + three scalefactors,
     recovered bit-exact).
   - Total `cargo test -p oxideav-mp1 --lib` count: **222 → 227**.
+- **Annex D Phase-3 — Step 3 `LTq` offset + Model 2 spreading
+  pieces**: closed-form helpers from the text-extractable portions of
+  Annex D continue to land in the [`psy`] module without touching the
+  decoder or the energy-driven allocator. `psy::ltq_offset_db(kbps)`
+  encodes the §D.1 Step 3 prose `-12 dB for bit rates >= 96 kbits/s
+  and 0 dB for bit rates < 96 kbits/s per channel` — the `kbps`
+  argument is the **per-channel** rate, matching the spec wording, and
+  the boundary at `96` is inclusive on the `-12 dB` side
+  (`ltq_offset_db(95) == 0`, `ltq_offset_db(96) == -12`). The clause
+  D.2 Model 2 spreading-function `tmpx` / `x` / post-step `sprdngf`
+  triplet is staged as `psy::model2_tmpx(j, i)`, `psy::model2_x(tmpx)`
+  and `psy::sprdngf_from_tmpy(tmpy)`: `tmpx = 1.05 · (j − i)`, `x = 8
+  · min((tmpx − 0.5)² − 2·(tmpx − 0.5), 0)` (peaks at `tmpx = 0.5`,
+  zero again at `tmpx = 2.5`, clamped non-positive everywhere), and
+  `sprdngf = 0` when `tmpy < −100 dB` else `10^(tmpy/10)`. The
+  intermediate `tmpy = …` line that bridges `x` to `sprdngf` is
+  typeset as a PDF image and is the remaining Model 2 DOCS-GAP — the
+  legible pieces around it are now in tree so once `tmpy` becomes
+  text-extractable the missing step plugs straight in.
+  - Fifteen new lib-tests cover: every per-channel rate from 8 to
+    448 kbit/s mapped to the right offset, the 95/96 boundary, the
+    `tmpx` sign convention (`j > i ⇒ tmpx > 0`), the `model2_x`
+    peak / zero-again points, the non-positivity clamp across
+    `[-3, 10]`, the `(0.5, 2.5)` strictly-negative interval matching
+    the closed form, the `tmpx ≤ 0.5` and `tmpx ≥ 2.5` clamp-to-zero
+    regions, the `sprdngf` cutoff for `tmpy < -100`, the `tmpy = -100`
+    inclusive boundary (`10^-10`), the `10^(tmpy/10)` conversion at a
+    handful of legible levels, and monotonicity of `sprdngf` in `tmpy`
+    inside the active region.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **227 → 242**.
 - **Layer II bit allocation core** (§C.1.5.2.7): the iterative
   Layer-II allocator that walks each subband's Table 3-B.2x column
   ladder (skipping `-` cells), accounting for the §2.4.2.1 frame
@@ -427,7 +457,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-222 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+242 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
@@ -514,25 +544,32 @@ output, opt in to flip the bit and have the encoder write the matching
    staged 200-DPI page renders for the dense Annex D tables under
    `docs/audio/mp3/annex-d-renders/`, and the companion text extract
    `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` carries
-   the text-readable portions of §D.1 verbatim. The first batch of
-   Phase-2 building blocks is now in tree in the new [`psy`] module:
+   the text-readable portions of §D.1 verbatim. The Phase-2 + Phase-3
+   building blocks are now in tree in the [`psy`] module:
    **Tables D.2a–f** (critical-band boundaries for Layer I and
    Layer II at 32 / 44,1 / 48 kHz) as `psy::critical_band_table`,
    the closed-form Step 6 masking-index `av_tm` / `av_nm`, the
    four-piece Step 6 masking-function `vf(dz, X)`, the composite
    Step 6 `LT_{tm,nm}` individual thresholds, the Step 7
-   power-domain `LTg` global-threshold sum, and the 33-row Table
-   D.5 coder partition table. The encoder's bit allocator itself
-   is **still** signal-energy-driven — wiring `LTg` into the SMR
-   loop additionally requires Tables **D.1a–f** (threshold in
-   quiet `LTq`) and the Model-2 Tables **D.3a–c** + **D.4a–c**
-   (calculation partition `ωlow / ωhigh / bval / minval / TMN` and
-   per-FFT-line absolute threshold), and those four-column dense
-   tables still live behind PNG renders the text layer does not
-   reliably extract. They are therefore DOCS-GAP awaiting a
-   higher-DPI or differently-OCR'd render pass, mirroring the
-   existing `annex-b-renders/` PNG → text transcription cycle that
-   unblocked Tables B.1 / B.3.
+   power-domain `LTg` global-threshold sum, the 33-row Table D.5
+   coder partition table, the **Step 3 `LTq` bit-rate offset rule**
+   (`psy::ltq_offset_db`: `−12 dB` for per-channel rates `≥ 96
+   kbit/s`, `0 dB` below), and the **clause D.2 Model 2 spreading
+   function** text-extractable pieces (`psy::model2_tmpx`,
+   `psy::model2_x`, and the post-step `psy::sprdngf_from_tmpy`
+   cutoff `sprdngf = 0` when `tmpy < −100 dB`, else `10^(tmpy/10)`).
+   The encoder's bit allocator itself is **still** signal-energy-
+   driven — wiring `LTg` into the SMR loop additionally requires
+   Tables **D.1a–f** (threshold in quiet `LTq`) and the Model-2
+   Tables **D.3a–c** + **D.4a–c** (calculation partition `ωlow /
+   ωhigh / bval / minval / TMN` and per-FFT-line absolute threshold),
+   and those four-column dense tables still live behind PNG renders
+   the text layer does not reliably extract. They are therefore
+   DOCS-GAP awaiting a higher-DPI or differently-OCR'd render pass,
+   mirroring the existing `annex-b-renders/` PNG → text transcription
+   cycle that unblocked Tables B.1 / B.3. The Model 2 `tmpy = …`
+   intermediate line that bridges `x` to `sprdngf` is similarly
+   typeset as an image in the PDF and is part of the same DOCS-GAP.
 
 ## License
 

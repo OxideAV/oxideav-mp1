@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Phase-3 — Step 3 `LTq` offset rule + Model 2 spreading
+  function pieces.** The text-extractable Annex D building blocks
+  beyond Step 6/7 are now staged in [`psy`]:
+  - **`psy::ltq_offset_db(bit_rate_per_channel_kbps)`** — Annex D
+    Step 3 offset applied to the §D.1 threshold-in-quiet `LTq(i)`
+    column: `-12 dB` for per-channel rates `>= 96 kbits/s`, `0 dB`
+    below. The spec wording draws the line at the per-channel rate
+    inclusive of 96, exactly matching the rule's literal text.
+  - **`psy::model2_tmpx(j_bark, i_bark)`** — clause D.2
+    Psychoacoustic Model 2 spreading-function primary term
+    `tmpx = 1.05 · (j − i)` (text-extracted verbatim).
+  - **`psy::model2_x(tmpx)`** — clause D.2 secondary term
+    `x = 8 · min((tmpx − 0.5)^2 − 2·(tmpx − 0.5), 0)`. Peaks at
+    `tmpx = 0.5` (returns 0), is zero again at `tmpx = 2.5`, and is
+    clamped non-positive everywhere.
+  - **`psy::sprdngf_from_tmpy(tmpy_db)`** — clause D.2 post-step
+    `sprdngf(i,j) = 0` when `tmpy < −100 dB`, else `10^(tmpy/10)`
+    (text-extracted verbatim).
+  - The intermediate `tmpy = …` line that bridges `x` to `sprdngf`
+    is typeset as an image in the PDF and remains a DOCS-GAP; the
+    legible pieces around it are now in tree so once the docs
+    collaborator captures `tmpy` it can be plugged in without
+    further changes to the cutoff.
+  - **+15 unit tests** pin the LTq offset boundary (95 → 0, 96 →
+    −12), the `model2_tmpx` sign convention, the `model2_x` clamp
+    region (`(−∞, 0.5] ∪ [2.5, +∞) → 0`; strictly negative inside
+    `(0.5, 2.5)`), and the `sprdngf` `tmpy = −100` boundary
+    (inclusive on the active side, i.e. `10^−10`).
+
 - **§C.1.5.1.4 Layer II scalefactor extraction** — new
   [`select_layer2_scalefactors`] and supporting
   [`layer2_subband_peak_per_part`] helpers compute the per-(ch, sb,

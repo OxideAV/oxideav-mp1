@@ -1192,6 +1192,108 @@ pub const CODER_PARTITIONS: [CoderPartition; 33] = [
     },
 ];
 
+// -----------------------------------------------------------------
+// Annex D Step 3 — threshold-in-quiet `LTq` bit-rate-dependent offset
+//
+// Quoted verbatim from the staged docs extract (text-layer readable
+// in the PDF):
+//
+//   "An offset depending on the overall bit rate is used for the
+//    absolute threshold. This offset is -12 dB for bit rates >=
+//    96 kbits/s and 0 dB for bit rates < 96 kbits/s per channel."
+//
+// The rule's wording "per channel" controls the comparison threshold:
+// it is the per-channel bit rate that gates which offset applies,
+// matching how the Annex D allocator consumes the budget. The Step 3
+// reading of the §D.1 Table D.1x absolute-threshold column is then
+//
+//   LTq_used(i) = LTq_table(i) + ltq_offset_db(bit_rate_per_channel)
+// -----------------------------------------------------------------
+
+/// Annex D Step 3 — bit-rate-dependent offset applied to the §D.1
+/// threshold-in-quiet `LTq(i)` column.
+///
+/// Returns `-12.0` dB when `bit_rate_per_channel_kbps >= 96`, and
+/// `0.0` dB otherwise. The argument is the **per-channel** bit rate
+/// in kbit/s, as the spec wording specifies. For a stereo / dual /
+/// joint stream the caller divides the overall bit rate by the active
+/// channel count before calling; for mono the overall rate is the
+/// per-channel rate.
+#[inline]
+pub fn ltq_offset_db(bit_rate_per_channel_kbps: u32) -> f64 {
+    if bit_rate_per_channel_kbps >= 96 {
+        -12.0
+    } else {
+        0.0
+    }
+}
+
+// -----------------------------------------------------------------
+// Annex D clause D.2 (Psychoacoustic Model 2) — spreading function
+// closed-form pieces (text-extractable)
+//
+// Quoted verbatim from the staged docs extract (the `tmpx` and `x`
+// lines extract from the PDF text layer; the `tmpy` intermediate
+// line is typeset as an image and remains a DOCS-GAP). The post-step
+// `sprdngf` cutoff is text-extractable.
+//
+//   tmpx = 1,05 * (j - i)         ; i = Bark of signal spread,
+//                                   j = Bark of band spread into
+//   x    = 8 * minimum( (tmpx - 0,5)^2 - 2*(tmpx - 0,5), 0 )
+//   tmpy = [illegible — typeset as image in PDF]
+//   if (tmpy < -100) then sprdngf(i,j) = 0
+//                    else sprdngf(i,j) = 10^(tmpy/10)
+//
+// `model2_tmpx` and `model2_x` ARE staged here; the `tmpy` →
+// `sprdngf` post-step is staged as `sprdngf_from_tmpy` so callers
+// (once `tmpy` becomes text-extractable) can plug a `tmpy` value
+// straight into the legible cutoff. Intentionally absent: the
+// `tmpy` line itself.
+// -----------------------------------------------------------------
+
+/// Model 2 spreading-function `tmpx` term (clause D.2, text-extracted
+/// verbatim): `tmpx = 1.05 · (j - i)`.
+///
+/// `j_bark` is the Bark of the band the masker is spread into; `i_bark`
+/// is the Bark of the signal being spread. The sign convention follows
+/// the spec literally — negative `tmpx` for `j < i`.
+#[inline]
+pub fn model2_tmpx(j_bark: f64, i_bark: f64) -> f64 {
+    1.05 * (j_bark - i_bark)
+}
+
+/// Model 2 spreading-function `x` term (clause D.2, text-extracted
+/// verbatim): `x = 8 · min((tmpx − 0.5)^2 − 2·(tmpx − 0.5), 0)`.
+///
+/// The `min(_, 0)` clamps the dB attenuation to never go positive — `x`
+/// is always `<= 0`. The function peaks at `tmpx = 0.5` (return value
+/// `0`) and is `0` again at `tmpx = 2.5` (`(2.0)^2 − 2·2.0 = 0`).
+#[inline]
+pub fn model2_x(tmpx: f64) -> f64 {
+    let s = tmpx - 0.5;
+    let v = s * s - 2.0 * s;
+    8.0 * v.min(0.0)
+}
+
+/// Model 2 spreading-function post-step (clause D.2, text-extracted
+/// verbatim): given the intermediate `tmpy` (dB), returns the
+/// spreading-function magnitude
+/// `sprdngf(i, j) = 0` when `tmpy < -100`, else `10^(tmpy / 10)`.
+///
+/// `tmpy` itself is the spreading-function dB level; the line that
+/// derives it from `x` / `bval` is rendered as a PDF image and is
+/// **not** captured in this module. Once the docs collaborator stages
+/// a text-extracted `tmpy` formula, the missing piece can be plugged in
+/// without changing the cutoff staged here.
+#[inline]
+pub fn sprdngf_from_tmpy(tmpy_db: f64) -> f64 {
+    if tmpy_db < -100.0 {
+        0.0
+    } else {
+        10f64.powf(tmpy_db / 10.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1546,6 +1648,196 @@ mod tests {
         // (1, 17, 33, 49, …, 513).
         for w in CODER_PARTITIONS[1..].windows(2) {
             assert_eq!(w[1].boundary - w[0].boundary, 16);
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Annex D Step 3 — LTq bit-rate offset
+    // -----------------------------------------------------------
+
+    #[test]
+    fn ltq_offset_below_96_kbps_is_zero() {
+        // Per-channel rates strictly below 96 kbit/s get a 0 dB offset.
+        for &kbps in &[8u32, 16, 32, 48, 64, 80, 95] {
+            assert_eq!(
+                ltq_offset_db(kbps),
+                0.0,
+                "per-channel rate {kbps} kbps should map to 0 dB offset"
+            );
+        }
+    }
+
+    #[test]
+    fn ltq_offset_at_and_above_96_kbps_is_minus_twelve() {
+        // The boundary value 96 kbit/s and every per-channel rate
+        // above it get -12 dB. The spec wording is ">= 96 kbits/s".
+        for &kbps in &[96u32, 112, 128, 160, 192, 224, 256, 320, 384, 448] {
+            assert_eq!(
+                ltq_offset_db(kbps),
+                -12.0,
+                "per-channel rate {kbps} kbps should map to -12 dB offset"
+            );
+        }
+    }
+
+    #[test]
+    fn ltq_offset_boundary_is_inclusive_at_96() {
+        // The spec wording draws the line at ">= 96 kbits/s"
+        // (inclusive), not ">" — 95 stays at 0 dB and 96 jumps to
+        // -12 dB, which is the entire spec-relevant edge case.
+        assert_eq!(ltq_offset_db(95), 0.0);
+        assert_eq!(ltq_offset_db(96), -12.0);
+    }
+
+    // -----------------------------------------------------------
+    // Annex D clause D.2 — Model 2 spreading function (text pieces)
+    // -----------------------------------------------------------
+
+    #[test]
+    fn model2_tmpx_matches_closed_form() {
+        // tmpx = 1.05 * (j - i); sign follows the literal (j - i) order.
+        for &(j, i) in &[(0.0f64, 0.0), (5.0, 3.0), (3.0, 5.0), (12.5, 8.0)] {
+            let got = model2_tmpx(j, i);
+            let want = 1.05 * (j - i);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "model2_tmpx({j}, {i}) = {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_tmpx_sign_matches_spec_order() {
+        // j > i  -> tmpx > 0; j < i -> tmpx < 0; j == i -> 0.
+        assert!(model2_tmpx(5.0, 3.0) > 0.0);
+        assert!(model2_tmpx(3.0, 5.0) < 0.0);
+        assert!((model2_tmpx(4.0, 4.0) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn model2_x_peak_at_tmpx_one_half() {
+        // x = 8 * min((tmpx-0.5)^2 - 2*(tmpx-0.5), 0). At tmpx = 0.5
+        // the inner expression is 0, so x = 0 (the peak — x is clamped
+        // to non-positive).
+        assert!((model2_x(0.5) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn model2_x_zero_again_at_tmpx_two_and_a_half() {
+        // At tmpx = 2.5 the inner s = 2.0, s^2 - 2s = 4 - 4 = 0. The
+        // clamp keeps the value at 0 (the inner is 0, not negative,
+        // so min(0, 0) = 0).
+        assert!((model2_x(2.5) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn model2_x_is_always_non_positive() {
+        // The min(_, 0) clamp guarantees x <= 0 everywhere.
+        for &tmpx in &[-3.0f64, -1.0, 0.0, 0.5, 1.0, 1.5, 2.5, 3.0, 5.0, 10.0] {
+            assert!(
+                model2_x(tmpx) <= 0.0,
+                "model2_x({tmpx}) = {} should be <= 0",
+                model2_x(tmpx)
+            );
+        }
+    }
+
+    #[test]
+    fn model2_x_matches_closed_form_when_inner_negative() {
+        // For tmpx in the (0.5, 2.5) open interval the inner term
+        // (s^2 - 2s) is negative, so the clamp is inactive and x =
+        // 8 * (s^2 - 2s).
+        for &tmpx in &[0.6f64, 1.0, 1.5, 2.0, 2.4] {
+            let s = tmpx - 0.5;
+            let want = 8.0 * (s * s - 2.0 * s);
+            let got = model2_x(tmpx);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "model2_x({tmpx}) = {got}, expected {want}"
+            );
+            // And the value must be strictly negative in this interval.
+            assert!(got < 0.0, "expected x < 0 inside (0.5, 2.5)");
+        }
+    }
+
+    #[test]
+    fn model2_x_clamps_to_zero_below_tmpx_one_half() {
+        // For tmpx < 0.5, s < 0, so s^2 - 2s = s^2 + 2|s| > 0; the
+        // clamp activates and x = 0.
+        for &tmpx in &[-5.0f64, -2.0, -1.0, 0.0, 0.49] {
+            assert_eq!(
+                model2_x(tmpx),
+                0.0,
+                "model2_x({tmpx}) should clamp to 0 below tmpx=0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_x_clamps_to_zero_above_tmpx_two_and_a_half() {
+        // For tmpx > 2.5, s > 2, so s^2 - 2s = s*(s-2) > 0; clamp -> 0.
+        for &tmpx in &[2.51f64, 3.0, 5.0, 10.0, 100.0] {
+            assert_eq!(
+                model2_x(tmpx),
+                0.0,
+                "model2_x({tmpx}) should clamp to 0 above tmpx=2.5"
+            );
+        }
+    }
+
+    #[test]
+    fn sprdngf_from_tmpy_returns_zero_below_minus_100() {
+        // tmpy strictly below -100 dB -> sprdngf = 0 (spec cutoff).
+        for &tmpy in &[-101.0f64, -150.0, -1000.0, f64::MIN] {
+            assert_eq!(
+                sprdngf_from_tmpy(tmpy),
+                0.0,
+                "sprdngf_from_tmpy({tmpy}) should cut off to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn sprdngf_from_tmpy_at_minus_100_is_active() {
+        // tmpy = -100 (boundary) is "not less than -100", so the
+        // 10^(tmpy/10) branch runs and produces 10^-10 — small but
+        // strictly positive.
+        let v = sprdngf_from_tmpy(-100.0);
+        assert!(v > 0.0, "sprdngf at boundary tmpy = -100 should be > 0");
+        assert!((v - 1e-10).abs() < 1e-14);
+    }
+
+    #[test]
+    fn sprdngf_from_tmpy_matches_power_conversion() {
+        // sprdngf = 10^(tmpy/10) for tmpy >= -100. Spot checks at a
+        // few legible levels.
+        for &(tmpy, want) in &[
+            (0.0f64, 1.0f64),
+            (-10.0, 0.1),
+            (-20.0, 0.01),
+            (-30.0, 0.001),
+            (10.0, 10.0),
+        ] {
+            let got = sprdngf_from_tmpy(tmpy);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "sprdngf_from_tmpy({tmpy}) = {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn sprdngf_from_tmpy_is_strictly_monotone_in_tmpy() {
+        // Inside the active region (tmpy >= -100) the conversion is
+        // 10^(tmpy/10), strictly monotone in tmpy.
+        let xs = [-100.0f64, -50.0, -10.0, 0.0, 5.0, 10.0, 20.0];
+        for w in xs.windows(2) {
+            assert!(
+                sprdngf_from_tmpy(w[1]) > sprdngf_from_tmpy(w[0]),
+                "sprdngf not monotone at {} -> {}",
+                w[0],
+                w[1]
+            );
         }
     }
 }
