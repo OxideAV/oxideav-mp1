@@ -104,8 +104,8 @@ pub use encode::{
 };
 pub use encoder::make_encoder_with_crc;
 pub use header::{
-    find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader, HeaderError, Id, Layer, Mode,
-    ModeExtension,
+    detect_free_format_frame_length, find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader,
+    FreeFormatFrameLength, FreeFormatProbeError, HeaderError, Id, Layer, Mode, ModeExtension,
 };
 pub use synthesis::{to_s16, SynthesisFilter};
 pub use tables::{ANALYSIS_WINDOW, QUANT_A, QUANT_B, SCALEFACTORS, SNR_DB, SYNTHESIS_WINDOW};

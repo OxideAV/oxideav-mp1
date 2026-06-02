@@ -494,6 +494,189 @@ pub fn find_sync(buf: &[u8]) -> Option<usize> {
     (0..=buf.len() - 4).find(|&i| FrameHeader::parse(&buf[i..i + 4]).is_ok())
 }
 
+/// Result of a §2.4.3.1 free-format frame-length probe.
+///
+/// When a header carries `bitrate_index == 0b0000` ([`Bitrate::Free`])
+/// the §2.4.2.1 slot-count formula is uninvertible from the header
+/// alone — the §2.4.3.1 prose states this verbatim: *"If the bitrate
+/// index equals '0000', the exact bitrate is not indicated. N can be
+/// determined from the distance between consecutive syncwords and the
+/// value of the padding bit."* This struct carries the recovered slot
+/// count `N`, the implied frame length in bytes, and the back-derived
+/// fixed bitrate in kbit/s (free-format streams hold the bitrate
+/// constant across consecutive frames, so `N` for the current frame
+/// is what the next syncword's offset measures, less the +1 padding
+/// slot when `padding_bit == 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeFormatFrameLength {
+    /// The §2.4.2.1 base slot count `N = floor(L · bitrate / Fs)` for
+    /// this stream, with `L = 12` for Layer I and `L = 144` for
+    /// Layer II (§2.4.3.1 prose). This is the per-frame slot count
+    /// when `padding_bit == 0`; padded frames carry `N + 1` slots.
+    pub base_slot_count: u32,
+    /// Total length of the current frame in bytes, including the
+    /// header (and CRC and padding slot if present). The Layer I slot
+    /// is four bytes and the Layer II slot is one byte (§2.4.2.1).
+    pub frame_length_bytes: u32,
+    /// The fixed-but-unsignalled bitrate in kbit/s, recovered as
+    /// `kbps = N · Fs / (L · 1000)` from the §2.4.3.1 inversion of
+    /// `N = floor(L · bitrate / Fs)`. May be zero when `Fs / (L · 1000)`
+    /// exceeds `N` (the §2.4.3.1 prose does not constrain this case;
+    /// it is reported verbatim so the caller can apply its own
+    /// minimum-bitrate sanity policy).
+    pub bitrate_kbps: u32,
+}
+
+/// Errors that can arise while probing a free-format frame's length
+/// (§2.4.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeFormatProbeError {
+    /// The supplied header does not carry [`Bitrate::Free`]; callers
+    /// should use [`FrameHeader::frame_length_bytes`] for non-free
+    /// frames.
+    NotFreeFormat,
+    /// No next-frame syncword was found in `after_header` whose
+    /// `(ID, layer, sampling_frequency, mode)` matches the current
+    /// frame's. §2.4.3.1 implies the bitrate is held constant across a
+    /// free-format stream; a stream-parameter mismatch in the candidate
+    /// next-frame header is therefore rejected rather than acted on.
+    NoNextSync,
+    /// A candidate next syncword was found, but the distance from the
+    /// current header to it does not factor cleanly into the
+    /// `(N + padding_bit)` slot count §2.4.3.1 prescribes: either the
+    /// distance is below the §2.4.2.1 minimum frame size (four bytes
+    /// for the header alone, six with a CRC) or the §2.4.3.1 prose's
+    /// integer-slot-distance invariant is violated by a Layer I slot
+    /// distance that is not a multiple of four bytes.
+    InconsistentDistance,
+}
+
+impl core::fmt::Display for FreeFormatProbeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FreeFormatProbeError::NotFreeFormat => {
+                write!(f, "header bitrate_index is not 0b0000 (free format)")
+            }
+            FreeFormatProbeError::NoNextSync => {
+                write!(
+                    f,
+                    "no matching next-frame syncword found after the free-format frame"
+                )
+            }
+            FreeFormatProbeError::InconsistentDistance => write!(
+                f,
+                "next-syncword distance does not factor into integer §2.4.3.1 slots"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FreeFormatProbeError {}
+
+/// Probe the byte-distance to the next consecutive syncword to recover
+/// a free-format frame's length (§2.4.3.1).
+///
+/// The §2.4.3.1 prose states verbatim: *"If the bitrate index equals
+/// '0000', the exact bitrate is not indicated. N can be determined
+/// from the distance between consecutive syncwords and the value of
+/// the padding bit."* This helper performs that inversion:
+///
+/// 1. Verify the supplied `header` is in free-format mode
+///    ([`Bitrate::Free`]); the routine is otherwise inapplicable.
+/// 2. Search `after_header` for the next position whose four bytes
+///    parse as a valid header for the same stream — same
+///    `(ID, layer, sampling_frequency, mode)`. §2.4.3.1 implies the
+///    bitrate is held constant across the free-format stream, so a
+///    mismatched stream-parameter candidate is rejected rather than
+///    acted on. Free-format streams are also free of intervening
+///    metadata (no ID3, no Xing tag at this layer of the stack), so
+///    the next syncword is at exactly the next-frame offset.
+/// 3. Compute the slot distance from the start of the current header
+///    to that next syncword (Layer I slot = 4 bytes, Layer II slot = 1
+///    byte, §2.4.2.1) and subtract the current frame's
+///    `padding_bit` (§2.4.3.1) to recover the base slot count `N`.
+/// 4. Report `N`, the current frame's byte length (`(N + padding_bit)
+///    · slot_bytes`), and the back-derived bitrate
+///    `kbps = N · Fs / (L · 1000)` (§2.4.3.1 inverted, `L = 12` for
+///    Layer I, `L = 144` for Layer II).
+///
+/// `after_header` begins immediately after the four bytes of the
+/// current frame's header. The current header's four bytes are NOT
+/// part of `after_header`; the distance computation accounts for the
+/// header bytes internally.
+pub fn detect_free_format_frame_length(
+    header: &FrameHeader,
+    after_header: &[u8],
+) -> Result<FreeFormatFrameLength, FreeFormatProbeError> {
+    if !matches!(header.bitrate, Bitrate::Free) {
+        return Err(FreeFormatProbeError::NotFreeFormat);
+    }
+    let slot_bytes: u32 = match header.layer {
+        Layer::I => LAYER1_SLOT_BYTES,
+        Layer::II => 1,
+    };
+    // The §2.4.3.1 N formula: N = L · bitrate / Fs.
+    let l: u32 = match header.layer {
+        Layer::I => 12,
+        Layer::II => 144,
+    };
+
+    // Scan after_header for the next matching syncword. The offset
+    // we want is the byte position OF THAT SYNCWORD relative to the
+    // start of the CURRENT header; since `after_header` begins right
+    // after the four header bytes we add HEADER_BYTES back in.
+    const HEADER_BYTES: u32 = 4;
+    let mut cursor: usize = 0;
+    while cursor + 4 <= after_header.len() {
+        if let Ok(next) = FrameHeader::parse(&after_header[cursor..cursor + 4]) {
+            // §2.4.3.1: the bitrate is held constant across the
+            // free-format stream, so the next frame must carry the
+            // same stream parameters. Reject candidates that differ.
+            if next.id == header.id
+                && next.layer == header.layer
+                && next.sampling_frequency == header.sampling_frequency
+                && next.mode == header.mode
+            {
+                let distance_bytes = HEADER_BYTES as usize + cursor;
+                let distance_bytes_u32 = match u32::try_from(distance_bytes) {
+                    Ok(v) => v,
+                    Err(_) => return Err(FreeFormatProbeError::InconsistentDistance),
+                };
+                // §2.4.3.1: distance is an integer number of slots.
+                if distance_bytes_u32 % slot_bytes != 0 {
+                    return Err(FreeFormatProbeError::InconsistentDistance);
+                }
+                let slots_total = distance_bytes_u32 / slot_bytes;
+                let padding = u32::from(header.padding);
+                if slots_total <= padding {
+                    return Err(FreeFormatProbeError::InconsistentDistance);
+                }
+                let base_slot_count = slots_total - padding;
+                let frame_length_bytes = distance_bytes_u32;
+                // §2.4.3.1 inverted: kbps = N · Fs / (L · 1000).
+                // Use u64 arithmetic to avoid overflow at the high
+                // end of the ladder.
+                let bitrate_kbps_u64 =
+                    (base_slot_count as u64 * header.sampling_frequency as u64) / (l as u64 * 1000);
+                let bitrate_kbps = u32::try_from(bitrate_kbps_u64).unwrap_or(u32::MAX);
+                return Ok(FreeFormatFrameLength {
+                    base_slot_count,
+                    frame_length_bytes,
+                    bitrate_kbps,
+                });
+            }
+            // Not a stream-matching candidate; keep scanning. Skip
+            // one byte so we can find a candidate that begins one
+            // byte later (free-format frame lengths are not required
+            // to be byte-aligned to anything other than the slot,
+            // and a candidate may share the syncword pattern with
+            // payload bytes).
+        }
+        cursor += 1;
+    }
+    Err(FreeFormatProbeError::NoNextSync)
+}
+
 /// The §2.4.3.1 CRC-16 generator polynomial, expressed as the 16-bit
 /// feedback mask used by the bit-serial shift register.
 ///
@@ -1227,5 +1410,245 @@ mod tests {
         assert_eq!(h.verify_crc(&header, &[0xAB]), None);
         // CRC word present but the allocation field is truncated.
         assert_eq!(h.verify_crc(&header, &[0xAB, 0xCD, 0x00]), None);
+    }
+
+    // ---- §2.4.3.1 free-format frame-length probe -------------------
+
+    #[test]
+    fn free_format_probe_rejects_non_free_header() {
+        // A non-free-format header is not the §2.4.3.1 prose's domain.
+        let header = build_header(1, 0b11, 1, 0b1000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        assert_eq!(
+            detect_free_format_frame_length(&h, &[]),
+            Err(FreeFormatProbeError::NotFreeFormat)
+        );
+    }
+
+    #[test]
+    fn free_format_probe_reports_no_next_sync_when_absent() {
+        // Free-format frame, 44.1 kHz, mono. No next syncword in the
+        // payload — pure noise.
+        let header = build_header(1, 0b11, 1, 0b0000, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        let payload = vec![0xA5u8; 200];
+        assert_eq!(
+            detect_free_format_frame_length(&h, &payload),
+            Err(FreeFormatProbeError::NoNextSync)
+        );
+    }
+
+    #[test]
+    fn free_format_probe_layer1_recovers_n_and_bitrate() {
+        // Layer I, MPEG-1, 32 kHz, mono, no padding, free format.
+        //
+        // §2.4.3.1: N = 12 · bitrate / Fs. Pick a free-format Layer I
+        // stream that would correspond to a 128 kbit/s rate (not on the
+        // fixed ladder for this exercise, but the math is the same):
+        // N = 12 · 128000 / 32000 = 48 slots = 192 bytes.
+        let header = build_header(1, 0b11, 1, 0b0000, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        assert_eq!(h.bitrate, Bitrate::Free);
+        let frame_bytes: u32 = 192;
+        // The payload between two free-format headers is (frame_bytes
+        // - 4) bytes; the next header begins exactly at the
+        // frame-length offset relative to the start of the current
+        // header.
+        let mut payload = vec![0x00u8; (frame_bytes - 4) as usize];
+        // Stamp a small recognisable pattern that does not collide with
+        // the syncword at any byte position.
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x7F).wrapping_add(0x40);
+        }
+        // The next-frame header carries identical stream parameters
+        // (free-format implies the bitrate is held constant — same
+        // (ID, layer, Fs, mode)).
+        let next_header = build_header(1, 0b11, 1, 0b0000, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        payload.extend_from_slice(&next_header);
+        // A few extra trailing bytes after the next header should not
+        // affect detection.
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let probe = detect_free_format_frame_length(&h, &payload).expect("probe");
+        assert_eq!(probe.base_slot_count, 48);
+        assert_eq!(probe.frame_length_bytes, 192);
+        assert_eq!(probe.bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn free_format_probe_layer1_padded_subtracts_one_slot() {
+        // Same as above but with padding_bit == 1: the next syncword
+        // is one slot (four bytes) further away, but `N` itself stays
+        // the same. We construct the next header to begin at offset
+        // 196 (192 + 4) so the probe must subtract the padding slot to
+        // recover N = 48.
+        let header = build_header(1, 0b11, 1, 0b0000, 0b10, 1, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        assert!(h.padding);
+        let next_offset: u32 = 196;
+        let mut payload = vec![0x00u8; (next_offset - 4) as usize];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x7F).wrapping_add(0x40);
+        }
+        let next_header = build_header(1, 0b11, 1, 0b0000, 0b10, 1, 0, 0b11, 0, 0, 1, 0);
+        payload.extend_from_slice(&next_header);
+        let probe = detect_free_format_frame_length(&h, &payload).expect("probe");
+        assert_eq!(probe.base_slot_count, 48);
+        assert_eq!(probe.frame_length_bytes, 196);
+        assert_eq!(probe.bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn free_format_probe_layer2_uses_unit_byte_slot() {
+        // Layer II at 32 kHz: §2.4.3.1 says N = 144 · bitrate / Fs.
+        // Pick a hypothetical 96 kbit/s free-format frame:
+        // N = 144 · 96000 / 32000 = 432 bytes (Layer II slot = 1 byte).
+        let header = build_header(1, 0b10, 1, 0b0000, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        assert_eq!(h.layer, Layer::II);
+        let frame_bytes: u32 = 432;
+        let mut payload = vec![0u8; (frame_bytes - 4) as usize];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x3F).wrapping_add(0x10);
+        }
+        let next_header = build_header(1, 0b10, 1, 0b0000, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        payload.extend_from_slice(&next_header);
+        let probe = detect_free_format_frame_length(&h, &payload).expect("probe");
+        assert_eq!(probe.base_slot_count, 432);
+        assert_eq!(probe.frame_length_bytes, 432);
+        assert_eq!(probe.bitrate_kbps, 96);
+    }
+
+    #[test]
+    fn free_format_probe_rejects_stream_parameter_mismatch() {
+        // Free-format Layer I frame at 44.1 kHz, mono. The next header
+        // in the buffer is on a DIFFERENT sampling frequency — the
+        // probe must walk past it and either find a matching one or
+        // report NoNextSync. We arrange no matching follow-up.
+        let header = build_header(1, 0b11, 1, 0b0000, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        let mut payload = vec![0u8; 100];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x7F).wrapping_add(0x40);
+        }
+        // Inject a 32 kHz header (sampling 0b10) instead of 44.1
+        // (0b00) — this candidate must be rejected.
+        let wrong_header = build_header(1, 0b11, 1, 0b0000, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        payload.extend_from_slice(&wrong_header);
+        // …and no other syncword in the rest of the payload.
+        payload.extend_from_slice(&[0xFEu8, 0xFE, 0xFE, 0xFE]);
+        assert_eq!(
+            detect_free_format_frame_length(&h, &payload),
+            Err(FreeFormatProbeError::NoNextSync)
+        );
+    }
+
+    #[test]
+    fn free_format_probe_layer1_rejects_non_slot_distance() {
+        // Layer I slot = 4 bytes (§2.4.2.1). A next syncword whose
+        // byte-distance from the current header is not a multiple of
+        // four breaks the §2.4.3.1 integer-slot-distance invariant
+        // and must be rejected.
+        //
+        // Build a payload such that the next syncword starts at byte
+        // offset 191 from the current header (191 = 4·47 + 3 — not a
+        // slot multiple).
+        let header = build_header(1, 0b11, 1, 0b0000, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        // After-header length: 191 - 4 = 187 bytes of pre-sync filler.
+        let mut payload = vec![0x55u8; 187];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x3F).wrapping_add(0x10);
+        }
+        let next_header = build_header(1, 0b11, 1, 0b0000, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        payload.extend_from_slice(&next_header);
+        assert_eq!(
+            detect_free_format_frame_length(&h, &payload),
+            Err(FreeFormatProbeError::InconsistentDistance)
+        );
+    }
+
+    #[test]
+    fn free_format_probe_layer1_finds_next_syncword_at_min_distance() {
+        // Smallest sensible free-format Layer I frame: the four-byte
+        // header alone (no audio payload, no CRC). This is degenerate
+        // but exercises the boundary of the probe.
+        //
+        // base_slot_count = 1, frame_length_bytes = 4 (one Layer I
+        // slot), bitrate = 1 · Fs / (12 · 1000) — with Fs = 48 000 the
+        // bitrate is 4 kbit/s. This is below any conformant Layer I
+        // bitrate but the probe reports it verbatim per the spec
+        // text (the spec does not constrain a minimum here).
+        let header = build_header(1, 0b11, 1, 0b0000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        let next_header = build_header(1, 0b11, 1, 0b0000, 0b01, 0, 0, 0b11, 0, 0, 1, 0);
+        let probe = detect_free_format_frame_length(&h, &next_header).expect("probe");
+        assert_eq!(probe.base_slot_count, 1);
+        assert_eq!(probe.frame_length_bytes, 4);
+        assert_eq!(probe.bitrate_kbps, 4);
+    }
+
+    #[test]
+    fn free_format_probe_layer2_padded_subtracts_one_byte() {
+        // Layer II at 24 kHz LSF, 64 kbit/s would give
+        // N = 144 · 64000 / 24000 = 384 bytes. With padding_bit = 1,
+        // the next syncword is at 385 bytes — the probe must subtract
+        // the one-byte padding slot.
+        let header = build_header(0, 0b10, 1, 0b0000, 0b01, 1, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        assert_eq!(h.id, Id::Mpeg2Lsf);
+        assert_eq!(h.sampling_frequency, 24_000);
+        let next_offset: u32 = 385;
+        let mut payload = vec![0u8; (next_offset - 4) as usize];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x3F).wrapping_add(0x10);
+        }
+        let next_header = build_header(0, 0b10, 1, 0b0000, 0b01, 1, 0, 0b11, 0, 0, 1, 0);
+        payload.extend_from_slice(&next_header);
+        let probe = detect_free_format_frame_length(&h, &payload).expect("probe");
+        assert_eq!(probe.base_slot_count, 384);
+        assert_eq!(probe.frame_length_bytes, 385);
+        assert_eq!(probe.bitrate_kbps, 64);
+    }
+
+    #[test]
+    fn free_format_probe_skips_past_syncword_pattern_in_payload() {
+        // A free-format payload byte may incidentally start a valid
+        // 32-bit header by chance. The probe must accept the first
+        // *matching* candidate; this test confirms it scans
+        // byte-by-byte (not 4-byte-by-4-byte) and lands on the right
+        // next-syncword position even when the payload has an
+        // intervening non-matching candidate sync earlier on.
+        //
+        // Build the current frame at 44.1 kHz mono. Plant a candidate
+        // 32 kHz header at offset 96 in the payload (rejected as
+        // mismatching), then the real next 44.1 kHz header at offset
+        // 196 — total frame length 200 bytes.
+        let header = build_header(1, 0b11, 1, 0b0000, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let h = FrameHeader::parse(&header).unwrap();
+        let mut payload = vec![0u8; 92]; // 92 + 4 (header) = 96 offset
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i as u8) & 0x3F).wrapping_add(0x10);
+        }
+        // Mismatching candidate (32 kHz) at offset 96.
+        payload.extend_from_slice(&build_header(
+            1, 0b11, 1, 0b0000, 0b10, 0, 0, 0b11, 0, 0, 1, 0,
+        ));
+        // Fill until offset 196 from header start (so after-header
+        // offset 192).
+        let target = 196usize;
+        while 4 + payload.len() < target {
+            payload.push(0x33);
+        }
+        // The real matching next header.
+        payload.extend_from_slice(&build_header(
+            1, 0b11, 1, 0b0000, 0b00, 0, 0, 0b11, 0, 0, 1, 0,
+        ));
+        let probe = detect_free_format_frame_length(&h, &payload).expect("probe");
+        // 196 bytes / 4-byte slot = 49 slots; padding 0 → N = 49.
+        assert_eq!(probe.frame_length_bytes, 196);
+        assert_eq!(probe.base_slot_count, 49);
+        // kbps = 49 · 44100 / (12 · 1000) = 180 (truncated, the spec
+        // formula is an integer division).
+        assert_eq!(probe.bitrate_kbps, 180);
     }
 }

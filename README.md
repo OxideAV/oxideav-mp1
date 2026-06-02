@@ -41,6 +41,23 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   (§2.4.2.1 / §2.4.3.1): slot count
   `N = floor(12 · bitrate / sampling_frequency) + padding_bit`, four
   bytes per Layer I slot.
+- **§2.4.3.1 free-format frame-length probe**: when a header carries
+  `bitrate_index == 0b0000`, the §2.4.2.1 N formula is uninvertible
+  from the header alone (§2.4.3.1: *"If the bitrate index equals
+  '0000', the exact bitrate is not indicated. N can be determined
+  from the distance between consecutive syncwords and the value of
+  the padding bit."*). The new
+  [`detect_free_format_frame_length(header, after_header)`] scans the
+  payload byte-by-byte for the next stream-matching syncword (same
+  `(ID, layer, sampling_frequency, mode)` — free-format implies the
+  bitrate is held constant), subtracts the `padding_bit` slot from
+  the discovered slot distance, and reports the recovered base slot
+  count `N`, the current frame's byte length, and the back-derived
+  bitrate `kbps = N · Fs / (L · 1000)` (Layer I `L = 12`, Layer II
+  `L = 144`). Rejects non-free headers with `NotFreeFormat`, missing
+  candidates with `NoNextSync`, and a Layer I distance that is not a
+  whole-slot multiple with `InconsistentDistance`. Stream-parameter
+  mismatches in candidate syncwords are skipped over.
 - **CRC `error_check()` verification** (§2.4.1.4 / §2.4.3.1):
   `protection_bit` drives whether a 16-bit CRC word follows;
   `FrameHeader::verify_crc` computes the CRC-16

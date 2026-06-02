@@ -8,6 +8,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.1 free-format frame-length probe.** The previously-deferred
+  free-format (`bitrate_index == 0b0000`) frame-length recovery is now
+  implemented. ISO/IEC 11172-3 (1993) §2.4.3.1 states verbatim: *"If
+  the bitrate index equals '0000', the exact bitrate is not indicated.
+  N can be determined from the distance between consecutive syncwords
+  and the value of the padding bit."* New
+  [`header::detect_free_format_frame_length(header, after_header) ->
+  Result<FreeFormatFrameLength, FreeFormatProbeError>`] inverts the
+  §2.4.3.1 N formula: it scans `after_header` for the next position
+  whose four bytes parse as a header on the same stream
+  (`(ID, layer, sampling_frequency, mode)` all match — free-format
+  holds the bitrate constant across consecutive frames), computes the
+  byte-distance from the start of the current header, subtracts the
+  `padding_bit` slot, and recovers `N`, the current frame's byte
+  length, and the back-derived bitrate `kbps = N · Fs / (L · 1000)`
+  (Layer I: `L = 12`, slot = 4 bytes; Layer II: `L = 144`, slot = 1
+  byte, both per §2.4.2.1 / §2.4.3.1). Returns
+  [`FreeFormatProbeError::NotFreeFormat`] for non-free headers,
+  [`…::NoNextSync`] when no stream-matching candidate is found, and
+  [`…::InconsistentDistance`] for a Layer I distance that is not a
+  whole-slot multiple. New public items:
+  [`header::detect_free_format_frame_length`],
+  [`header::FreeFormatFrameLength`],
+  [`header::FreeFormatProbeError`], all re-exported at the crate root.
+  - **+10 unit tests** cover: the `NotFreeFormat` rejection on a fixed
+    header; the `NoNextSync` reject when no candidate sync is present;
+    a Layer I 32 kHz / 128 kbit/s frame (`N = 48` slots / 192 bytes)
+    recovered against a stream-matching next header; the
+    `padding_bit == 1` slot-subtract on the Layer I path (196 byte
+    distance → `N = 48`); a Layer II 32 kHz / 96 kbit/s frame
+    (`N = 432` bytes, slot = 1 byte) recovered against a Layer II
+    next header; the stream-parameter mismatch rejection (a 32 kHz
+    candidate must not be accepted for a 44.1 kHz current frame);
+    Layer I `InconsistentDistance` on a 191-byte distance (not a
+    multiple of 4); the boundary case of a four-byte degenerate
+    frame (`N = 1`) at 48 kHz; the LSF Layer II / 24 kHz / 64 kbit/s
+    padded case (385 byte distance → `N = 384`); and a payload
+    cycling a non-matching candidate (32 kHz) followed by a real
+    matching candidate (44.1 kHz) confirming the byte-by-byte scan
+    lands on the right next-syncword. Total
+    `cargo test -p oxideav-mp1 --lib` count: **242 → 252**.
+
 - **Annex D Phase-3 — Step 3 `LTq` offset rule + Model 2 spreading
   function pieces.** The text-extractable Annex D building blocks
   beyond Step 6/7 are now staged in [`psy`]:
