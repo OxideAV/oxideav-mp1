@@ -2018,6 +2018,15 @@ pub enum Layer2EncodeError {
         /// The header + (optional) CRC + allocation field cost in bytes.
         overhead: usize,
     },
+    /// The top-level [`Mp1Layer2FrameEncoder::encode_frame`] expects
+    /// exactly [`LAYER2_SAMPLES_PER_FRAME`] (= 1152) PCM samples per
+    /// channel per call (§2.4.2.1).
+    ///
+    /// [`LAYER2_SAMPLES_PER_FRAME`]: crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME
+    WrongSampleCount {
+        /// The per-channel sample count actually received.
+        got: usize,
+    },
 }
 
 impl core::fmt::Display for Layer2EncodeError {
@@ -2047,6 +2056,13 @@ impl core::fmt::Display for Layer2EncodeError {
                     f,
                     "Layer II encode: §2.4.2.1 frame is {frame_len} bytes, below the \
                      {overhead}-byte header / CRC / allocation overhead"
+                )
+            }
+            Layer2EncodeError::WrongSampleCount { got } => {
+                write!(
+                    f,
+                    "Layer II encode: §2.4.2.1 frame granularity is 1152 PCM samples \
+                     per channel; received {got} per channel"
                 )
             }
         }
@@ -2620,6 +2636,118 @@ impl Mp1FrameEncoder {
             Mode::DualChannel => 0b10,
             Mode::SingleChannel => 0b11,
         }
+    }
+}
+
+/// A stateful Layer II encoder: holds one [`AnalysisFilter`] per
+/// channel so the §C.1.3 input FIFO carries across frames, mirroring
+/// the decoder's per-channel synthesis-filter history.
+///
+/// One call to [`encode_frame`](Self::encode_frame) consumes exactly
+/// [`LAYER2_SAMPLES_PER_FRAME`] interleaved `f64` PCM samples per
+/// channel (`1152 * channels` values total), runs 36 slots of analysis
+/// to populate the §2.4.1.6 sub-band matrix, and dispatches to the
+/// top-level [`encode_layer2_frame`] for header + alloc + scfsi +
+/// samples assembly. The optional §2.4.1.4 CRC is emitted iff the
+/// caller's [`Layer2HeaderParams::has_crc`] is `true`.
+///
+/// This is the Layer II analogue of [`Mp1FrameEncoder`]: the Layer I
+/// path packs 12 slots × 32 sub-bands = 384 PCM samples per channel
+/// per frame; the Layer II path packs 36 slots × 32 sub-bands = 1152
+/// PCM samples per channel per frame.
+///
+/// [`LAYER2_SAMPLES_PER_FRAME`]: crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME
+#[derive(Debug)]
+pub struct Mp1Layer2FrameEncoder {
+    params: Layer2HeaderParams,
+    filters: Vec<AnalysisFilter>,
+}
+
+impl Mp1Layer2FrameEncoder {
+    /// Build a Layer II frame encoder for the given header parameters
+    /// with fresh (zeroed) analysis history.
+    ///
+    /// The header's `mode` field selects the channel count
+    /// (`SingleChannel` → 1, every other variant → 2). Construction
+    /// does not validate the §2.4.2.3 bitrate ladder; that check fires
+    /// inside [`encode_frame`](Self::encode_frame) on first use, the
+    /// same point [`encode_layer2_frame`] would raise it. This matches
+    /// [`Mp1FrameEncoder`]'s lazy-validation contract.
+    pub fn new(params: Layer2HeaderParams) -> Mp1Layer2FrameEncoder {
+        let nch = params.mode.channels() as usize;
+        Mp1Layer2FrameEncoder {
+            params,
+            filters: (0..nch).map(|_| AnalysisFilter::new()).collect(),
+        }
+    }
+
+    /// Zero the analysis history (for a seek / stream restart).
+    pub fn reset(&mut self) {
+        for f in &mut self.filters {
+            f.reset();
+        }
+    }
+
+    /// The channel count implied by the header mode (1 or 2).
+    pub fn channels(&self) -> usize {
+        self.params.mode.channels() as usize
+    }
+
+    /// A read-only view of the configured Layer II header parameters.
+    pub fn params(&self) -> &Layer2HeaderParams {
+        &self.params
+    }
+
+    /// Encode one Layer II frame of interleaved `f64` PCM in `[-1, 1)`
+    /// to a complete §2.4.2.1 frame byte buffer.
+    ///
+    /// `pcm` is interleaved: `pcm[sample*nch + ch]`, with exactly
+    /// `LAYER2_SAMPLES_PER_FRAME` (= 1152) samples per channel
+    /// (§2.4.2.1). Internally runs 36 slots × 32 PCM samples through
+    /// [`AnalysisFilter::analyze`] per channel, builds the
+    /// `subbands[ch][sb][slot]` matrix the §2.4.1.6 writers expect,
+    /// and dispatches to [`encode_layer2_frame`]. The returned frame
+    /// is exactly `floor(144·bitrate/Fs) + padding_bit` bytes long.
+    ///
+    /// [`LAYER2_SAMPLES_PER_FRAME`]: crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME
+    // The §C.1.3 analysis body is a strict (slot, ch, sb) nested walk
+    // mirroring the §C.1.5.2 spec presentation; an iterator rewrite
+    // would obscure the spec mapping for no behavioural gain.
+    #[allow(clippy::needless_range_loop)]
+    pub fn encode_frame(&mut self, pcm: &[f64]) -> Result<Vec<u8>, Layer2EncodeError> {
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_FRAME, LAYER2_SAMPLES_PER_SUBBAND};
+
+        let nch = self.channels();
+        if !(nch == 1 || nch == 2) {
+            return Err(Layer2EncodeError::UnsupportedChannelCount(nch));
+        }
+        let per_ch = LAYER2_SAMPLES_PER_FRAME; // 1152
+        if pcm.len() != per_ch * nch {
+            return Err(Layer2EncodeError::WrongSampleCount {
+                got: pcm.len() / nch.max(1),
+            });
+        }
+
+        // §C.1.3 analysis: run the per-channel AnalysisFilter 36 times,
+        // 32 PCM samples per slot, capturing 32 sub-band outputs per
+        // slot. The resulting `subbands[ch][sb][slot]` matrix has the
+        // exact shape `encode_layer2_frame` consumes.
+        let mut subbands = [[[0.0f64; LAYER2_SAMPLES_PER_SUBBAND]; SUBBANDS]; 2];
+        for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+            for ch in 0..nch {
+                let mut input = [0.0f64; SUBBANDS];
+                for (j, v) in input.iter_mut().enumerate() {
+                    let sample_idx = slot * SUBBANDS + j;
+                    *v = pcm[sample_idx * nch + ch];
+                }
+                let s = self.filters[ch].analyze(&input);
+                for sb in 0..SUBBANDS {
+                    subbands[ch][sb][slot] = s[sb];
+                }
+            }
+        }
+
+        encode_layer2_frame(&self.params, &subbands)
     }
 }
 
@@ -5151,5 +5279,207 @@ mod tests {
         // Byte count: floor(144·64·1000/24000) = 384.
         let expected = (144u32 * 64 * 1000) / 24_000;
         assert_eq!(frame.len(), expected as usize);
+    }
+
+    // ---- Mp1Layer2FrameEncoder (top-level §C.1.3 + §C.1.5.2) ---
+
+    /// Build an interleaved `f64` PCM block carrying `nch` channels of
+    /// a sum of two sinusoids per channel at `fs`, with
+    /// `LAYER2_SAMPLES_PER_FRAME` (1152) samples per channel — the
+    /// Layer II frame granularity. Channel 1 (when present) is
+    /// π/4-phase-shifted relative to channel 0 so the two channels
+    /// carry distinct sub-band content.
+    fn layer2_test_pcm(fs: u32, nch: usize) -> Vec<f64> {
+        use crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME;
+        let n = LAYER2_SAMPLES_PER_FRAME;
+        let mut pcm = vec![0.0f64; n * nch];
+        for s in 0..n {
+            let t = s as f64 / fs as f64;
+            for ch in 0..nch {
+                let phase = if ch == 0 {
+                    0.0
+                } else {
+                    std::f64::consts::FRAC_PI_4
+                };
+                pcm[s * nch + ch] = 0.4 * (2.0 * std::f64::consts::PI * 440.0 * t + phase).sin()
+                    + 0.2 * (2.0 * std::f64::consts::PI * 1_320.0 * t + phase).cos();
+            }
+        }
+        pcm
+    }
+
+    /// Top-level Layer II encoder: a mono 48 kHz / 128 kbit/s PCM
+    /// frame round-trips through the decoder into a non-silent PCM
+    /// frame, the produced bytes match the §2.4.2.1 frame length, and
+    /// the §2.4.1.3 header re-parses to Layer II / `ID == 1`.
+    #[test]
+    fn mp1_layer2_frame_encoder_round_trip_mono() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        assert_eq!(enc.channels(), 1);
+        let pcm = layer2_test_pcm(48_000, 1);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME);
+        let frame = enc.encode_frame(&pcm).expect("encode_frame mono");
+
+        // §2.4.2.1: floor(144·128·1000/48000) = 384 bytes.
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert_eq!(header.layer, crate::header::Layer::II);
+        assert_eq!(header.channels(), 1);
+        assert!(!header.is_lsf());
+
+        // The decoder reconstructs the sub-band matrix; the encoder
+        // must have placed at least one non-zero allocation (silence
+        // would be a degenerate sanity-fail).
+        let recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("decode_layer2_audio_data");
+        let any_alloc = (0..recovered.sblimit).any(|sb| recovered.subbands[0][sb].allocation != 0);
+        assert!(any_alloc, "encoder must place at least one allocation");
+    }
+
+    /// Top-level Layer II encoder, joint-stereo 44.1 kHz / 192 kbit/s:
+    /// the §2.4.1.6 shared upper band's per-channel allocations agree
+    /// in the bound..sblimit range, and the decoder reconstructs both
+    /// channels.
+    #[test]
+    fn mp1_layer2_frame_encoder_round_trip_joint_stereo() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+
+        let params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        assert_eq!(enc.channels(), 2);
+        let pcm = layer2_test_pcm(44_100, 2);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME * 2);
+        let frame = enc.encode_frame(&pcm).expect("encode_frame stereo");
+
+        // §2.4.2.1: floor(144·192·1000/44100) = 626 bytes.
+        let expected_len = (144u32 * 192 * 1000) / 44_100;
+        assert_eq!(frame.len(), expected_len as usize);
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert_eq!(header.layer, crate::header::Layer::II);
+        assert_eq!(header.channels(), 2);
+
+        let recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("decode_layer2_audio_data");
+        // Joint-stereo upper-band invariant: ch0 and ch1 allocations
+        // identical for sb ∈ [bound, sblimit).
+        let table = crate::tables_layer2::layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        for sb in bound..table.sblimit() {
+            assert_eq!(
+                recovered.subbands[0][sb].allocation, recovered.subbands[1][sb].allocation,
+                "shared upper band must have identical allocation per channel \
+                 (sb={sb}, bound={bound})"
+            );
+        }
+        // Each channel placed at least one allocation overall.
+        for ch in 0..2 {
+            let any = (0..recovered.sblimit).any(|sb| recovered.subbands[ch][sb].allocation != 0);
+            assert!(any, "channel {ch} must place at least one allocation");
+        }
+    }
+
+    /// `encode_frame` rejects the wrong PCM length with the new
+    /// [`Layer2EncodeError::WrongSampleCount`] variant.
+    #[test]
+    fn mp1_layer2_frame_encoder_rejects_wrong_sample_count() {
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        // 1024 samples is not 1152 — short frame.
+        let pcm = vec![0.0f64; 1024];
+        let err = enc.encode_frame(&pcm).unwrap_err();
+        assert_eq!(err, Layer2EncodeError::WrongSampleCount { got: 1024 });
+    }
+
+    /// `encode_frame` surfaces the off-ladder bitrate rejection from
+    /// the underlying [`encode_layer2_frame`] (lazy validation in the
+    /// header packer fires on first use, matching `Mp1FrameEncoder`).
+    #[test]
+    fn mp1_layer2_frame_encoder_rejects_off_ladder_bitrate() {
+        // 100 kbit/s is not on either Layer II ladder.
+        let params = Layer2HeaderParams::new(48_000, 100, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(48_000, 1);
+        let err = enc.encode_frame(&pcm).unwrap_err();
+        match err {
+            Layer2EncodeError::Header(Layer2HeaderError::UnsupportedBitrate(100)) => {}
+            other => panic!("expected UnsupportedBitrate(100), got {other:?}"),
+        }
+    }
+
+    /// LSF round-trip through the top-level encoder: a 24 kHz / 64
+    /// kbit/s mono PCM frame encodes via Table B.1 and decodes back
+    /// through the matching LSF Layer II path.
+    #[test]
+    fn mp1_layer2_frame_encoder_round_trip_lsf_mono() {
+        use crate::decode_layer2::decode_layer2_audio_data;
+
+        let params = Layer2HeaderParams::new(24_000, 64, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(24_000, 1);
+        let frame = enc.encode_frame(&pcm).expect("encode_frame LSF");
+        // §2.4.2.1: floor(144·64·1000/24000) = 384 bytes.
+        assert_eq!(frame.len(), ((144u32 * 64 * 1000) / 24_000) as usize);
+        let header = FrameHeader::parse(&frame).expect("parse LSF header");
+        assert!(header.is_lsf(), "LSF Fs must produce an LSF (ID==0) header");
+        let _ = decode_layer2_audio_data(&header, &frame[4..]).expect("LSF Layer II decode");
+    }
+
+    /// `Mp1Layer2FrameEncoder::reset` zeroes the per-channel
+    /// AnalysisFilter input FIFO — the same condition as a freshly
+    /// constructed encoder. So encoding a Layer II frame on a fresh
+    /// encoder produces byte-identical output to encoding it on a
+    /// previously-used-then-reset encoder, given identical input.
+    #[test]
+    fn mp1_layer2_frame_encoder_reset_zeroes_history() {
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut a = Mp1Layer2FrameEncoder::new(params);
+        let mut b = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(48_000, 1);
+        // Prime `a` with a different signal so its AnalysisFilter
+        // history diverges from `b`.
+        let prime: Vec<f64> = (0..pcm.len())
+            .map(|i| ((i % 64) as f64) / 64.0 - 0.5)
+            .collect();
+        let _ = a.encode_frame(&prime).expect("prime");
+        // Now reset `a` and encode the test signal on both.
+        a.reset();
+        let fa = a.encode_frame(&pcm).expect("encode after reset");
+        let fb = b.encode_frame(&pcm).expect("encode fresh");
+        assert_eq!(fa, fb, "reset must restore fresh-encoder history");
+    }
+
+    /// The §2.4.1.4 CRC opt-in on the top-level Layer II frame
+    /// encoder writes a §2.4.3.1 CRC the decoder's `verify_layer2_crc`
+    /// accepts as `Ok`, and the frame byte length is unchanged from
+    /// the no-CRC variant (§2.4.2.1 slot count is bitrate-derived).
+    #[test]
+    fn mp1_layer2_frame_encoder_emits_verifying_crc() {
+        use crate::decode_layer2::verify_layer2_crc;
+
+        let mut params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        params.has_crc = true;
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(48_000, 1);
+        let frame = enc.encode_frame(&pcm).expect("encode_frame with CRC");
+        // §2.4.2.1: floor(144·128·1000/48000) = 384 bytes regardless of
+        // CRC (CRC bits come out of the audio-data budget).
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert!(header.has_crc(), "has_crc must clear protection_bit");
+        // `verify_layer2_crc` takes (header_bytes, after_header) where
+        // after_header carries the CRC word at the start followed by
+        // the §2.4.1.6 allocation + scfsi region.
+        let status = verify_layer2_crc(&header, &frame[..4], &frame[4..])
+            .expect("verify_layer2_crc: CRC region present");
+        assert!(
+            status.is_good(),
+            "encoded CRC must verify clean: {status:?}"
+        );
     }
 }

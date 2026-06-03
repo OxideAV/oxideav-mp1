@@ -100,7 +100,7 @@ pub use encode::{
     BitWriter, EncodeError, EncodeParams, Layer2Allocation, Layer2AllocationFieldError,
     Layer2EncodeError, Layer2HeaderError, Layer2HeaderParams, Layer2SamplesFieldError,
     Layer2SamplesFieldInput, Layer2ScalefactorFieldError, Layer2ScalefactorFieldInput,
-    Layer2ScalefactorIndices, Layer2SubbandPeaks, Mp1FrameEncoder,
+    Layer2ScalefactorIndices, Layer2SubbandPeaks, Mp1FrameEncoder, Mp1Layer2FrameEncoder,
 };
 pub use encoder::make_encoder_with_crc;
 pub use header::{

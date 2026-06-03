@@ -8,6 +8,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.3 stateful Layer II frame encoder (`Mp1Layer2FrameEncoder`).**
+  A new `encode::Mp1Layer2FrameEncoder` carries one `AnalysisFilter`
+  per channel — the same §C.1.3 input-FIFO state the Layer I
+  `Mp1FrameEncoder` owns — and exposes a single
+  `encode_frame(pcm: &[f64]) -> Result<Vec<u8>, Layer2EncodeError>`
+  call that consumes exactly `LAYER2_SAMPLES_PER_FRAME` (= 1152)
+  interleaved PCM samples per channel, runs 36 slots × 32-PCM-sample
+  analysis to build the `subbands[ch][sb][slot]` matrix, and
+  dispatches to [`encode_layer2_frame`]. This is the Layer II
+  analogue of `Mp1FrameEncoder` (which packs 12 slots × 32 sub-bands =
+  384 PCM samples per channel per Layer I frame), closing the
+  long-standing followup that the previous top-level Layer II
+  encoder entry point [`encode_layer2_frame`] only accepted
+  pre-analysed sub-band matrices and gave the caller no built-in
+  way to carry §C.1.3 analysis-filter history across frames.
+  - `Mp1Layer2FrameEncoder::new(Layer2HeaderParams)` builds an
+    encoder with fresh (zeroed) analysis history.
+    `reset()` zeros the per-channel `AnalysisFilter` input FIFO for
+    a seek / stream restart, `channels()` reports the
+    header-implied channel count (1 or 2), and `params()` exposes a
+    read-only view of the configured header.
+  - The §2.4.1.4 CRC opt-in flows through `Layer2HeaderParams::has_crc`
+    exactly as for the underlying [`encode_layer2_frame`] — when
+    enabled, the emitted §2.4.3.1 CRC verifies clean through
+    `verify_layer2_crc`, and the §2.4.2.1 byte count is unchanged
+    (the CRC's 16 bits come out of the audio-data budget).
+  - New `Layer2EncodeError::WrongSampleCount { got }` variant
+    surfaces a PCM length that is not exactly `1152 · channels`.
+    Off-ladder bitrates and unsupported sampling frequencies are
+    surfaced as `Layer2EncodeError::Header(...)` on the first
+    `encode_frame` call, matching `Mp1FrameEncoder`'s lazy-
+    validation contract.
+  - **+7 lib-tests** cover: a mono 48 kHz / 128 kbit/s end-to-end
+    PCM → encoded-frame → decoded-sub-bands round trip that
+    confirms the §2.4.2.1 byte count, the §2.4.1.3 `Layer::II` /
+    `ID == 1` header re-parse, and that the encoder places at least
+    one non-zero allocation; a joint-stereo 44.1 kHz / 192 kbit/s
+    round trip that asserts the §2.4.1.6 shared-upper-band
+    invariant (ch0 and ch1 allocations identical for
+    `sb ∈ [bound, sblimit)`) and that each channel placed at least
+    one allocation; an LSF mono 24 kHz / 64 kbit/s round trip
+    routing through Table B.1 (`ID == 0`); a `WrongSampleCount`
+    rejection at a 1024-sample input (1152 required); an
+    off-ladder `Layer2HeaderError::UnsupportedBitrate(100)` surfacing
+    through `Layer2EncodeError::Header(..)`; a `reset` test that
+    primes an encoder with one signal then resets and re-encodes a
+    second signal, comparing byte-for-byte against a fresh encoder
+    given the same second signal (confirming the analysis-filter
+    FIFO is fully zeroed); and a `has_crc == true` round trip whose
+    §2.4.3.1 CRC verifies through `verify_layer2_crc` and whose
+    §2.4.2.1 byte count matches the no-CRC variant. Public surface
+    add: re-exported [`Mp1Layer2FrameEncoder`] at the crate root.
+    Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+
 - **§2.4.1.6 / §C.1.5.2 top-level Layer II frame encoder.** A new
   `encode::encode_layer2_frame(&Layer2HeaderParams, &subbands) ->
   Result<Vec<u8>, Layer2EncodeError>` wires together every Layer II

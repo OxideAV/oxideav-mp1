@@ -472,6 +472,45 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     (24 kHz / 64 kbit/s mono) Layer II round-trip exercising the
     `ID == 0` Table B.1 path through the same top-level entry point.
   - Total `cargo test -p oxideav-mp1 --lib` count: **259 → 266**.
+- **§C.1.3 stateful Layer II frame encoder `Mp1Layer2FrameEncoder`**:
+  a new `encode::Mp1Layer2FrameEncoder` carries one `AnalysisFilter`
+  per channel — the same §C.1.3 input-FIFO state the Layer I
+  `Mp1FrameEncoder` owns — and exposes
+  `encode_frame(pcm: &[f64]) -> Result<Vec<u8>, Layer2EncodeError>`
+  which consumes exactly `LAYER2_SAMPLES_PER_FRAME` (= 1152)
+  interleaved PCM samples per channel, runs 36 slots × 32-PCM-sample
+  analysis to populate the `subbands[ch][sb][slot]` matrix, and
+  dispatches to the underlying `encode_layer2_frame`. This is the
+  Layer II analogue of `Mp1FrameEncoder` (which packs 12 slots × 32
+  sub-bands = 384 PCM samples per channel per Layer I frame): callers
+  can now produce complete Layer II frames from time-domain PCM
+  without having to run the analysis bank themselves. The §2.4.1.4
+  CRC opt-in flows through `Layer2HeaderParams::has_crc` exactly as
+  for the underlying frame-encoder, and a new
+  `Layer2EncodeError::WrongSampleCount { got }` surfaces a PCM length
+  that is not exactly `1152 · channels`. `reset()` zeros the
+  per-channel analysis-filter FIFO for a seek / stream restart;
+  `channels()` reports the header-implied 1 / 2 channel count;
+  `params()` exposes a read-only view of the configured header.
+  - Seven new lib-tests cover: a mono 48 kHz / 128 kbit/s round trip
+    that confirms the §2.4.2.1 byte count, the `Layer::II` /
+    `ID == 1` header re-parse and that the encoder places at least
+    one non-zero allocation; a joint-stereo 44.1 kHz / 192 kbit/s
+    round trip asserting the §2.4.1.6 shared-upper-band invariant
+    (ch0 and ch1 allocations identical for
+    `sb ∈ [bound, sblimit)`) and that each channel placed at least
+    one allocation; an LSF mono 24 kHz / 64 kbit/s round trip
+    through Table B.1 (`ID == 0`); a `WrongSampleCount` rejection on
+    a 1024-sample input; an off-ladder
+    `Layer2HeaderError::UnsupportedBitrate(100)` surfacing through
+    `Layer2EncodeError::Header(..)`; a `reset` test priming one
+    encoder with a divergent signal then resetting and re-encoding
+    a second signal byte-for-byte identically to a fresh encoder
+    given the same signal; and a `has_crc == true` round trip whose
+    §2.4.3.1 CRC verifies through `verify_layer2_crc` at unchanged
+    §2.4.2.1 byte count. Public surface add: re-exported
+    `Mp1Layer2FrameEncoder` at the crate root.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
 - **Annex D Phase-3 — Step 3 `LTq` offset + Model 2 spreading
   pieces**: closed-form helpers from the text-extractable portions of
   Annex D continue to land in the [`psy`] module without touching the
