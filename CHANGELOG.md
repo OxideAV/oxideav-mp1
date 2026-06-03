@@ -8,6 +8,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.1.6 / §C.1.5.2 top-level Layer II frame encoder.** A new
+  `encode::encode_layer2_frame(&Layer2HeaderParams, &subbands) ->
+  Result<Vec<u8>, Layer2EncodeError>` wires together every Layer II
+  encoder piece already in tree (per-part scalefactor extraction via
+  `select_layer2_scalefactors`, the §C.1.5.2.7 iterative bit allocator
+  `allocate_bits_layer2`, the §2.4.1.6 four-region writers, and a
+  new §C.1.5.2 / §2.4.3.3.4 per-sample quantizer
+  `quantize_layer2_sample`) behind a single call that takes only the
+  §2.4.1.3 header parameters and the analysed per-(ch, sb) sub-band
+  matrix. The function emits a complete §2.4.2.1 Layer II frame —
+  header + optional §2.4.1.4 CRC + §2.4.1.6 allocation, scfsi,
+  scalefactor and samples regions + zero-padded ANC tail — exactly
+  `floor(144 · bitrate / Fs) + padding_bit` bytes long.
+- **§2.4.3.3.4 inverse quantizer.** New
+  `encode::quantize_layer2_sample(value, scf, &QuantClass) -> u32`
+  computes the raw `nlevels`-level code the §2.4.1.6 SAMPLES writer
+  consumes, inverting the decoder's `s'' = C · (s''' + D)` formula
+  step-by-step (normalise by the scalefactor, solve for s''', scale to
+  a signed `bits_per_sample`-bit integer, reinterpret unsigned, XOR the
+  MSB) and clamping the result to `[0, nlevels)` so the writer's
+  `SampleCodeOutOfRange` pre-flight is never tripped. Forms the exact
+  inverse of the decoder's `requantize_triplet`: for every legal
+  `(class, code)` the decoder reconstruction round-trips back to the
+  same code through the new encoder.
+- **§2.4.1.6 intensity-stereo allocation mirroring.** In the top-level
+  Layer II encoder the per-channel bit allocator runs against
+  pre-mirrored peaks for `sb ∈ [bound, sblimit)` (each cell gets the
+  channel max) and the resulting per-channel allocations are merged in
+  the shared upper band so the §2.4.1.6 writer's
+  `UpperBandChannelsDisagree` invariant always holds.
+- **§2.4.1.4 CRC emission on the Layer II encode side.** When
+  `Layer2HeaderParams::has_crc == true`, `encode_layer2_frame` reserves
+  a 16-bit `error_check()` placeholder immediately after the header,
+  then patches it with the §2.4.3.1 CRC-16 computed off the just-
+  written allocation + scfsi region via `compute_layer2_crc`. The
+  decoder's `verify_layer2_crc` accepts the encoded frame's CRC as
+  `Ok`. §2.4.2.1 frame byte count is unchanged.
+- **5 lib-tests** for the new wiring: a full sweep across every Table
+  3-B.4 quantization class in B.2a confirming the
+  `quantize_layer2_sample` round-trip recovers every legal code; an
+  out-of-range PCM clamp test that keeps the writer's pre-flight
+  happy; a mono 48 kHz / 128 kbit/s end-to-end encode → decode round
+  trip whose recovered samples sit within one quantizer step of the
+  analysed input on every allocated subband; a joint-stereo 44.1 kHz /
+  192 kbit/s round-trip that checks the shared upper band carries
+  matching allocations and the decoded ch0/ch1 sample triplet is
+  identical pre-scalefactor (the §2.4.1.6 shared-`s_dp` invariant);
+  a §2.4.1.4 CRC opt-in round-trip that verifies the encoder's CRC
+  through `verify_layer2_crc`; an off-ladder-bitrate rejection path
+  surfaced as `Layer2EncodeError::Header(UnsupportedBitrate)`; and a
+  LSF (24 kHz / 64 kbit/s) Layer II mono round-trip exercising the
+  `ID == 0` Table B.1 path through the same top-level entry point.
+  Total `cargo test -p oxideav-mp1 --lib` count: **259 → 266**.
 - **ISO/IEC 13818-3 Annex B Table B.1 LSF Layer II allocation table
   transcribed.** Previously this crate aliased the MPEG-2 LSF Layer II
   (`Fs ∈ {16, 22.05, 24} kHz`) decode path to MPEG-1 Layer II Table

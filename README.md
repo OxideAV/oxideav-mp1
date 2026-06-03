@@ -341,12 +341,15 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     error). Together with the prior `write_layer2_header`,
     `write_layer2_allocation_field` and
     `write_layer2_scalefactor_field` this completes the four-region
-    §2.4.1.6 control + audio-data payload of a Layer II frame; the
-    remaining Layer II encoder followups are top-level `Mp1Encoder`
-    integration of the four writers, a Layer-II `EncodeParams::layer`
-    switch, and the §C.1.5.2.5 / Table C.4 perceptual SCFSI selection
-    (still a PDF-image DOCS-GAP, hence the writer takes the SCFSI
-    codes as caller input).
+    §2.4.1.6 control + audio-data payload of a Layer II frame; a
+    later round wired them behind the top-level
+    `encode::encode_layer2_frame` (see below). The remaining Layer II
+    encoder followups are the §C.1.5.2.5 / Table C.4 perceptual SCFSI
+    selection (still a PDF-image DOCS-GAP, hence the encoder writes
+    `scfsi == 0b00` for every allocated subband) and an
+    `Mp1Encoder`-style trait-object integration with a
+    `EncodeParams::layer` switch surfacing both Layer I and Layer II
+    through one `oxideav_core::Encoder`.
   - Total `cargo test -p oxideav-mp1 --lib` count: **182 → 193**.
 - **Layer II scalefactor extraction** (§C.1.5.1.4 per part): a clean-room
   encoder-side helper that turns the 36 analysed sub-band samples of
@@ -419,6 +422,56 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     96, 112, 128, 144, 160}` kbit/s) at each of the three LSF rates
     confirming the §2.4.3.1 "for all bitrates" invariance.
   - Total `cargo test -p oxideav-mp1 --lib` count: **242 → 259**.
+- **§2.4.1.6 / §C.1.5.2 Layer II top-level frame encoder**: the four
+  §2.4.1.6 region writers, the per-part scalefactor extractor, the
+  §C.1.5.2.7 bit allocator and a new §C.1.5.2 / §2.4.3.3.4 per-sample
+  quantizer are now wired behind a single
+  `encode::encode_layer2_frame(&Layer2HeaderParams, &subbands) ->
+  Result<Vec<u8>, Layer2EncodeError>`. Callers supply only the
+  §2.4.1.3 header parameters (sampling frequency, Layer II bitrate,
+  channel mode, joint-stereo bound, optional §2.4.1.4 CRC opt-in) and
+  the analysed `[ch][sb][slot]` sub-band matrix; the function emits a
+  complete §2.4.2.1 Layer II frame — header + optional CRC +
+  §2.4.1.6 allocation, scfsi, scalefactor and samples regions +
+  zero-padded ANC tail — exactly `floor(144 · bitrate / Fs) +
+  padding_bit` bytes long. New §2.4.3.3.4 inverse-quantizer
+  `encode::quantize_layer2_sample(value, scf, &QuantClass) -> u32`
+  computes the raw `nlevels`-level code the §2.4.1.6 SAMPLES writer
+  consumes, inverting the decoder's `s'' = C · (s''' + D)` formula
+  step-by-step and clamping into `[0, nlevels)` so the writer's
+  `SampleCodeOutOfRange` pre-flight is never tripped on a
+  scalefactor-saturating signal. In intensity-stereo upper bands
+  (`sb ∈ [bound, sblimit)`) per-channel peaks are pre-mirrored before
+  the allocator runs, and the resulting per-channel allocations are
+  shared post-hoc so the §2.4.1.6 writer's
+  `UpperBandChannelsDisagree` invariant always holds. The encoder
+  writes `scfsi == 0b00` (three independent scalefactors per
+  allocated `(ch, sb)`) on every cell — Table C.4's perceptual
+  collapse remains a PDF-image DOCS-GAP and the worst-case
+  bookkeeping `allocate_bits_layer2` already reserves matches the
+  three-scalefactor cost. New `Layer2EncodeError` enumerates the
+  channel-count, header (`Layer2HeaderError` surface),
+  channel-mode-mismatch and `FrameTooSmall` rejection paths.
+  - Seven new lib-tests cover: a sweep across every Table 3-B.4
+    quantization class active in B.2a (48 kHz / 192 kbit/s stereo)
+    confirming `quantize_layer2_sample` recovers every legal code on
+    every quantizer step (the strict inverse of the decoder's
+    `requantize_triplet`); an out-of-range PCM clamp test
+    (`±10.0`, `±2.0`, `1e6`) that keeps every emitted code in
+    `[0, nlevels)`; a mono 48 kHz / 128 kbit/s end-to-end encode →
+    decode round trip whose recovered samples sit within one
+    quantizer step of the analysed input on every allocated subband
+    (with `peak_err_within_grid` walking each allocated `(sb,
+    slot)`); a joint-stereo 44.1 kHz / 192 kbit/s round-trip that
+    checks the shared upper band carries matching allocations and the
+    decoded ch0/ch1 sample ratio equals the scalefactor ratio (the
+    §2.4.1.6 shared-`s_dp` invariant); a §2.4.1.4 CRC opt-in
+    round-trip that verifies the encoder's CRC through
+    `verify_layer2_crc`; an off-ladder-bitrate rejection surfaced as
+    `Layer2EncodeError::Header(UnsupportedBitrate(100))`; and a LSF
+    (24 kHz / 64 kbit/s mono) Layer II round-trip exercising the
+    `ID == 0` Table B.1 path through the same top-level entry point.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **259 → 266**.
 - **Annex D Phase-3 — Step 3 `LTq` offset + Model 2 spreading
   pieces**: closed-form helpers from the text-extractable portions of
   Annex D continue to land in the [`psy`] module without touching the
@@ -513,7 +566,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-259 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+266 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-

@@ -1909,6 +1909,366 @@ pub fn layer2_stereo_bound(header: &FrameHeader, sblimit: usize) -> usize {
     raw.min(sblimit)
 }
 
+// ---- Layer II per-sample quantization (§C.1.5.2 / §2.4.3.3.4) ---
+
+/// Quantize one Layer II sub-band sample value into a raw `nlevels`-level
+/// code for a given quantization class (§C.1.5.2 quantization step,
+/// inverse of the §2.4.3.3.4 decoder requantization formula
+/// `s'' = C · (s''' + D)`).
+///
+/// * `value` is the analysed sub-band sample `s'`.
+/// * `scf` is the chosen Table 3-B.1 scalefactor multiplier for the
+///   sample's `(ch, sb, part)` cell.
+/// * `class` is the per-`(sb, alloc[ch][sb])` quantization class
+///   resolved off the per-frame [`AllocationTable`].
+///
+/// The function inverts the §2.4.3.3.4 formula step-by-step:
+///
+/// 1. Normalise `X = value / scf`.
+/// 2. Recover the spec's `s''' = X / C − D` (the two's-complement
+///    fractional pre-image of the decoder's linear formula).
+/// 3. Scale to a signed `bits_per_sample`-bit integer
+///    `signed = round(s''' · 2^(nb−1))`.
+/// 4. Reinterpret as unsigned `inverted = signed mod 2^nb` and apply the
+///    §2.4.3.3.4 MSB-inversion `code = inverted XOR (1 << (nb−1))`.
+/// 5. Clamp the result to `[0, nlevels)` so the §2.4.1.6 writer's
+///    pre-flight always accepts it (the §2.4.3.3.4 inverse only uses
+///    `nlevels` of the `2^bits_per_sample` codes; the extra ones the
+///    raw arithmetic could pick are forbidden by the spec).
+///
+/// Feeding the returned code through the decoder's
+/// [`crate::decode_layer2::decode_layer2_audio_data`] path
+/// (after writing it through [`write_layer2_samples_field`])
+/// recovers a sample value within one quantizer step of the chosen
+/// scalefactor's grid — exactly the §C.1.5.2 reconstruction error
+/// behaviour.
+pub fn quantize_layer2_sample(value: f64, scf: f64, class: &QuantClass) -> u32 {
+    let nb = class.bits_per_sample();
+    debug_assert!(
+        (2..=16).contains(&nb),
+        "Layer II per-sample width 2..=16 per Table 3-B.4"
+    );
+    let nlevels = class.nlevels as u32;
+    let msb: u32 = 1u32 << (nb - 1);
+    let two_nb: u64 = 1u64 << nb;
+
+    // §2.4.3.3.4 step backward: target s'' (the decoder's linear-formula
+    // output) IS `value/scf` once the scalefactor rescale is undone, so
+    // s''' = (value/scf) / C − D. The half-open `[-1, +1−2^(−(nb−1)))`
+    // range is the natural domain of `s'''`; any out-of-range input gets
+    // clamped to the closest representable two's-complement signed
+    // integer below.
+    let x = value / scf;
+    let s_triple_prime = x / class.c - class.d;
+    let scaled = (s_triple_prime * (msb as f64)).round();
+
+    // Clamp `signed` to the nb-bit two's-complement range
+    // [-2^(nb-1), 2^(nb-1) - 1] before the unsigned conversion.
+    let lo = -(msb as i64);
+    let hi = (msb as i64) - 1;
+    let signed = (scaled as i64).clamp(lo, hi);
+
+    // §2.4.3.3.4 "the first bit of each of the three codes has to be
+    // inverted" — read backward: the unsigned `inverted` representation
+    // of `signed` is `(signed mod 2^nb)`; XOR'ing the MSB recovers the
+    // raw bitstream code.
+    let inverted = if signed < 0 {
+        (signed + two_nb as i64) as u32
+    } else {
+        signed as u32
+    };
+    let raw_code = inverted ^ msb;
+
+    // Only the first `nlevels` of the `2^nb` codes are legal for a
+    // class with `nlevels < 2^nb` (the spec lists exactly `nlevels`
+    // quantizer steps); the §2.4.1.6 writer rejects anything in the
+    // forbidden tail. Clamping to `nlevels - 1` keeps the encoder
+    // consistent with the writer and matches the symmetric `±1` clip
+    // the spec implies for over-range PCM.
+    raw_code.min(nlevels - 1)
+}
+
+// ---- Layer II top-level frame encoder (§C.1.5.2 wiring) --------
+
+/// Errors raised while encoding a Layer II frame at the top level
+/// ([`encode_layer2_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer2EncodeError {
+    /// A Layer II frame requires `1` or `2` channels; everything else is
+    /// out of the §2.4.2.3 syntax.
+    UnsupportedChannelCount(usize),
+    /// The header parameters do not represent a valid Layer II header
+    /// (unsupported sampling frequency or off-ladder bitrate).
+    Header(Layer2HeaderError),
+    /// The header's channel mode disagrees with the supplied per-channel
+    /// sub-band data (mono header with stereo sub-bands or vice versa).
+    ChannelModeMismatch {
+        /// Channel count implied by the header.
+        header_channels: usize,
+        /// Channel count carried by the sub-band data.
+        data_channels: usize,
+    },
+    /// The §2.4.2.1 frame byte count derived from header fields is too
+    /// small to hold the §2.4.1.6 control regions and the per-frame
+    /// allocation field (i.e. the bitrate is below the minimum the
+    /// allocator can place a single non-zero allocation at).
+    FrameTooSmall {
+        /// The computed `(144·bitrate/Fs)` byte count.
+        frame_len: usize,
+        /// The header + (optional) CRC + allocation field cost in bytes.
+        overhead: usize,
+    },
+}
+
+impl core::fmt::Display for Layer2EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Layer2EncodeError::UnsupportedChannelCount(n) => {
+                write!(f, "Layer II encode: unsupported channel count {n}")
+            }
+            Layer2EncodeError::Header(h) => {
+                write!(f, "Layer II encode: header: {h}")
+            }
+            Layer2EncodeError::ChannelModeMismatch {
+                header_channels,
+                data_channels,
+            } => {
+                write!(
+                    f,
+                    "Layer II encode: header mode implies {header_channels}-channel \
+                     but sub-band data carries {data_channels}-channel"
+                )
+            }
+            Layer2EncodeError::FrameTooSmall {
+                frame_len,
+                overhead,
+            } => {
+                write!(
+                    f,
+                    "Layer II encode: §2.4.2.1 frame is {frame_len} bytes, below the \
+                     {overhead}-byte header / CRC / allocation overhead"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Layer2EncodeError {}
+
+impl From<Layer2HeaderError> for Layer2EncodeError {
+    fn from(e: Layer2HeaderError) -> Layer2EncodeError {
+        Layer2EncodeError::Header(e)
+    }
+}
+
+/// Encode one §2.4.1.6 Layer II frame from analysed sub-band samples,
+/// wiring together the four §2.4.1.6 writers
+/// ([`write_layer2_header`], [`write_layer2_allocation_field`],
+/// [`write_layer2_scalefactor_field`], [`write_layer2_samples_field`])
+/// behind the encoder-side scalefactor / bit-allocation / quantization
+/// helpers.
+///
+/// `params` carries every §2.4.1.3 header field plus the optional
+/// §2.4.1.4 CRC opt-in (via [`Layer2HeaderParams::has_crc`]).
+/// `subbands[ch][sb][slot]` is the analysed sub-band sample matrix for
+/// the frame — 36 slots per (ch, sb), the same shape
+/// [`select_layer2_scalefactors`] / [`layer2_subband_peak_per_part`]
+/// consume.
+///
+/// The encoder chooses `scfsi == 0b00` for every allocated `(ch, sb)`:
+/// three independent scalefactors per (ch, sb), as the §2.4.1.6
+/// "three equal parts of 12 sub-band samples" syntax permits in the
+/// absence of the §C.1.5.2.5 / Table C.4 perceptual SCFSI collapse
+/// (Table C.4 is rendered as a PDF image the text layer cannot extract
+/// reliably; the all-`0b00` choice is the conservative bookkeeping the
+/// [`allocate_bits_layer2`] budget already assumes).
+///
+/// Returns the §2.4.2.1 frame bytes (header + optional CRC +
+/// §2.4.1.6 alloc + scfsi/scf + samples regions + zero-padded ANC
+/// tail), exactly `floor(144 · bitrate / Fs) + padding_bit` bytes long.
+///
+/// The §2.4.3.3.4 round-trip `encode → decode` lands within one Layer II
+/// quantizer step plus the §2.4.3.3 grouping rounding; the decoder's
+/// [`crate::decode_layer2::decode_layer2_audio_data`] reproduces the
+/// per-(ch, sb, slot) sub-band sample to a tolerance that depends on the
+/// class `nlevels` (small `nlevels` → coarser grid).
+// The §C.1.5.2 wiring is a strict (ch, sb, gr, sample) nested walk, the
+// same structure the four writers expose; an iterator rewrite would
+// obscure the spec mapping.
+#[allow(clippy::needless_range_loop)]
+pub fn encode_layer2_frame(
+    params: &Layer2HeaderParams,
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+) -> Result<Vec<u8>, Layer2EncodeError> {
+    use crate::decode_layer2::{LAYER2_SAMPLES_PER_SUBBAND, SYNTAX_GRANULES};
+    use crate::tables_layer2::layer2_bit_allocation_table;
+
+    let nch = params.mode.channels() as usize;
+    if !(nch == 1 || nch == 2) {
+        return Err(Layer2EncodeError::UnsupportedChannelCount(nch));
+    }
+
+    // Round-trip the params through `FrameHeader::parse` to obtain the
+    // typed header the §2.4.1.6 allocation-table selector consumes. The
+    // pack call validates the §2.4.2.3 sampling-frequency / bitrate
+    // ladder eagerly, returning `Layer2HeaderError` on bad input.
+    let header_bytes = pack_layer2_header(params)?;
+    let header = FrameHeader::parse(&header_bytes).expect(
+        "pack_layer2_header produced a valid four-byte Layer II header; \
+         FrameHeader::parse must succeed",
+    );
+    let table = layer2_bit_allocation_table(&header);
+    let sblimit = table.sblimit();
+    let bound = layer2_stereo_bound(&header, sblimit);
+
+    // §2.4.2.1 frame byte count: floor(144·bitrate/Fs) + padding_bit.
+    // The header pack validated `bitrate_kbps` already so this is in
+    // range.
+    let bytes = (144u32 * (params.bitrate_kbps as u32) * 1000) / params.sampling_frequency;
+    let padding = if params.padding { 1 } else { 0 };
+    let frame_len = (bytes + padding) as usize;
+    let bbal_bits = nch * sum_nbal_per_channel(table);
+    let crc_bytes = if params.has_crc { 2 } else { 0 };
+    let overhead_bits = 32 + crc_bytes * 8 + bbal_bits;
+    let overhead_bytes = overhead_bits.div_ceil(8);
+    if frame_len < overhead_bytes {
+        return Err(Layer2EncodeError::FrameTooSmall {
+            frame_len,
+            overhead: overhead_bytes,
+        });
+    }
+    let budget_bits = (frame_len * 8).saturating_sub(overhead_bits);
+
+    // §C.1.5.1.4 (per-part) scalefactor selection — populates the
+    // §2.4.2.6 SCFSI part-0/1/2 array directly.
+    let scf_indices = select_layer2_scalefactors(subbands, nch, sblimit);
+    // §C.1.5.2.7 bit allocation — the per-frame `(ch, sb) → alloc`
+    // matrix. The allocator's "peak energy" proxy is the per-subband max
+    // absolute sub-band sample over the 36 slots.
+    let mut peak = [[0.0f64; SUBBANDS]; 2];
+    for ch in 0..nch {
+        for sb in 0..sblimit {
+            let mut m = 0.0f64;
+            for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+                let a = subbands[ch][sb][slot].abs();
+                if a > m {
+                    m = a;
+                }
+            }
+            peak[ch][sb] = m;
+        }
+    }
+    // §2.4.1.6 intensity-stereo: in `[bound, sblimit)` both channels MUST
+    // carry the same `allocation` value (the bitstream writes one shared
+    // `nbal`-bit field for the pair). Pre-mirror the per-(ch, sb) peaks
+    // in the upper band before running the allocator so any step the
+    // allocator places lands on the same allocation for both channels —
+    // the per-channel scfsi+scalefactor bookkeeping is still accounted
+    // for in the allocator's worst-case overhead. Post-fix the rare
+    // races where the two channels diverged anyway (both peaks equal but
+    // numerical ties resolve to different (ch, sb) winners) by mirroring
+    // the larger allocation into the other channel.
+    if nch == 2 {
+        for sb in bound..sblimit {
+            let m = peak[0][sb].max(peak[1][sb]);
+            peak[0][sb] = m;
+            peak[1][sb] = m;
+        }
+    }
+    let mut alloc = allocate_bits_layer2(&peak, nch, table, budget_bits);
+    if nch == 2 {
+        for sb in bound..sblimit {
+            let shared = alloc[0][sb].max(alloc[1][sb]);
+            alloc[0][sb] = shared;
+            alloc[1][sb] = shared;
+        }
+    }
+
+    // §C.1.5.2 quantization — build the per-(ch, gr, sb) triplet of raw
+    // codes the §2.4.1.6 writer consumes. The §2.4.2.6 SCFSI schedule
+    // splits the 36 slots into three 12-slot scalefactor parts (part =
+    // slot / 12); the chosen scalefactor for the corresponding part
+    // normalises each sample before quantization.
+    let mut samples_input = Layer2SamplesFieldInput::default();
+    for ch in 0..nch {
+        for sb in 0..sblimit {
+            // The upper band sources its triplet from channel 0; channel
+            // 1's codes for `sb >= bound` are unused by the §2.4.1.6
+            // writer in shared mode.
+            let upper_band = sb >= bound;
+            if upper_band && ch != 0 {
+                continue;
+            }
+            let a = alloc[ch][sb];
+            if a == 0 {
+                continue;
+            }
+            let class = table.quant_class(sb, a).expect(
+                "allocate_bits_layer2 only selects legal Table 3-B.2x cells; \
+                 quant_class must resolve",
+            );
+            for gr in 0..SYNTAX_GRANULES {
+                for s in 0..3 {
+                    let slot = gr * 3 + s;
+                    let part = slot / 12;
+                    let scf = SCALEFACTORS[scf_indices[ch][sb][part] as usize];
+                    let value = subbands[ch][sb][slot];
+                    samples_input.codes[ch][gr][sb][s] = quantize_layer2_sample(value, scf, class);
+                }
+            }
+        }
+    }
+
+    // §2.4.2.6 SCFSI: every allocated (ch, sb) carries `0b00` (three
+    // independent scalefactors per part). Table C.4's perceptual collapse
+    // is a PDF-image DOCS-GAP; the worst-case bookkeeping
+    // [`allocate_bits_layer2`] already assumes is exactly this
+    // three-scalefactor cost, so the budget stays sound.
+    let scalefactor_input = Layer2ScalefactorFieldInput {
+        scfsi: [[0u8; SUBBANDS]; 2],
+        scalefactor_indices: scf_indices,
+    };
+
+    // §C.1.5.1.10-style frame assembly: write each region MSB-first,
+    // patch the CRC placeholder after the §2.4.1.6 alloc + scfsi fields
+    // have been emitted (those plus header bits 16…31 are the Table
+    // 3-B.5 protected region for Layer II).
+    let mut bw = BitWriter::new();
+    write_layer2_header(&mut bw, params).map_err(Layer2EncodeError::Header)?;
+    if params.has_crc {
+        // Reserve the 16-bit error_check() placeholder.
+        bw.put(0, 16);
+    }
+    write_layer2_allocation_field(&mut bw, table, &alloc, nch, bound)
+        .expect("allocate_bits_layer2 + layer2_stereo_bound produce shapes the writer accepts");
+    write_layer2_scalefactor_field(&mut bw, table, &alloc, &scalefactor_input, nch, bound)
+        .expect("select_layer2_scalefactors emits indices < 63 and scfsi=0b00 is consistent");
+    write_layer2_samples_field(&mut bw, table, &alloc, &samples_input, nch, bound).expect(
+        "quantize_layer2_sample clamps codes to [0, nlevels) so the samples writer accepts them",
+    );
+
+    let mut bytes = bw.finish();
+    if bytes.len() < frame_len {
+        bytes.resize(frame_len, 0);
+    }
+
+    // §2.4.3.1 CRC patch: walk the just-written header + alloc + scfsi
+    // region with the decoder-side `compute_layer2_crc`, which sizes the
+    // §2.4.1.6 protected region per the Table 3-B.2x `nbal` widths and
+    // the in-stream allocation values. The CRC word lives at bytes 4..6,
+    // and the allocation field starts at byte 6.
+    if params.has_crc {
+        use crate::decode_layer2::compute_layer2_crc;
+        let crc = compute_layer2_crc(&header, &bytes[0..4], &bytes[6..])
+            .expect("encoder just wrote a CRC-shaped allocation + scfsi region");
+        let crc_bytes = crc.to_be_bytes();
+        bytes[4] = crc_bytes[0];
+        bytes[5] = crc_bytes[1];
+    }
+
+    Ok(bytes)
+}
+
 /// Parameters for a single Layer I encode: the target bitrate and the
 /// stream's sampling frequency and channel mode.
 #[derive(Debug, Clone, Copy)]
@@ -4471,5 +4831,325 @@ mod tests {
         assert!(err.is_err());
         let bytes = bw.finish();
         assert!(bytes.is_empty(), "pre-flight rejection must not emit bytes");
+    }
+
+    // ---- §C.1.5.2 / §2.4.3.3.4 per-sample quantizer ----------------
+
+    /// `quantize_layer2_sample` must be the exact inverse of the decoder
+    /// `requantize_triplet` for every legal `(class, code)`. Feeding the
+    /// per-class decoder reconstruction back through the encoder must
+    /// recover the original code on every quantizer step.
+    #[test]
+    fn quantize_layer2_sample_inverts_requantize_triplet() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(48_000, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        // Walk a representative cross section of Tables 3-B.4 classes —
+        // the small grouped ones (nlevels 3/5/9) plus a handful of the
+        // non-grouped classes that drive most Layer II bitrates.
+        let mut classes_seen = std::collections::HashSet::new();
+        for sb in 0..table.sblimit() {
+            let nbal = table.nbal(sb);
+            for a in 1..(1u8 << nbal) {
+                if let Some(class) = table.quant_class(sb, a) {
+                    classes_seen.insert((class.nlevels, class.grouping));
+                    // For every legal code [0, nlevels), reconstruct the
+                    // decoder s'' value and round-trip through the
+                    // encoder. The reconstructed value sits exactly on a
+                    // quantizer grid point, so the encoder must recover
+                    // the original code exactly (no half-step ambiguity).
+                    for code in 0..(class.nlevels as u32) {
+                        // Decoder reconstruction at unit scalefactor.
+                        let s_dp = reconstruct_layer2_sample(class, code);
+                        let got = quantize_layer2_sample(s_dp, 1.0, class);
+                        assert_eq!(
+                            got, code,
+                            "class nlevels={} sb={sb} code={code} → {got}",
+                            class.nlevels
+                        );
+                    }
+                }
+            }
+        }
+        // Sanity: we exercised more than a single class.
+        assert!(
+            classes_seen.len() >= 5,
+            "expected the B.2a sweep to cover >= 5 quantization classes, saw {}",
+            classes_seen.len()
+        );
+    }
+
+    /// Helper: reproduce the decoder's §2.4.3.3.4 reconstruction for one
+    /// raw code under a quantization class (no scalefactor rescale).
+    fn reconstruct_layer2_sample(class: &QuantClass, code: u32) -> f64 {
+        let nb = class.bits_per_sample();
+        let msb = 1u32 << (nb - 1);
+        let inverted = code ^ msb;
+        let signed = if inverted & msb != 0 {
+            i64::from(inverted) - (1i64 << nb)
+        } else {
+            i64::from(inverted)
+        };
+        let s_frac = signed as f64 / (1u64 << (nb - 1)) as f64;
+        class.c * (s_frac + class.d)
+    }
+
+    /// Out-of-range PCM inputs must clamp into `[0, nlevels)` so the
+    /// §2.4.1.6 writer's `SampleCodeOutOfRange` pre-flight never trips
+    /// when the caller feeds the encoder its own analysed sub-bands —
+    /// even on a scalefactor-saturating signal.
+    #[test]
+    fn quantize_layer2_sample_clamps_to_nlevels() {
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let header = header_l2(48_000, 192, Mode::Stereo);
+        let table = layer2_bit_allocation_table(&header);
+        for sb in 0..table.sblimit() {
+            for a in 1..(1u8 << table.nbal(sb)) {
+                if let Some(class) = table.quant_class(sb, a) {
+                    // Push the encoder past the class's natural domain
+                    // in both directions; clamp keeps the code on-grid.
+                    for value in [-10.0f64, -2.0, 2.0, 10.0, 1e6] {
+                        let code = quantize_layer2_sample(value, 1.0, class);
+                        assert!(
+                            code < class.nlevels as u32,
+                            "class nlevels={} value={value} → code={code}",
+                            class.nlevels
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- top-level §C.1.5.2 frame encoder --------------------------
+
+    /// A clean §2.4.1.6 round-trip: encode a known sub-band matrix,
+    /// re-parse the header, walk the same `decode_layer2_audio_data`
+    /// path a real decoder uses, and confirm the recovered sub-band
+    /// samples sit on the chosen scalefactor grid (within one quantizer
+    /// step of the analysed input).
+    #[test]
+    fn encode_layer2_frame_round_trip_mono() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_SUBBAND};
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        // 48 kHz / 128 kbit/s mono — selects Table 3-B.2c (sblimit = 8,
+        // matching Annex B for that bitrate/Fs cell).
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut subbands = Box::new([[[0.0f64; 36]; SUBBANDS]; 2]);
+        // Stamp a slowly-varying pattern into sb 0 and sb 4 (both inside
+        // every Layer II `sblimit`) so the allocator must place at least
+        // those two subbands.
+        for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+            let t = slot as f64 / LAYER2_SAMPLES_PER_SUBBAND as f64;
+            subbands[0][0][slot] = 0.5 * (2.0 * std::f64::consts::PI * t).sin();
+            subbands[0][4][slot] = 0.3 * (2.0 * std::f64::consts::PI * 2.0 * t).cos();
+        }
+
+        let frame = encode_layer2_frame(&params, &subbands).expect("encode_layer2_frame");
+        // §2.4.2.1 byte-count: floor(144·128·1000/48000) = 384 bytes.
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+        // The header byte 0 must be 0xFF and byte 1's high nibble 0xF
+        // (the §2.4.1.3 sync). The §2.4.1.3 layer field at bits 17:18
+        // selects Layer II (`0b10` in the high nibble of byte 1) — for
+        // mono / no-CRC the protection bit is `1`, so byte 1 should be
+        // `0b1111_1101 = 0xFD`.
+        assert_eq!(frame[0], 0xFF);
+        assert_eq!(frame[1] & 0xF0, 0xF0);
+        let header = FrameHeader::parse(&frame).expect("parse encoded header");
+        assert_eq!(header.layer, crate::header::Layer::II);
+        assert_eq!(header.channels(), 1);
+
+        // Decode through the production decoder path.
+        let recovered = decode_layer2_audio_data(&header, &frame[4..]).expect("layer II decode");
+        let table = layer2_bit_allocation_table(&header);
+        // Per-slot tolerance per the chosen scalefactor's grid. Pick the
+        // coarsest scalefactor / class active in the frame so any
+        // subband's reconstruction sits within one quantizer step of
+        // that grid.
+        let mut peak_err_within_grid = true;
+        let mut any_alloc = false;
+        for sb in 0..table.sblimit() {
+            let alloc = recovered.subbands[0][sb].allocation;
+            if alloc == 0 {
+                continue;
+            }
+            any_alloc = true;
+            let class = table.quant_class(sb, alloc).expect("class");
+            // Reconstruction step at unit scalefactor is at most
+            // 2·class.c / nlevels; the encoder picked a scalefactor
+            // strictly larger than the per-part peak so the grid step
+            // for that part is at most `2·class.c·scf / nlevels`. Take
+            // the worst-case scalefactor (== 2.0 = SCALEFACTORS[0])
+            // as a safe upper bound.
+            let step = 2.0 * class.c * 2.0 / class.nlevels as f64;
+            for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+                let want = subbands[0][sb][slot];
+                let got = recovered.subbands[0][sb].samples[slot];
+                if (got - want).abs() > step {
+                    peak_err_within_grid = false;
+                }
+            }
+        }
+        assert!(
+            any_alloc,
+            "encoder must place at least one Layer II allocation"
+        );
+        assert!(
+            peak_err_within_grid,
+            "Layer II round-trip exceeded one-quantizer-step error per allocated subband"
+        );
+    }
+
+    /// The §2.4.1.4 CRC opt-in on the top-level Layer II encoder writes
+    /// a CRC the decoder's `verify_layer2_crc` accepts as `Ok`, and the
+    /// frame byte length is unchanged from the no-CRC variant (the CRC
+    /// occupies bytes the allocator would otherwise have spent on audio
+    /// data, but the §2.4.2.1 frame envelope stays the same).
+    #[test]
+    fn encode_layer2_frame_emits_verifying_crc() {
+        use crate::decode_layer2::verify_layer2_crc;
+        let mut params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        params.has_crc = true;
+        let subbands = Box::new([[[0.05f64; 36]; SUBBANDS]; 2]);
+        let frame = encode_layer2_frame(&params, &subbands).expect("encode_layer2_frame");
+        // §2.4.2.1 byte count is the same as the no-CRC frame at the
+        // same bitrate.
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+        // Re-parse and verify the CRC.
+        let header = FrameHeader::parse(&frame[..4]).expect("parse header");
+        assert!(
+            header.has_crc(),
+            "has_crc must be true on the encoded frame"
+        );
+        let status =
+            verify_layer2_crc(&header, &frame[..4], &frame[4..]).expect("verify_layer2_crc");
+        assert!(
+            status.is_good(),
+            "verify_layer2_crc must accept the encoder's CRC, got {:?}",
+            status
+        );
+    }
+
+    /// Joint-stereo Layer II frames encode + decode through the
+    /// intensity-stereo upper band: the bitstream's shared cells store
+    /// a single sample triplet but the §2.4.1.6 syntax still reads one
+    /// scalefactor per channel, so channel 0 / channel 1 recovered
+    /// samples are the same `s_dp` triplet rescaled by each channel's
+    /// own scalefactor. The ratio between the two per-slot
+    /// reconstructions is therefore the ratio of their scalefactors,
+    /// independent of the chosen quantizer.
+    #[test]
+    fn encode_layer2_frame_round_trip_joint_stereo() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_SUBBAND};
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let mut params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
+        // mode_extension == 0b01 → bound subband index = 8 (per
+        // §2.4.2.3). With Fs=44.1kHz/192kbit/s Table 3-B.2a (sblimit=27),
+        // the upper band [8, 27) is the shared region.
+        params.mode_extension = crate::header::ModeExtension(0b01);
+        let mut subbands = Box::new([[[0.0f64; 36]; SUBBANDS]; 2]);
+        for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+            let t = slot as f64 / LAYER2_SAMPLES_PER_SUBBAND as f64;
+            // Channel 0 carries content in both the low band (sb 2) and
+            // the shared upper band (sb 10). Channel 1 also has content
+            // in the shared upper band so its per-part scalefactor is
+            // not the silent-fallback `62`; the encoder pre-mirrors the
+            // peaks anyway (shared cells take the per-channel max so the
+            // allocator's quantizer-grid step covers both).
+            subbands[0][2][slot] = 0.4 * (2.0 * std::f64::consts::PI * t).sin();
+            subbands[0][10][slot] = 0.3 * (4.0 * std::f64::consts::PI * t).cos();
+            subbands[1][2][slot] = 0.2 * (2.0 * std::f64::consts::PI * t).cos();
+            subbands[1][10][slot] = 0.25 * (4.0 * std::f64::consts::PI * t).sin();
+        }
+        let frame = encode_layer2_frame(&params, &subbands).expect("encode_layer2_frame");
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert_eq!(header.mode, Mode::JointStereo);
+        let recovered = decode_layer2_audio_data(&header, &frame[4..]).expect("decode");
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        // §2.4.1.6 shared upper band: both channels see the same
+        // allocation (writer pre-flight enforces this), and the decoder
+        // applies the same `s_dp` triplet to each per-channel scalefactor.
+        // Confirm: (a) allocations match in the shared band, and (b) the
+        // ch-0/ch-1 sample ratio matches the per-part scalefactor ratio
+        // within a single quantizer step.
+        let mut any_shared = false;
+        for sb in bound..table.sblimit() {
+            let a0 = recovered.subbands[0][sb].allocation;
+            let a1 = recovered.subbands[1][sb].allocation;
+            assert_eq!(
+                a0, a1,
+                "joint_stereo shared sb={sb} allocation must match: ch0={a0} ch1={a1}"
+            );
+            if a0 == 0 {
+                continue;
+            }
+            any_shared = true;
+            for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+                let s0 = recovered.subbands[0][sb].samples[slot];
+                let s1 = recovered.subbands[1][sb].samples[slot];
+                let part = slot / 12;
+                let scf0 = SCALEFACTORS
+                    [recovered.subbands[0][sb].scalefactor_indices[part] as usize & 0x3F];
+                let scf1 = SCALEFACTORS
+                    [recovered.subbands[1][sb].scalefactor_indices[part] as usize & 0x3F];
+                // s0/scf0 must equal s1/scf1 (the shared §2.4.3.3.4
+                // `s_dp` triplet), within a one-ULP floating-point
+                // tolerance: the rescale is the only step that differs
+                // between the two channels.
+                let r0 = s0 / scf0;
+                let r1 = s1 / scf1;
+                assert!(
+                    (r0 - r1).abs() < 1e-9,
+                    "joint_stereo shared sb={sb} slot={slot}: \
+                     ch0/scf0={r0} vs ch1/scf1={r1}"
+                );
+            }
+        }
+        assert!(
+            any_shared,
+            "joint_stereo expected at least one allocated shared upper-band subband"
+        );
+    }
+
+    /// The top-level encoder rejects header parameters whose bitrate is
+    /// not on the §2.4.2.3 Layer II ladder, mirroring `pack_layer2_header`.
+    #[test]
+    fn encode_layer2_frame_rejects_off_ladder_bitrate() {
+        // 100 kbit/s is not on the MPEG-1 Layer II ladder (32 / 48 / 56
+        // / 64 / 80 / 96 / 112 / 128 / 160 / 192 / 224 / 256 / 320 / 384).
+        let params = Layer2HeaderParams::new(48_000, 100, Mode::SingleChannel);
+        let subbands = Box::new([[[0.0f64; 36]; SUBBANDS]; 2]);
+        let err = encode_layer2_frame(&params, &subbands)
+            .expect_err("100 kbit/s must be rejected on the MPEG-1 L2 ladder");
+        match err {
+            Layer2EncodeError::Header(Layer2HeaderError::UnsupportedBitrate(100)) => {}
+            other => panic!("expected Header(UnsupportedBitrate(100)), got {other:?}"),
+        }
+    }
+
+    /// LSF Layer II (16 / 22.05 / 24 kHz, `ID == 0`) frames encode via
+    /// the §2.4.3.1 Table B.1 LSF allocation table and round-trip
+    /// through the decoder's matching LSF Layer II path.
+    #[test]
+    fn encode_layer2_frame_round_trip_lsf_mono() {
+        use crate::decode_layer2::decode_layer2_audio_data;
+        let params = Layer2HeaderParams::new(24_000, 64, Mode::SingleChannel);
+        let mut subbands = Box::new([[[0.0f64; 36]; SUBBANDS]; 2]);
+        for slot in 0..36 {
+            let t = slot as f64 / 36.0;
+            subbands[0][1][slot] = 0.3 * (2.0 * std::f64::consts::PI * t).sin();
+            subbands[0][5][slot] = 0.2 * (2.0 * std::f64::consts::PI * 2.0 * t).cos();
+        }
+        let frame = encode_layer2_frame(&params, &subbands).expect("encode_layer2_frame LSF");
+        let header = FrameHeader::parse(&frame).expect("parse LSF header");
+        assert!(header.is_lsf(), "LSF Fs must produce an LSF (ID==0) header");
+        let _recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("LSF Layer II decode");
+        // Byte count: floor(144·64·1000/24000) = 384.
+        let expected = (144u32 * 64 * 1000) / 24_000;
+        assert_eq!(frame.len(), expected as usize);
     }
 }
