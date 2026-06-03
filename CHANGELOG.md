@@ -8,6 +8,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ISO/IEC 13818-3 Annex B Table B.1 LSF Layer II allocation table
+  transcribed.** Previously this crate aliased the MPEG-2 LSF Layer II
+  (`Fs ∈ {16, 22.05, 24} kHz`) decode path to MPEG-1 Layer II Table
+  3-B.2b (sblimit = 30, Σ nbal = 94). ISO/IEC 13818-3:1997 §2.4.3.1
+  "Audio Decoding Layer I, II" (printed p.49) substitutes **Table B.1
+  "Possible quantisation per subband, Layer II — Sampling frequencies
+  16; 22,05; 24 kHz"** (printed p.71 / PDF page 81) for all of B.2a..d
+  at every LSF bitrate. The replacement table has `sblimit = 30` but a
+  strictly narrower per-subband ladder: `nbal = 4` for `sb 0..=3`
+  (15-column ladder `{3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023,
+  2047, 4095, 8191, 16383}`), `nbal = 3` for `sb 4..=10` (7-column
+  ladder `{3, 5, 9, 15, 31, 63, 127}`), `nbal = 2` for `sb 11..=29`
+  (3-column ladder `{3, 5, 9}`), and `nbal = 0` for `sb 30..=31`
+  (silenced). `Σ nbal = 4·4 + 7·3 + 19·2 = 75` exactly matches the
+  footer printed below the table. Implemented in
+  `tables_layer2::TABLE_LSF` and wired into the
+  `layer2_bit_allocation_table(header)` selector — Layer II frames with
+  `ID == 0` now resolve to `TABLE_LSF` rather than `TABLE_B2B`, so the
+  Layer II decoder, the Layer II `audio_data()` / `error_check()` CRC
+  sizing, and the Layer II frame writers (`write_layer2_allocation_field`,
+  `write_layer2_scalefactor_field`, `write_layer2_samples_field`) all
+  see the correct per-subband `nbal` widths and quantisation classes at
+  16 / 22.05 / 24 kHz with no further changes to the per-region writer
+  logic.
+  - **+7 unit tests** cover: the per-subband `nbal` pattern (`{4, 4, 4,
+    4, 3, 3, 3, 3, 3, 3, 3, 2, …, 2, 0, 0}`) and `Σ nbal = 75` total
+    across `{16, 22.05, 24} kHz × {8, 64, 144, 160} kbit/s`; the
+    `sb 0..=3` row's 15-column quant-class resolution against the exact
+    spec sequence; the `sb 4..=10` row's 7-column resolution; the
+    `sb 11..=29` row's 3-column resolution; `sb 30..=31` `nbal = 0`
+    silenced behaviour; a structural-distinction test that shows
+    Table B.1 differs from B.2b at `nbal(5)` (B.1 = 3, B.2b = 4) and at
+    the column count for `sb = 11` (B.1 has 3, B.2b has 7); and a
+    pointer-identity sweep over the full 13818-3 §2.4.2.3 Layer II/III
+    LSF bitrate ladder (`{8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112,
+    128, 144, 160}` kbit/s) at each of the three LSF rates confirming
+    the §2.4.3.1 "for all bitrates" invariance.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **242 → 259**.
+
 - **§2.4.3.1 free-format frame-length probe.** The previously-deferred
   free-format (`bitrate_index == 0b0000`) frame-length recovery is now
   implemented. ISO/IEC 11172-3 (1993) §2.4.3.1 states verbatim: *"If

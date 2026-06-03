@@ -3,6 +3,13 @@
 //! page renders (PDF pages 52-53 for B.2a/B.2b, 54-55 for B.2c/B.2d,
 //! 59 for B.4).
 //!
+//! Also carries the **MPEG-2 LSF Layer II** allocation table from
+//! ISO/IEC 13818-3:1997 Annex B Table B.1 ("Possible quantisation
+//! per subband, Layer II — Sampling frequencies 16; 22,05; 24 kHz",
+//! printed p.71 / PDF page 81). 13818-3 §2.4.3.1 substitutes that
+//! single table for all of 11172-3's B.2a..d when decoding Layer II
+//! frames at any LSF sampling frequency / bitrate.
+//!
 //! ## Table 3-B.2x — "Possible quantization per subband"
 //!
 //! Four sub-tables differ by the `(sampling_frequency, bitrate per
@@ -565,6 +572,91 @@ const TABLE_B2D: AllocationTable = AllocationTable {
     rows: &TABLE_B2D_ROWS,
 };
 
+// ---- 13818-3 Annex B Table B.1 (LSF Layer II, sblimit=30,
+//      sum_of_nbal=75) -----------------------------------------------
+//
+// ISO/IEC 13818-3:1997 §2.4.3.1 "Audio Decoding Layer I, II"
+// (printed p.49) substitutes a single Layer II allocation table for
+// all three LSF sampling frequencies (16 / 22.05 / 24 kHz) and all
+// bitrates: "For Layer II, instead of tables B.2 (Layer II bit
+// allocation tables) in ISO/IEC 11172-3, table B.1 (Possible
+// quantisation per subband, Layer II) of this part of ISO/IEC 13818
+// should be used." The shape is structurally different from any of
+// 11172-3 B.2a..d:
+//
+// * sb 0..3   nbal = 4, levels = {3, 5, 7, 9, 15, 31, 63, 127, 255,
+//                                 511, 1023, 2047, 4095, 8191, 16383}
+// * sb 4..10  nbal = 3, levels = {3, 5, 9, 15, 31, 63, 127}
+// * sb 11..29 nbal = 2, levels = {3, 5, 9}
+// * sb 30..31 nbal = 0 (carry no allocation, no samples — §2.4.3.3.5)
+//
+// sblimit = 30, Σ nbal = 4·4 + 7·3 + 19·2 = 75 — matches the footer
+// printed below the table (PDF page 81 of the staged
+// `ISO_IEC_13818-3-MPEG2-audio-1997.pdf`).
+
+const ROW_LSF_0_3: &[Option<u16>] = &[
+    Some(3),
+    Some(5),
+    Some(7),
+    Some(9),
+    Some(15),
+    Some(31),
+    Some(63),
+    Some(127),
+    Some(255),
+    Some(511),
+    Some(1023),
+    Some(2047),
+    Some(4095),
+    Some(8191),
+    Some(16383),
+];
+const ROW_LSF_4_10: &[Option<u16>] = &[
+    Some(3),
+    Some(5),
+    Some(9),
+    Some(15),
+    Some(31),
+    Some(63),
+    Some(127),
+];
+const ROW_LSF_11_29: &[Option<u16>] = &[Some(3), Some(5), Some(9)];
+
+const TABLE_LSF_ROWS: [AllocationRow; 32] = {
+    let mut rows = [AllocationRow {
+        nbal: 0,
+        levels: &[],
+    }; 32];
+    let mut sb = 0;
+    while sb <= 3 {
+        rows[sb] = AllocationRow {
+            nbal: 4,
+            levels: ROW_LSF_0_3,
+        };
+        sb += 1;
+    }
+    while sb <= 10 {
+        rows[sb] = AllocationRow {
+            nbal: 3,
+            levels: ROW_LSF_4_10,
+        };
+        sb += 1;
+    }
+    while sb <= 29 {
+        rows[sb] = AllocationRow {
+            nbal: 2,
+            levels: ROW_LSF_11_29,
+        };
+        sb += 1;
+    }
+    rows
+};
+
+const TABLE_LSF: AllocationTable = AllocationTable {
+    sblimit_value: 30,
+    rows: &TABLE_LSF_ROWS,
+};
+
 /// Select the per-frame bit-allocation table for the given Layer II
 /// header (§2.4.3.3.1).
 ///
@@ -579,13 +671,13 @@ const TABLE_B2D: AllocationTable = AllocationTable {
 /// * **B.2c** (sblimit=8):  Fs = 48/44.1 kHz at 32 and 48.
 /// * **B.2d** (sblimit=12): Fs = 32 kHz at 32 and 48.
 ///
-/// For ISO/IEC 13818-3 LSF Fs = 16/22.05/24 kHz the 13818-3 §2.4.3
-/// extension specifies one shared table covering all combinations
-/// (sblimit=30, structurally identical to B.2b). We map every LSF
-/// frame to B.2b accordingly; explicit `Fs ≤ 24 kHz` cases all share
-/// the LSF Layer-II "Possible quantization" table reproduced in
-/// 13818-3 Annex B which has the same shape as 11172-3 B.2b — see the
-/// 13818-3 §B.1 annex page.
+/// For ISO/IEC 13818-3 LSF Fs ∈ {16, 22.05, 24} kHz, the 13818-3
+/// §2.4.3.1 substitution mandates the single LSF table — 13818-3 Annex
+/// B Table B.1 ("Possible quantisation per subband, Layer II — Sampling
+/// frequencies 16; 22,05; 24 kHz", printed p.71) — for **all** bitrate
+/// values. That table has `sblimit = 30` and `Σ nbal = 75` (vs B.2b's
+/// 94) and a strictly narrower per-subband ladder; it is implemented
+/// as [`TABLE_LSF`] above.
 ///
 /// When a `(Fs, kbps-per-channel)` combination is not in any "allowed"
 /// list (e.g. an out-of-spec total bitrate × Fs the §2.4.2.3 footnote
@@ -597,8 +689,10 @@ const TABLE_B2D: AllocationTable = AllocationTable {
 pub fn layer2_bit_allocation_table(header: &FrameHeader) -> &'static AllocationTable {
     debug_assert!(matches!(header.layer, Layer::II));
     if matches!(header.id, Id::Mpeg2Lsf) {
-        // 13818-3 §B.1 LSF Layer II allocation table (sblimit = 30).
-        return &TABLE_B2B;
+        // 13818-3 §2.4.3.1 / Annex B Table B.1 — single LSF Layer II
+        // allocation table for all of Fs ∈ {16, 22.05, 24} kHz and all
+        // bitrates.
+        return &TABLE_LSF;
     }
     let kbps_total = match header.bitrate {
         crate::header::Bitrate::Fixed(k) => k,
@@ -823,6 +917,193 @@ mod tests {
                 (l1 - l2).abs() < 1e-9,
                 "nlevels={nlevels} (nb={nb}): L1 {l1} vs L2 {l2}",
             );
+        }
+    }
+
+    // ---- 13818-3 Annex B Table B.1 (LSF Layer II) ----------------
+
+    fn header_lsf(fs: u32, kbps: u16, mode: crate::header::Mode) -> FrameHeader {
+        FrameHeader {
+            id: Id::Mpeg2Lsf,
+            layer: Layer::II,
+            protection: true,
+            bitrate: crate::header::Bitrate::Fixed(kbps),
+            sampling_frequency: fs,
+            padding: false,
+            private: false,
+            mode,
+            mode_extension: crate::header::ModeExtension(0),
+            copyright: false,
+            original: true,
+            emphasis: crate::header::Emphasis::None,
+        }
+    }
+
+    #[test]
+    fn lsf_layer2_shape_per_subband() {
+        // 13818-3 Annex B Table B.1: nbal pattern is
+        //   sb 0..3  -> 4
+        //   sb 4..10 -> 3
+        //   sb 11..29 -> 2
+        //   sb 30..31 -> 0
+        // sblimit = 30, sum_of_nbal = 75 (footer printed below the
+        // table on PDF page 81).
+        for fs in [16_000u32, 22_050, 24_000] {
+            for kbps in [8u16, 64, 144, 160] {
+                let t = layer2_bit_allocation_table(&header_lsf(
+                    fs,
+                    kbps,
+                    crate::header::Mode::SingleChannel,
+                ));
+                assert_eq!(t.sblimit(), 30, "Fs={fs} kbps={kbps}");
+                for sb in 0..=3 {
+                    assert_eq!(t.nbal(sb), 4, "sb {sb} nbal mismatch");
+                }
+                for sb in 4..=10 {
+                    assert_eq!(t.nbal(sb), 3, "sb {sb} nbal mismatch");
+                }
+                for sb in 11..=29 {
+                    assert_eq!(t.nbal(sb), 2, "sb {sb} nbal mismatch");
+                }
+                for sb in 30..32 {
+                    assert_eq!(t.nbal(sb), 0, "sb {sb} nbal mismatch");
+                }
+                let total: u32 = (0..t.sblimit()).map(|sb| t.nbal(sb) as u32).sum();
+                assert_eq!(total, 75);
+            }
+        }
+    }
+
+    #[test]
+    fn lsf_layer2_quant_class_row_0_3() {
+        // sb 0..3 row: nbal = 4 → 15 valid columns ⇒ allocation
+        // indices 1..=15 map to {3, 5, 7, 9, 15, 31, 63, 127, 255, 511,
+        // 1023, 2047, 4095, 8191, 16383} per Table B.1.
+        let expected: [u16; 15] = [
+            3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383,
+        ];
+        let t = layer2_bit_allocation_table(&header_lsf(
+            24_000,
+            64,
+            crate::header::Mode::SingleChannel,
+        ));
+        for sb in 0..=3 {
+            // alloc = 0 ⇒ no samples (not present in the table).
+            assert!(t.quant_class(sb, 0).is_none());
+            for (i, &nl) in expected.iter().enumerate() {
+                let alloc = (i + 1) as u8;
+                let cls = t
+                    .quant_class(sb, alloc)
+                    .unwrap_or_else(|| panic!("sb {sb} alloc {alloc} missing"));
+                assert_eq!(cls.nlevels, nl, "sb {sb} alloc {alloc}");
+            }
+        }
+    }
+
+    #[test]
+    fn lsf_layer2_quant_class_row_4_10() {
+        // sb 4..10 row: nbal = 3 → 7 valid columns ⇒ allocation indices
+        // 1..=7 map to {3, 5, 9, 15, 31, 63, 127} per Table B.1.
+        let expected: [u16; 7] = [3, 5, 9, 15, 31, 63, 127];
+        let t = layer2_bit_allocation_table(&header_lsf(
+            16_000,
+            32,
+            crate::header::Mode::SingleChannel,
+        ));
+        for sb in 4..=10 {
+            assert!(t.quant_class(sb, 0).is_none());
+            for (i, &nl) in expected.iter().enumerate() {
+                let alloc = (i + 1) as u8;
+                let cls = t
+                    .quant_class(sb, alloc)
+                    .unwrap_or_else(|| panic!("sb {sb} alloc {alloc} missing"));
+                assert_eq!(cls.nlevels, nl, "sb {sb} alloc {alloc}");
+            }
+        }
+    }
+
+    #[test]
+    fn lsf_layer2_quant_class_row_11_29() {
+        // sb 11..29 row: nbal = 2 → 3 valid columns ⇒ allocation indices
+        // 1..=3 map to {3, 5, 9} per Table B.1.
+        let expected: [u16; 3] = [3, 5, 9];
+        let t = layer2_bit_allocation_table(&header_lsf(22_050, 96, crate::header::Mode::Stereo));
+        for sb in 11..=29 {
+            assert!(t.quant_class(sb, 0).is_none());
+            for (i, &nl) in expected.iter().enumerate() {
+                let alloc = (i + 1) as u8;
+                let cls = t
+                    .quant_class(sb, alloc)
+                    .unwrap_or_else(|| panic!("sb {sb} alloc {alloc} missing"));
+                assert_eq!(cls.nlevels, nl, "sb {sb} alloc {alloc}");
+            }
+        }
+    }
+
+    #[test]
+    fn lsf_layer2_subbands_30_31_are_silent() {
+        // §2.4.3.3.5: subbands at or above sblimit carry no bits and
+        // decode as zero samples.
+        let t = layer2_bit_allocation_table(&header_lsf(
+            24_000,
+            64,
+            crate::header::Mode::SingleChannel,
+        ));
+        for sb in 30..32 {
+            assert_eq!(t.nbal(sb), 0);
+            // alloc = 0 ⇒ None always; any non-zero alloc would be
+            // unreachable here since nbal = 0 means the bit-allocation
+            // field reads no bits for these subbands.
+            assert!(t.quant_class(sb, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn lsf_layer2_distinct_from_b2b() {
+        // The previous LSF mapping aliased to B.2b. Confirm B.1 differs
+        // structurally: B.2b has nbal == 4 at sb = 5 (in the 3..10
+        // band), while Table B.1 has nbal == 3 there. Equivalent test
+        // on the level vector for sb 11 (B.2b row 11..22 has 7 valid
+        // columns; B.1 row 11..29 has 3).
+        let lsf = layer2_bit_allocation_table(&header_lsf(
+            24_000,
+            64,
+            crate::header::Mode::SingleChannel,
+        ));
+        let mpeg1_b2b = layer2_bit_allocation_table(&header_mp1(
+            44_100,
+            128,
+            crate::header::Mode::SingleChannel,
+        ));
+        assert_eq!(lsf.nbal(5), 3);
+        assert_eq!(mpeg1_b2b.nbal(5), 4);
+        // Column count differs at sb 11: B.1 has 3 columns, B.2b has 7.
+        assert!(lsf.quant_class(11, 3).is_some());
+        assert!(lsf.quant_class(11, 4).is_none());
+        assert!(mpeg1_b2b.quant_class(11, 4).is_some());
+    }
+
+    #[test]
+    fn lsf_layer2_table_invariant_in_bitrate() {
+        // §2.4.3.1 substitution: one LSF Layer II table is used "for
+        // all" bitrates. Confirm that holds across the entire 13818-3
+        // §2.4.2.3 Layer II/III LSF ladder (8 … 160 kbit/s) at each of
+        // the three LSF rates.
+        let reference =
+            layer2_bit_allocation_table(&header_lsf(24_000, 8, crate::header::Mode::SingleChannel));
+        for fs in [16_000u32, 22_050, 24_000] {
+            for kbps in [8u16, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160] {
+                let t = layer2_bit_allocation_table(&header_lsf(
+                    fs,
+                    kbps,
+                    crate::header::Mode::SingleChannel,
+                ));
+                // Pointer identity ⇒ same `&'static` table.
+                assert!(
+                    std::ptr::eq(t, reference),
+                    "Fs {fs} kbps {kbps} resolved to a different table",
+                );
+            }
         }
     }
 

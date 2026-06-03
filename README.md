@@ -131,10 +131,10 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   **RMS = 0.50 LSB, max|err| = 1 LSB across 20 736 samples** —
   essentially bit-exact, the residual being IEEE-754 ordering. A full
   Layer II *encoder* (frame writer + §C.1.5.2.5 SCFSI selection from
-  Table C.4 + quantization with Table C.6 (A, B) constants) and a
-  transcription of the 13818-3 LSF Layer II allocation table for
-  Fs ∈ {16, 22.05, 24} kHz remain followups; the §C.1.5.2.7 bit
-  allocator and the Table C.5 SNR ladder are now in tree (see below).
+  Table C.4 + quantization with Table C.6 (A, B) constants) remains
+  a followup; the §C.1.5.2.7 bit allocator, the Table C.5 SNR ladder,
+  and the 13818-3 Annex B Table B.1 LSF Layer II allocation table for
+  Fs ∈ {16, 22.05, 24} kHz are now in tree (see below).
 - **Layer II §2.4.3.1 CRC-16 `error_check()` verification** over the
   §2.4.3.1 + Annex B Table 3-B.5 Layer II protected fields (header
   bits 16…31 + the §2.4.1.6 bit-allocation field + the §2.4.1.6
@@ -380,6 +380,45 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     subband fixture (3 bytes / 20 bits — scfsi + three scalefactors,
     recovered bit-exact).
   - Total `cargo test -p oxideav-mp1 --lib` count: **222 → 227**.
+- **ISO/IEC 13818-3 Annex B Table B.1 — LSF Layer II allocation
+  table**: the §2.4.3.1 substitution rule for MPEG-2 LSF Layer II
+  decoding is now spelled out exactly per the spec. Earlier rounds
+  aliased the LSF path to MPEG-1 Layer II Table 3-B.2b (`sblimit =
+  30`, `Σ nbal = 94`) on the strength of a matching `sblimit`;
+  13818-3 §2.4.3.1 actually substitutes **Table B.1 "Possible
+  quantisation per subband, Layer II — Sampling frequencies 16; 22,05;
+  24 kHz"** (printed p.71 / PDF page 81) for B.2a..d at every LSF
+  bitrate, and the per-subband ladder is strictly narrower:
+  `nbal = 4` for `sb 0..=3` (15-column ladder `{3, 5, 7, 9, 15, 31,
+  63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383}`), `nbal = 3` for
+  `sb 4..=10` (7-column ladder `{3, 5, 9, 15, 31, 63, 127}`),
+  `nbal = 2` for `sb 11..=29` (3-column ladder `{3, 5, 9}`), and
+  `nbal = 0` for `sb 30..=31` (silenced). `Σ nbal = 4·4 + 7·3 + 19·2
+  = 75` matches the footer printed below the table. Implemented in
+  `tables_layer2::TABLE_LSF` and wired into the
+  `layer2_bit_allocation_table(header)` selector — Layer II frames
+  with `ID == 0` now resolve to `TABLE_LSF` rather than `TABLE_B2B`,
+  so the Layer II decoder, the `error_check()` CRC sizing, and the
+  Layer II frame writers (`write_layer2_allocation_field`,
+  `write_layer2_scalefactor_field`, `write_layer2_samples_field`)
+  all see the correct per-subband `nbal` widths and per-row quant
+  classes at 16 / 22.05 / 24 kHz without any further per-region
+  writer-logic changes (the writers read `nbal(sb)` and
+  `quant_class(sb, alloc)` straight off the `AllocationTable`).
+  - Seven new lib-tests cover: the per-subband `nbal` pattern (`{4,
+    4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 2, …, 2, 0, 0}`) and `Σ nbal = 75`
+    total across `{16, 22.05, 24} kHz × {8, 64, 144, 160} kbit/s`;
+    the `sb 0..=3` row's 15-column quant-class resolution against the
+    exact spec sequence; the `sb 4..=10` row's 7-column resolution;
+    the `sb 11..=29` row's 3-column resolution; the `sb 30..=31`
+    `nbal = 0` silenced behaviour; a structural-distinction test
+    showing Table B.1 differs from B.2b at `nbal(5)` (B.1 = 3, B.2b =
+    4) and at the column count for `sb = 11` (B.1 has 3, B.2b has 7);
+    and a pointer-identity sweep over the full 13818-3 §2.4.2.3 Layer
+    II/III LSF bitrate ladder (`{8, 16, 24, 32, 40, 48, 56, 64, 80,
+    96, 112, 128, 144, 160}` kbit/s) at each of the three LSF rates
+    confirming the §2.4.3.1 "for all bitrates" invariance.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **242 → 259**.
 - **Annex D Phase-3 — Step 3 `LTq` offset + Model 2 spreading
   pieces**: closed-form helpers from the text-extractable portions of
   Annex D continue to land in the [`psy`] module without touching the
@@ -474,7 +513,7 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   variant builds the boxed decoder with the §2.4.3.1 concealment
   strategy of the caller's choosing.
 
-242 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
+259 tests cover both bitrate ladders (MPEG-1 and LSF), every sampling
 rate across both editions, all mode / mode_extension / emphasis codes,
 padding cases at 44.1 kHz and 22.05 kHz, sync recovery, the §2.4.3.1
 CRC-16 (polynomial/init constants, known register steps, protected-
