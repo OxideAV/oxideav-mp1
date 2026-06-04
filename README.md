@@ -472,6 +472,50 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     (24 kHz / 64 kbit/s mono) Layer II round-trip exercising the
     `ID == 0` Table B.1 path through the same top-level entry point.
   - Total `cargo test -p oxideav-mp1 --lib` count: **259 → 266**.
+- **§2.4.1.8 `ancillary_data()` emission on the Layer II encoder
+  side**: a new
+  `encode::encode_layer2_frame_with_ancillary(&Layer2HeaderParams,
+  &subbands, &[u8]) -> Result<Vec<u8>, Layer2EncodeError>` is the
+  ancillary-aware companion to `encode_layer2_frame`. The caller's
+  `ancillary_bit` payload (bslbf; spec §2.4.1.8) is copied into the
+  §2.4.2.1 frame tail that begins immediately after the §2.4.1.6
+  audio-data region — `BitWriter::finish` byte-aligns the partial
+  trailing byte of the samples region first, so the ancillary tail
+  always starts on a whole-byte boundary. Any §2.4.2.1 frame bytes
+  the payload does not fill are zero-padded. A payload larger than
+  the §2.4.1.8 tail capacity surfaces a typed
+  `Layer2EncodeError::AncillaryTooLarge { space, got }`. The
+  §2.4.3.1 CRC patch — when `Layer2HeaderParams::has_crc` is true —
+  runs after the ancillary copy and continues to verify clean
+  through `verify_layer2_crc` because the Annex B Table 3-B.5
+  protected region (header bits 16…31 + allocation + scfsi) excludes
+  the §2.4.1.8 tail (the CRC word at frame bytes 4..6 is
+  bit-identical to the no-ancillary reference frame).
+  - On `Mp1Layer2FrameEncoder` a paired `set_pending_ancillary(&[u8])`
+    / `pending_ancillary()` / `clear_pending_ancillary()` staging API
+    routes a one-shot ancillary payload into the next `encode_frame`
+    call (success or `AncillaryTooLarge`). `reset()` also drops a
+    staged payload so a seek doesn't leak ancillary bytes into the
+    next frame. The default behaviour — no staged payload —
+    zero-pads the §2.4.1.8 tail, preserving byte-for-byte
+    compatibility with frames produced by the existing
+    `Mp1Layer2FrameEncoder` API.
+  - Five new lib-tests cover: a `Mp1Layer2FrameEncoder` mono 48 kHz /
+    192 kbit/s silence-input frame where the staged payload appears
+    at the first byte where the ancillary frame diverges from a
+    reference no-ancillary frame, the post-payload bytes are
+    zero-padded, and the decoder's §2.4.1.6 allocation map is
+    unchanged; an oversized-payload path surfacing the
+    `AncillaryTooLarge { space, got }` variant; a
+    `set_pending_ancillary` → `encode_frame` → `encode_frame`
+    "consumed once" round-trip; a `clear_pending_ancillary` test
+    comparing against a fresh encoder; and a CRC + ancillary
+    round-trip that confirms the §2.4.3.1 CRC word at frame bytes
+    4..6 is bit-identical to the no-ancillary reference and the
+    staged payload still lands at the first differing byte. Public
+    surface add: re-exported `encode_layer2_frame_with_ancillary` at
+    the crate root.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **273 → 278**.
 - **§C.1.3 stateful Layer II frame encoder `Mp1Layer2FrameEncoder`**:
   a new `encode::Mp1Layer2FrameEncoder` carries one `AnalysisFilter`
   per channel — the same §C.1.3 input-FIFO state the Layer I

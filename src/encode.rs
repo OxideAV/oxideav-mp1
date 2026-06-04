@@ -2027,6 +2027,22 @@ pub enum Layer2EncodeError {
         /// The per-channel sample count actually received.
         got: usize,
     },
+    /// The §2.4.1.8 `ancillary_data()` payload supplied to
+    /// [`encode_layer2_frame_with_ancillary`] (or
+    /// [`Mp1Layer2FrameEncoder::set_pending_ancillary`]) is larger than
+    /// the space remaining after the §2.4.1.6 header / CRC / allocation
+    /// / scalefactor / samples regions.
+    ///
+    /// `space` is the byte count the encoder reserved for ancillary
+    /// (`floor(144·bitrate/Fs) + padding_bit` minus the number of bytes
+    /// the §2.4.1.6 audio-data regions consumed); `got` is the caller's
+    /// payload length.
+    AncillaryTooLarge {
+        /// The §2.4.1.8 tail capacity available in the current frame.
+        space: usize,
+        /// The caller's ancillary payload length in bytes.
+        got: usize,
+    },
 }
 
 impl core::fmt::Display for Layer2EncodeError {
@@ -2065,6 +2081,13 @@ impl core::fmt::Display for Layer2EncodeError {
                      per channel; received {got} per channel"
                 )
             }
+            Layer2EncodeError::AncillaryTooLarge { space, got } => {
+                write!(
+                    f,
+                    "Layer II encode: §2.4.1.8 ancillary_data() payload {got} bytes \
+                     exceeds the {space}-byte tail capacity in this frame"
+                )
+            }
         }
     }
 }
@@ -2100,21 +2123,56 @@ impl From<Layer2HeaderError> for Layer2EncodeError {
 /// [`allocate_bits_layer2`] budget already assumes).
 ///
 /// Returns the §2.4.2.1 frame bytes (header + optional CRC +
-/// §2.4.1.6 alloc + scfsi/scf + samples regions + zero-padded ANC
-/// tail), exactly `floor(144 · bitrate / Fs) + padding_bit` bytes long.
+/// §2.4.1.6 alloc + scfsi/scf + samples regions + zero-padded
+/// §2.4.1.8 ancillary tail), exactly `floor(144 · bitrate / Fs) +
+/// padding_bit` bytes long. The ancillary tail is zero-filled; see
+/// [`encode_layer2_frame_with_ancillary`] for the variant that lets
+/// the caller supply the §2.4.1.8 `ancillary_data()` payload.
 ///
 /// The §2.4.3.3.4 round-trip `encode → decode` lands within one Layer II
 /// quantizer step plus the §2.4.3.3 grouping rounding; the decoder's
 /// [`crate::decode_layer2::decode_layer2_audio_data`] reproduces the
 /// per-(ch, sb, slot) sub-band sample to a tolerance that depends on the
 /// class `nlevels` (small `nlevels` → coarser grid).
+pub fn encode_layer2_frame(
+    params: &Layer2HeaderParams,
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+) -> Result<Vec<u8>, Layer2EncodeError> {
+    encode_layer2_frame_inner(params, subbands, &[])
+}
+
+/// Encode a §2.4.1.6 Layer II frame with a caller-supplied §2.4.1.8
+/// `ancillary_data()` payload.
+///
+/// Identical to [`encode_layer2_frame`] but `ancillary` is copied into
+/// the §2.4.1.8 tail that begins immediately after the §2.4.1.6
+/// audio-data region (the partial trailing byte of the samples region
+/// is byte-aligned by [`BitWriter::finish`] before the ancillary tail
+/// is written; ancillary therefore starts on a whole-byte boundary).
+/// Any §2.4.2.1 frame bytes the caller does not fill are zero-padded.
+///
+/// Returns [`Layer2EncodeError::AncillaryTooLarge`] when `ancillary`
+/// does not fit between the audio-data tail and the §2.4.2.1 frame
+/// length `floor(144·bitrate/Fs) + padding_bit`; the §2.4.3.1 CRC (if
+/// enabled) is patched after the ancillary copy and is unaffected by
+/// the ancillary bytes (the §2.4.3.1 protected region is header bits
+/// 16…31 plus the §2.4.1.6 allocation + scfsi field).
+pub fn encode_layer2_frame_with_ancillary(
+    params: &Layer2HeaderParams,
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    ancillary: &[u8],
+) -> Result<Vec<u8>, Layer2EncodeError> {
+    encode_layer2_frame_inner(params, subbands, ancillary)
+}
+
 // The §C.1.5.2 wiring is a strict (ch, sb, gr, sample) nested walk, the
 // same structure the four writers expose; an iterator rewrite would
 // obscure the spec mapping.
 #[allow(clippy::needless_range_loop)]
-pub fn encode_layer2_frame(
+fn encode_layer2_frame_inner(
     params: &Layer2HeaderParams,
     subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    ancillary: &[u8],
 ) -> Result<Vec<u8>, Layer2EncodeError> {
     use crate::decode_layer2::{LAYER2_SAMPLES_PER_SUBBAND, SYNTAX_GRANULES};
     use crate::tables_layer2::layer2_bit_allocation_table;
@@ -2264,6 +2322,21 @@ pub fn encode_layer2_frame(
     );
 
     let mut bytes = bw.finish();
+    // §2.4.1.8 ancillary_data(): the bytes between the §2.4.1.6
+    // audio-data tail and the §2.4.2.1 frame length are reserved for
+    // the caller's `ancillary_bit` payload (bslbf, byte-aligned because
+    // `BitWriter::finish` flushed the partial samples-region byte just
+    // above). When the caller supplies no ancillary the tail is
+    // zero-padded; an overlong payload errors out so the caller can
+    // resize before the §2.4.3.1 CRC patch fires.
+    let space = frame_len.saturating_sub(bytes.len());
+    if ancillary.len() > space {
+        return Err(Layer2EncodeError::AncillaryTooLarge {
+            space,
+            got: ancillary.len(),
+        });
+    }
+    bytes.extend_from_slice(ancillary);
     if bytes.len() < frame_len {
         bytes.resize(frame_len, 0);
     }
@@ -2661,6 +2734,10 @@ impl Mp1FrameEncoder {
 pub struct Mp1Layer2FrameEncoder {
     params: Layer2HeaderParams,
     filters: Vec<AnalysisFilter>,
+    /// Caller-supplied §2.4.1.8 `ancillary_data()` payload consumed by
+    /// the next [`encode_frame`](Self::encode_frame) call and cleared
+    /// afterwards. `None` (or empty) means "zero-pad the tail".
+    pending_ancillary: Option<Vec<u8>>,
 }
 
 impl Mp1Layer2FrameEncoder {
@@ -2678,14 +2755,55 @@ impl Mp1Layer2FrameEncoder {
         Mp1Layer2FrameEncoder {
             params,
             filters: (0..nch).map(|_| AnalysisFilter::new()).collect(),
+            pending_ancillary: None,
         }
     }
 
-    /// Zero the analysis history (for a seek / stream restart).
+    /// Zero the analysis history (for a seek / stream restart). Also
+    /// drops any caller-supplied §2.4.1.8 ancillary payload buffered by
+    /// [`set_pending_ancillary`](Self::set_pending_ancillary) since the
+    /// last [`encode_frame`](Self::encode_frame).
     pub fn reset(&mut self) {
         for f in &mut self.filters {
             f.reset();
         }
+        self.pending_ancillary = None;
+    }
+
+    /// Stage a §2.4.1.8 `ancillary_data()` payload to be written into
+    /// the tail of the next [`encode_frame`](Self::encode_frame) call.
+    ///
+    /// The bytes are copied into the §2.4.1.6 audio-data tail of the
+    /// next frame; the staged payload is cleared after that one encode
+    /// call (success or [`Layer2EncodeError::AncillaryTooLarge`]) so
+    /// subsequent frames return to the default zero-padded tail.
+    /// Passing an empty slice or calling
+    /// [`clear_pending_ancillary`](Self::clear_pending_ancillary)
+    /// restores the default behaviour without consuming a frame.
+    pub fn set_pending_ancillary(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            self.pending_ancillary = None;
+        } else {
+            self.pending_ancillary = Some(bytes.to_vec());
+        }
+    }
+
+    /// Drop any §2.4.1.8 ancillary payload buffered by
+    /// [`set_pending_ancillary`](Self::set_pending_ancillary).
+    ///
+    /// Subsequent [`encode_frame`](Self::encode_frame) calls will
+    /// zero-pad the §2.4.1.8 tail until the caller stages another
+    /// payload.
+    pub fn clear_pending_ancillary(&mut self) {
+        self.pending_ancillary = None;
+    }
+
+    /// Returns the currently-staged §2.4.1.8 ancillary payload, or `&[]`
+    /// when no payload has been staged since the last
+    /// [`encode_frame`](Self::encode_frame) (or
+    /// [`reset`](Self::reset) / [`clear_pending_ancillary`](Self::clear_pending_ancillary)).
+    pub fn pending_ancillary(&self) -> &[u8] {
+        self.pending_ancillary.as_deref().unwrap_or(&[])
     }
 
     /// The channel count implied by the header mode (1 or 2).
@@ -2706,8 +2824,13 @@ impl Mp1Layer2FrameEncoder {
     /// (§2.4.2.1). Internally runs 36 slots × 32 PCM samples through
     /// [`AnalysisFilter::analyze`] per channel, builds the
     /// `subbands[ch][sb][slot]` matrix the §2.4.1.6 writers expect,
-    /// and dispatches to [`encode_layer2_frame`]. The returned frame
-    /// is exactly `floor(144·bitrate/Fs) + padding_bit` bytes long.
+    /// and dispatches to [`encode_layer2_frame`] (or
+    /// [`encode_layer2_frame_with_ancillary`] when
+    /// [`set_pending_ancillary`](Self::set_pending_ancillary) staged a
+    /// §2.4.1.8 `ancillary_data()` payload). The returned frame is
+    /// exactly `floor(144·bitrate/Fs) + padding_bit` bytes long. The
+    /// staged ancillary buffer is cleared after this call regardless
+    /// of outcome.
     ///
     /// [`LAYER2_SAMPLES_PER_FRAME`]: crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME
     // The §C.1.3 analysis body is a strict (slot, ch, sb) nested walk
@@ -2747,7 +2870,12 @@ impl Mp1Layer2FrameEncoder {
             }
         }
 
-        encode_layer2_frame(&self.params, &subbands)
+        let pending = self.pending_ancillary.take().unwrap_or_default();
+        if pending.is_empty() {
+            encode_layer2_frame(&self.params, &subbands)
+        } else {
+            encode_layer2_frame_with_ancillary(&self.params, &subbands, &pending)
+        }
     }
 }
 
@@ -5480,6 +5608,241 @@ mod tests {
         assert!(
             status.is_good(),
             "encoded CRC must verify clean: {status:?}"
+        );
+    }
+
+    // ---- §2.4.1.8 ancillary_data() tail (Layer II encoder) ---------
+
+    /// Top-level `encode_layer2_frame_with_ancillary` writes the
+    /// supplied bytes into the §2.4.1.8 tail. The frame still has the
+    /// §2.4.2.1 byte count and the decoder still recovers the
+    /// audio-data region; the ancillary payload appears at the end of
+    /// the frame just before any zero-padded slack.
+    #[test]
+    fn encode_layer2_frame_with_ancillary_appends_payload() {
+        use crate::decode_layer2::decode_layer2_audio_data;
+
+        // Mono 48 kHz / 192 kbps → 576-byte frames; a silence input
+        // yields silent sub-bands and the §C.1.5.2.7 allocator emits
+        // the empty allocation, leaving the §2.4.1.8 tail at its
+        // maximum size for the configuration.
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        let pcm = vec![0.0f64; crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME];
+        // The reference frame: no ancillary, encoder runs to completion
+        // on the same PCM with a fresh history.
+        let ref_frame = enc.encode_frame(&pcm).expect("encode_frame reference");
+
+        // Same PCM through a second encoder with the same fresh
+        // history, plus a §2.4.1.8 ancillary payload.
+        let mut enc2 = Mp1Layer2FrameEncoder::new(params);
+        let payload: [u8; 5] = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+        enc2.set_pending_ancillary(&payload);
+        assert_eq!(enc2.pending_ancillary(), &payload);
+        let frame = enc2.encode_frame(&pcm).expect("encode_frame ancillary");
+        assert_eq!(
+            frame.len(),
+            ref_frame.len(),
+            "§2.4.2.1 frame length unchanged by ancillary"
+        );
+
+        // The §2.4.1.6 audio-data prefix is identical in both frames;
+        // they differ only in the §2.4.1.8 tail. The first byte where
+        // the two frames differ marks the §2.4.1.8 tail boundary, and
+        // the ancillary frame's bytes from that offset onward must
+        // start with the caller's payload.
+        let mut tail_start = ref_frame.len();
+        for (i, (r, f)) in ref_frame.iter().zip(frame.iter()).enumerate() {
+            if r != f {
+                tail_start = i;
+                break;
+            }
+        }
+        assert!(
+            tail_start < ref_frame.len(),
+            "ancillary must produce at least one differing byte"
+        );
+        assert!(
+            tail_start + payload.len() <= frame.len(),
+            "tail must hold the §2.4.1.8 payload"
+        );
+        assert_eq!(
+            &frame[tail_start..tail_start + payload.len()],
+            &payload,
+            "ancillary payload must appear at the §2.4.1.8 tail"
+        );
+        // Anything after the payload is zero-padded, and the
+        // corresponding region of the reference is also zero.
+        assert!(
+            frame[tail_start + payload.len()..].iter().all(|b| *b == 0),
+            "post-payload §2.4.2.1 padding must be zero"
+        );
+        assert!(
+            ref_frame[tail_start..].iter().all(|b| *b == 0),
+            "reference frame's §2.4.1.8 tail must be zero",
+        );
+
+        // Audio-data region still decodes identically.
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        let recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("decode with ancillary");
+        let ref_header = FrameHeader::parse(&ref_frame).expect("parse ref header");
+        let ref_recovered =
+            decode_layer2_audio_data(&ref_header, &ref_frame[4..]).expect("decode ref");
+        assert_eq!(recovered.sblimit, ref_recovered.sblimit);
+        for sb in 0..recovered.sblimit {
+            assert_eq!(
+                recovered.subbands[0][sb].allocation, ref_recovered.subbands[0][sb].allocation,
+                "§2.4.1.6 allocation must be unchanged by §2.4.1.8 ancillary",
+            );
+        }
+    }
+
+    /// An ancillary payload larger than the §2.4.1.8 tail capacity
+    /// surfaces a typed [`Layer2EncodeError::AncillaryTooLarge`] error,
+    /// and the stateful encoder clears the staged payload after the
+    /// failed call (next encode reverts to zero-padded tail).
+    #[test]
+    fn encode_layer2_frame_with_oversized_ancillary_errors() {
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        // The §2.4.2.1 frame is 384 bytes; padding a payload bigger
+        // than the whole frame guarantees overflow.
+        let oversized = vec![0u8; 4096];
+        let mut subbands = [[[0.0f64; 36]; SUBBANDS]; 2];
+        // Populate trivial sub-bands so the encode pipeline runs.
+        for sb in 0..2 {
+            for slot in 0..36 {
+                subbands[0][sb][slot] = 0.1;
+            }
+        }
+        let err = encode_layer2_frame_with_ancillary(&params, &subbands, &oversized)
+            .expect_err("oversized ancillary must error");
+        match err {
+            Layer2EncodeError::AncillaryTooLarge { space, got } => {
+                assert!(space < got);
+                assert_eq!(got, oversized.len());
+            }
+            other => panic!("expected AncillaryTooLarge, got {other:?}"),
+        }
+    }
+
+    /// The stateful encoder consumes the staged ancillary once: a
+    /// second `encode_frame` call after the first one with ancillary
+    /// returns to the no-ancillary frame layout. We compare against
+    /// pairs of fresh encoders (same params, same PCM, same history)
+    /// to confirm the two-frame sequence "ancillary then nothing" on
+    /// one encoder matches "ancillary then nothing" on two encoders
+    /// where the second has no staged payload.
+    #[test]
+    fn mp1_layer2_frame_encoder_pending_ancillary_consumed_once() {
+        // Mono 48 kHz / 192 kbps + silence input: the §C.1.5.2.7
+        // allocator emits the empty allocation, leaving the §2.4.1.8
+        // tail at its maximum size.
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        let pcm = vec![0.0f64; crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME];
+        let payload: [u8; 4] = [0xA5, 0x5A, 0x12, 0x34];
+
+        // One stateful encoder: stage payload, encode, then encode
+        // again without staging anything.
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        enc.set_pending_ancillary(&payload);
+        let frame_with = enc.encode_frame(&pcm).expect("with ancillary");
+        // Buffer cleared after consumption.
+        assert_eq!(enc.pending_ancillary(), &[] as &[u8]);
+        let frame_after = enc.encode_frame(&pcm).expect("after ancillary");
+
+        // Reference encoders that mirror the same analysis-history
+        // trajectory: encoder A stages the payload for frame 0;
+        // encoder B encodes two plain frames. Frame 1 of A must equal
+        // frame 1 of B (both ancillary-free after a frame of history).
+        let mut a = Mp1Layer2FrameEncoder::new(params);
+        a.set_pending_ancillary(&payload);
+        let a0 = a.encode_frame(&pcm).expect("a0");
+        assert_eq!(a0, frame_with);
+        let a1 = a.encode_frame(&pcm).expect("a1");
+        assert_eq!(a1, frame_after);
+
+        let mut b = Mp1Layer2FrameEncoder::new(params);
+        // b also runs ancillary on frame 0 so its analysis history
+        // tracks a's; the test target is "frame 1 ancillary-free".
+        b.set_pending_ancillary(&payload);
+        let _ = b.encode_frame(&pcm).expect("b0");
+        let b1 = b.encode_frame(&pcm).expect("b1");
+        // Sanity: b1 is exactly a1 (deterministic).
+        assert_eq!(a1, b1);
+
+        // And the two frames `frame_with` and `frame_after` differ:
+        // the ancillary tail is gone.
+        assert_ne!(frame_with, frame_after);
+    }
+
+    /// [`Mp1Layer2FrameEncoder::clear_pending_ancillary`] drops a
+    /// staged payload without consuming a frame; the next encode is
+    /// indistinguishable from one made on a fresh encoder.
+    #[test]
+    fn mp1_layer2_frame_encoder_clear_pending_ancillary() {
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut enc_a = Mp1Layer2FrameEncoder::new(params);
+        let mut enc_b = Mp1Layer2FrameEncoder::new(params);
+
+        enc_a.set_pending_ancillary(&[1, 2, 3]);
+        assert_eq!(enc_a.pending_ancillary(), &[1, 2, 3]);
+        enc_a.clear_pending_ancillary();
+        assert_eq!(enc_a.pending_ancillary(), &[] as &[u8]);
+
+        let pcm = layer2_test_pcm(48_000, 1);
+        let frame_a = enc_a.encode_frame(&pcm).expect("encode a");
+        let frame_b = enc_b.encode_frame(&pcm).expect("encode b");
+        assert_eq!(frame_a, frame_b, "cleared ancillary == no ancillary");
+    }
+
+    /// §2.4.1.8 ancillary on a §2.4.1.4-CRC frame: the CRC region is
+    /// header bits 16…31 + allocation + scfsi (per Annex B Table 3-B.5)
+    /// — it does NOT cover the §2.4.1.8 tail — so the stored CRC
+    /// continues to verify with `verify_layer2_crc` and the tail still
+    /// carries the caller's payload.
+    #[test]
+    fn encode_layer2_frame_with_ancillary_and_crc_verifies() {
+        use crate::decode_layer2::verify_layer2_crc;
+
+        // Mono 48 kHz / 192 kbps + silence: §2.4.1.8 tail is maximal
+        // even after the 16-bit §2.4.1.4 CRC eats two bytes.
+        let mut params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        params.has_crc = true;
+        let pcm = vec![0.0f64; crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME];
+        let payload: [u8; 6] = [0xCA, 0xFE, 0xBA, 0xBE, 0x55, 0xAA];
+
+        let mut enc_ref = Mp1Layer2FrameEncoder::new(params);
+        let ref_frame = enc_ref.encode_frame(&pcm).expect("ref crc frame");
+
+        let mut enc = Mp1Layer2FrameEncoder::new(params);
+        enc.set_pending_ancillary(&payload);
+        let frame = enc.encode_frame(&pcm).expect("encode with crc + ancillary");
+
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert!(header.has_crc(), "protection_bit must indicate CRC present");
+        let status = verify_layer2_crc(&header, &frame[..4], &frame[4..])
+            .expect("verify_layer2_crc: CRC region present");
+        assert!(
+            status.is_good(),
+            "§2.4.3.1 CRC must verify clean even with §2.4.1.8 ancillary tail: {status:?}"
+        );
+        // Both frames carry the same CRC word (bytes 4..6) since the
+        // §2.4.3.1 protected region excludes the §2.4.1.8 tail.
+        assert_eq!(&frame[4..6], &ref_frame[4..6]);
+
+        // Locate the §2.4.1.8 tail by diffing against the no-ancillary
+        // reference; the payload must appear at the first differing
+        // byte.
+        let tail_start = frame
+            .iter()
+            .zip(ref_frame.iter())
+            .position(|(a, b)| a != b)
+            .expect("ancillary frame differs from reference somewhere");
+        assert_eq!(
+            &frame[tail_start..tail_start + payload.len()],
+            &payload,
+            "§2.4.1.8 payload must appear at the differing-byte boundary"
         );
     }
 }
