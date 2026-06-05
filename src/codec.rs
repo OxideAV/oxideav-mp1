@@ -30,9 +30,12 @@ use oxideav_core::{
 
 use crate::decode::{decode_audio_data, SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS};
 use crate::decode_layer2::{
-    decode_layer2_audio_data, verify_layer2_crc, Layer2Subbands, LAYER2_SAMPLES_PER_SUBBAND,
+    decode_layer2_audio_data, verify_layer2_crc, Layer2Subbands, LAYER2_SAMPLES_PER_FRAME,
+    LAYER2_SAMPLES_PER_SUBBAND,
 };
-use crate::encode::{EncodeParams, Mp1FrameEncoder};
+use crate::encode::{
+    EncodeParams, Layer2HeaderParams, LayerSelect, Mp1FrameEncoder, Mp1Layer2FrameEncoder,
+};
 use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Layer, Mode};
 use crate::synthesis::{to_s16, SynthesisFilter};
 
@@ -473,9 +476,10 @@ impl Decoder for Mp1Decoder {
 /// absent. The chosen mode is mono for `channels == 1` and stereo for
 /// `channels == 2`. The §2.4.1.4 CRC is **not** emitted; the encoded
 /// frame's `protection_bit` is `1`. Use
-/// [`make_encoder_with_crc`] to enable optional CRC emission.
+/// [`make_encoder_with_crc`] to enable optional CRC emission, or
+/// [`make_encoder_layer2`] to produce Layer II frames instead.
 pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    make_encoder_inner(params, /*emit_crc=*/ false)
+    make_encoder_inner(params, /*emit_crc=*/ false, LayerSelect::LayerI)
 }
 
 /// Build an [`Mp1Encoder`] from `params`, with the optional §2.4.1.4
@@ -489,10 +493,31 @@ pub(crate) fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>
 /// reported by the header stays at the §2.4.2.1
 /// `N = floor(12 · bitrate / Fs) + padding` value.
 pub(crate) fn make_encoder_with_crc(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    make_encoder_inner(params, /*emit_crc=*/ true)
+    make_encoder_inner(params, /*emit_crc=*/ true, LayerSelect::LayerI)
 }
 
-fn make_encoder_inner(params: &CodecParameters, emit_crc: bool) -> Result<Box<dyn Encoder>> {
+/// Build an [`Mp1Encoder`] that emits **Layer II** (§2.4.1.6) frames.
+///
+/// Identical parameter contract to [`make_encoder`] (`sample_rate` and
+/// `channels` required, `bit_rate` optional), but the produced encoder
+/// dispatches to [`Mp1Layer2FrameEncoder`] and consumes **1152** PCM
+/// samples per channel per [`Encoder::send_frame`] call (the §2.4.2.1
+/// Layer II frame granularity) rather than the Layer I 384.
+///
+/// The default per-rate bitrate is picked from the §2.4.2.3 Layer II
+/// ladder (mono-channel midpoint for `channels == 1`, stereo midpoint
+/// for `channels == 2`); the LSF rates (13818-3 §2.4.2.3) draw from
+/// the LSF Layer II ladder. The §2.4.1.4 CRC is **not** emitted by
+/// default.
+pub(crate) fn make_encoder_layer2(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_inner(params, /*emit_crc=*/ false, LayerSelect::LayerII)
+}
+
+fn make_encoder_inner(
+    params: &CodecParameters,
+    emit_crc: bool,
+    layer: LayerSelect,
+) -> Result<Box<dyn Encoder>> {
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("oxideav-mp1: sample_rate required"))?;
@@ -516,17 +541,34 @@ fn make_encoder_inner(params: &CodecParameters, emit_crc: bool) -> Result<Box<dy
     // the MPEG-1 default keeps allocation density comparable).
     let is_lsf = matches!(sample_rate, 16_000 | 22_050 | 24_000);
     // Pick a default bitrate when the caller didn't specify one. The
-    // LSF defaults are picked from the LSF ladder (which differs from
-    // MPEG-1's at almost every position).
-    let bitrate_kbps = match params.bit_rate {
-        Some(bps) => (bps / 1000) as u16,
-        None if is_lsf && channels == 1 => 96,
-        None if is_lsf => 128,
-        None if channels == 1 => 192,
-        None => 256,
+    // ladders differ by layer and by ID bit (§2.4.2.3 has four
+    // distinct ladders: MPEG-1 Layer I, MPEG-1 Layer II, LSF Layer I,
+    // LSF Layer II). The mono / stereo midpoints below come straight
+    // from the respective ladder so the default lands on a valid
+    // index without requiring caller intervention.
+    let bitrate_kbps = match (params.bit_rate, layer) {
+        (Some(bps), _) => (bps / 1000) as u16,
+        (None, LayerSelect::LayerI) if is_lsf && channels == 1 => 96,
+        (None, LayerSelect::LayerI) if is_lsf => 128,
+        (None, LayerSelect::LayerI) if channels == 1 => 192,
+        (None, LayerSelect::LayerI) => 256,
+        // Layer II defaults: 13818-3 §2.4.2.3 LSF Layer II ladder is
+        // {8,16,24,32,40,48,56,64,80,96,112,128,144,160}; pick 64
+        // mono / 96 stereo (LSF mono fits comfortably in 64 kbit/s
+        // and the stereo midpoint 96 keeps allocation density in the
+        // same neighbourhood as the LSF Layer I default).
+        (None, LayerSelect::LayerII) if is_lsf && channels == 1 => 64,
+        (None, LayerSelect::LayerII) if is_lsf => 96,
+        // 11172-3 §2.4.2.3 MPEG-1 Layer II ladder is
+        // {32,48,56,64,80,96,112,128,160,192,224,256,320,384}; pick
+        // 128 mono / 192 stereo as comfortable defaults.
+        (None, LayerSelect::LayerII) if channels == 1 => 128,
+        (None, LayerSelect::LayerII) => 192,
     };
     let bitrate = Bitrate::Fixed(bitrate_kbps);
-    let enc_params = EncodeParams::new(bitrate, sample_rate, mode).with_emit_crc(emit_crc);
+    let enc_params = EncodeParams::new(bitrate, sample_rate, mode)
+        .with_emit_crc(emit_crc)
+        .with_layer(layer);
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID));
     out_params.sample_rate = Some(sample_rate);
     out_params.channels = Some(channels);
@@ -540,20 +582,26 @@ fn make_encoder_inner(params: &CodecParameters, emit_crc: bool) -> Result<Box<dy
     )))
 }
 
-/// A frame-to-packet MPEG-1 Audio Layer I encoder.
+/// A frame-to-packet MPEG-1 Audio Layer I / Layer II encoder.
 ///
-/// Wraps [`Mp1FrameEncoder`] (which owns the per-channel analysis
-/// history) and adapts it to the [`oxideav_core::Encoder`] trait:
-/// accept an [`AudioFrame`] of interleaved S16 (or the same-shape S16P
-/// planar layout), produce one compressed Layer I packet per call.
+/// Wraps either [`Mp1FrameEncoder`] (Layer I, 384 PCM samples/channel
+/// per frame) or [`Mp1Layer2FrameEncoder`] (Layer II, 1152
+/// samples/channel) — each of which owns the per-channel analysis
+/// history — and adapts the chosen inner encoder to the
+/// [`oxideav_core::Encoder`] trait: accept an [`AudioFrame`] of
+/// interleaved S16 (or the same-shape S16P planar layout), produce one
+/// compressed Layer I/II packet per call.
 ///
-/// Each input frame must carry exactly **384 samples per channel** —
-/// the Layer I frame granularity (§2.4.2.1). Partial frames on flush
+/// The layer is selected at construction time via
+/// [`EncodeParams::layer`] (Layer I is the default for byte-for-byte
+/// compatibility with the encoder's pre-switch behaviour). Each input
+/// frame must carry exactly **384** (Layer I, §2.4.2.1) or **1152**
+/// (Layer II, §2.4.2.1) samples per channel; partial frames on flush
 /// return [`Error::Eof`].
 #[derive(Debug)]
 pub struct Mp1Encoder {
     codec_id: CodecId,
-    inner: Mp1FrameEncoder,
+    inner: Mp1InnerEncoder,
     /// The output stream parameters muxers will read back via
     /// [`Encoder::output_params`].
     output: CodecParameters,
@@ -562,11 +610,79 @@ pub struct Mp1Encoder {
     eof: bool,
 }
 
+/// Layer-dispatched inner encoder: each variant owns its own per-channel
+/// analysis history (see [`Mp1FrameEncoder`] / [`Mp1Layer2FrameEncoder`]).
+#[derive(Debug)]
+enum Mp1InnerEncoder {
+    /// Layer I (§2.4.1.5): 384 samples/channel per frame.
+    LayerI(Mp1FrameEncoder),
+    /// Layer II (§2.4.1.6): 1152 samples/channel per frame.
+    LayerII(Mp1Layer2FrameEncoder),
+}
+
+impl Mp1InnerEncoder {
+    fn channels(&self) -> usize {
+        match self {
+            Mp1InnerEncoder::LayerI(e) => e.channels(),
+            Mp1InnerEncoder::LayerII(e) => e.channels(),
+        }
+    }
+
+    /// Samples per channel that one [`Mp1Encoder::send_frame`] must
+    /// carry: 384 for Layer I, 1152 for Layer II (§2.4.2.1).
+    fn samples_per_frame(&self) -> usize {
+        match self {
+            Mp1InnerEncoder::LayerI(_) => SAMPLES_PER_SUBBAND * SUBBANDS,
+            Mp1InnerEncoder::LayerII(_) => LAYER2_SAMPLES_PER_FRAME,
+        }
+    }
+
+    /// Encode one frame's worth of interleaved PCM, surfacing the inner
+    /// encoder's typed error wrapped in [`Error::other`] (matching the
+    /// pre-switch Layer I path's surfacing of [`crate::encode::EncodeError`]).
+    fn encode_frame(&mut self, pcm: &[f64]) -> Result<Vec<u8>> {
+        match self {
+            Mp1InnerEncoder::LayerI(e) => e
+                .encode_frame(pcm)
+                .map_err(|err| Error::other(format!("oxideav-mp1: encode: {err}"))),
+            Mp1InnerEncoder::LayerII(e) => e
+                .encode_frame(pcm)
+                .map_err(|err| Error::other(format!("oxideav-mp1: encode: {err}"))),
+        }
+    }
+}
+
 impl Mp1Encoder {
     fn new(codec_id: CodecId, params: EncodeParams, output: CodecParameters) -> Mp1Encoder {
+        // §2.4.1.5 / §2.4.1.6 dispatch: the layer field of `params`
+        // chooses which inner encoder owns the per-channel analysis
+        // history. The Layer II branch translates the shared
+        // [`EncodeParams`] (bitrate / sampling frequency / channel mode
+        // / optional CRC) into the [`Layer2HeaderParams`] shape that
+        // [`Mp1Layer2FrameEncoder`] consumes; all other header fields
+        // default to their [`Layer2HeaderParams::new`] values
+        // (no mode_extension, no padding, no private/copyright,
+        // original = 1, Emphasis::None).
+        let inner = match params.layer {
+            LayerSelect::LayerI => Mp1InnerEncoder::LayerI(Mp1FrameEncoder::new(params)),
+            LayerSelect::LayerII => {
+                let bitrate_kbps = match params.bitrate {
+                    Bitrate::Fixed(k) => k,
+                    // Free / forbidden bitrates surface their typed
+                    // rejection from `encode_layer2_frame` on first
+                    // encode, matching the Layer I path's lazy
+                    // validation contract.
+                    _ => 0,
+                };
+                let mut hp =
+                    Layer2HeaderParams::new(params.sampling_frequency, bitrate_kbps, params.mode);
+                hp.has_crc = params.emit_crc;
+                Mp1InnerEncoder::LayerII(Mp1Layer2FrameEncoder::new(hp))
+            }
+        };
         Mp1Encoder {
             codec_id,
-            inner: Mp1FrameEncoder::new(params),
+            inner,
             output,
             pending_frame: None,
             pending_pkt: None,
@@ -641,7 +757,10 @@ impl Encoder for Mp1Encoder {
         let Frame::Audio(a) = frame else {
             return Err(Error::invalid("oxideav-mp1: encoder requires audio frame"));
         };
-        let expected = (SAMPLES_PER_SUBBAND * SUBBANDS) as u32;
+        // §2.4.2.1 per-frame sample count: 384 for Layer I, 1152 for
+        // Layer II. The inner encoder reports the value that matches
+        // whichever layer was selected at construction time.
+        let expected = self.inner.samples_per_frame() as u32;
         if a.samples != expected {
             return Err(Error::invalid(format!(
                 "oxideav-mp1: frame must carry {expected} samples/channel, got {}",
@@ -664,10 +783,7 @@ impl Encoder for Mp1Encoder {
             };
         };
         let pcm = self.frame_to_pcm(&frame)?;
-        let bytes = self
-            .inner
-            .encode_frame(&pcm)
-            .map_err(|e| Error::other(format!("oxideav-mp1: encode: {e}")))?;
+        let bytes = self.inner.encode_frame(&pcm)?;
         let sr = self.output.sample_rate.unwrap_or(48_000);
         let mut pkt = Packet::new(0, TimeBase::new(1, sr as i64), bytes);
         if let Some(pts) = frame.pts {
@@ -1578,5 +1694,156 @@ mod tests {
         let mut sr_only = CodecParameters::audio(CodecId::new("mp1"));
         sr_only.sample_rate = Some(48_000);
         assert!(make_encoder_with_crc(&sr_only).is_err());
+    }
+
+    // ---- §2.4.1.5 / §2.4.1.6 LayerSelect dispatch (encoder-level) ----
+
+    /// Build an `n`-sample-per-channel mono S16 sine in the
+    /// AudioFrame shape the encoder consumes. Generalisation of
+    /// `build_audio_frame_mono` so the same helper feeds both the
+    /// 384-sample Layer I path and the 1152-sample Layer II path.
+    fn build_audio_frame_mono_n(sample_rate: u32, n: usize) -> AudioFrame {
+        let mut bytes = Vec::with_capacity(n * 2);
+        for k in 0..n {
+            let t = k as f64 / sample_rate as f64;
+            let v = (2.0 * std::f64::consts::PI * 1_000.0 * t).sin();
+            let s = (v * 16_000.0) as i16;
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        AudioFrame {
+            samples: n as u32,
+            pts: None,
+            data: vec![bytes],
+        }
+    }
+
+    /// Build an `n`-sample-per-channel stereo S16 frame whose left
+    /// channel is a 1 kHz sine and right channel is a 1.5 kHz sine,
+    /// interleaved.
+    fn build_audio_frame_stereo_n(sample_rate: u32, n: usize) -> AudioFrame {
+        let mut bytes = Vec::with_capacity(n * 2 * 2);
+        for k in 0..n {
+            let t = k as f64 / sample_rate as f64;
+            let l = ((2.0 * std::f64::consts::PI * 1_000.0 * t).sin() * 16_000.0) as i16;
+            let r = ((2.0 * std::f64::consts::PI * 1_500.0 * t).sin() * 16_000.0) as i16;
+            bytes.extend_from_slice(&l.to_le_bytes());
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        AudioFrame {
+            samples: n as u32,
+            pts: None,
+            data: vec![bytes],
+        }
+    }
+
+    #[test]
+    fn make_encoder_default_dispatches_to_layer_i() {
+        // Regression: the default `make_encoder` factory keeps producing
+        // Layer I frames (header layer bits `0b11`) for byte-for-byte
+        // compatibility with the encoder's pre-LayerSelect behaviour,
+        // and continues to accept exactly 384 samples/channel.
+        let mut params = CodecParameters::audio(CodecId::new("mp1"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(1);
+        let mut enc = make_encoder(&params).unwrap();
+        // The Layer I granularity (§2.4.2.1).
+        let frame = build_audio_frame_mono_n(48_000, 384);
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let h = FrameHeader::parse(&pkt.data).unwrap();
+        assert_eq!(h.layer, Layer::I, "default factory must emit Layer I");
+        // A wrong-granularity send is rejected on the Layer I path (the
+        // 1152 Layer II frame size is not a Layer I frame).
+        let wrong = build_audio_frame_mono_n(48_000, 1152);
+        let err = enc.send_frame(&Frame::Audio(wrong)).unwrap_err();
+        let s = format!("{err}");
+        assert!(
+            s.contains("384"),
+            "Layer I encoder must reject non-384 frame sizes, got: {s}"
+        );
+    }
+
+    #[test]
+    fn make_encoder_layer2_emits_layer_ii_header() {
+        // The Layer II factory produces a frame whose header's `layer`
+        // bits are `0b10` (Layer II) and whose §2.4.2.1 frame length
+        // matches `floor(144 · bitrate / Fs) + padding`. Mono 48 kHz
+        // at the 128 kbit/s default lands at exactly 384 bytes
+        // (`floor(144 · 128_000 / 48_000)` = 384, padding = 0).
+        let mut params = CodecParameters::audio(CodecId::new("mp1"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(1);
+        let mut enc = make_encoder_layer2(&params).expect("make_encoder_layer2");
+        // The Layer II granularity (§2.4.2.1).
+        let frame = build_audio_frame_mono_n(48_000, 1152);
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let h = FrameHeader::parse(&pkt.data).unwrap();
+        assert_eq!(h.layer, Layer::II, "Layer II factory must emit Layer II");
+        // The §2.4.2.1 frame length: 144 · 128_000 / 48_000 = 384.
+        assert_eq!(pkt.data.len(), 384);
+        assert_eq!(h.mode, Mode::SingleChannel);
+        assert_eq!(h.sampling_frequency, 48_000);
+        // The Layer II factory must reject a Layer-I-sized frame on
+        // the granularity check (1152, not 384, is the §2.4.2.1
+        // Layer II frame size).
+        let wrong = build_audio_frame_mono_n(48_000, 384);
+        let err = enc.send_frame(&Frame::Audio(wrong)).unwrap_err();
+        let s = format!("{err}");
+        assert!(
+            s.contains("1152"),
+            "Layer II encoder must reject non-1152 frame sizes, got: {s}"
+        );
+    }
+
+    #[test]
+    fn make_encoder_layer2_round_trips_through_decoder() {
+        // A Layer II encode -> decode loop reaches PCM cleanly: the
+        // frame parses as Layer II, the decoder produces 1152
+        // samples/channel per frame (§2.4.2.1), and several frames in
+        // the synthesis filterbank ramps to non-silence (so we're
+        // actually carrying signal end-to-end, not just zero-padding
+        // through the encoder).
+        let mut params = CodecParameters::audio(CodecId::new("mp1"));
+        params.sample_rate = Some(44_100);
+        params.channels = Some(2);
+        let mut enc = make_encoder_layer2(&params).expect("make_encoder_layer2");
+        let mut dec = make_decoder(&params).unwrap();
+        let mut saw_nonzero = false;
+        for _ in 0..6 {
+            let frame = build_audio_frame_stereo_n(44_100, 1152);
+            enc.send_frame(&Frame::Audio(frame)).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            let h = FrameHeader::parse(&pkt.data).unwrap();
+            assert_eq!(h.layer, Layer::II);
+            assert_eq!(h.mode, Mode::Stereo);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            // §2.4.2.1: 1152 samples per channel per Layer II frame.
+            assert_eq!(a.samples, 1152);
+            // Stereo interleaved: 1152 * 2 channels * 2 bytes/sample.
+            assert_eq!(a.data[0].len(), 1152 * 2 * 2);
+            if a.data[0].iter().any(|&b| b != 0) {
+                saw_nonzero = true;
+            }
+        }
+        assert!(
+            saw_nonzero,
+            "Layer II encode -> decode produced only silence"
+        );
+    }
+
+    #[test]
+    fn make_encoder_layer2_validates_params() {
+        // The Layer II factory shares its parameter validation with the
+        // Layer I factory: missing sample_rate / channels must be
+        // rejected the same way.
+        let bare = CodecParameters::audio(CodecId::new("mp1"));
+        assert!(make_encoder_layer2(&bare).is_err());
+        let mut sr_only = CodecParameters::audio(CodecId::new("mp1"));
+        sr_only.sample_rate = Some(48_000);
+        assert!(make_encoder_layer2(&sr_only).is_err());
     }
 }

@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`Mp1Encoder` §2.4.1.5 / §2.4.1.6 Layer-I / Layer-II top-level
+  dispatch switch.** The `oxideav_core::Encoder` trait object the
+  registry hands back from `make_encoder` (and the direct factory twin
+  `encoder::make_encoder`) can now drive either the Layer I
+  `Mp1FrameEncoder` or the Layer II `Mp1Layer2FrameEncoder` through one
+  wrapper. The selection rides on a new `EncodeParams::layer:
+  LayerSelect` field (default `LayerSelect::LayerI`, preserving
+  byte-for-byte compatibility with the encoder's pre-switch
+  behaviour), set via the `EncodeParams::with_layer(LayerSelect)`
+  builder. A new factory pair exposes the Layer II branch directly:
+  `encoder::make_encoder_layer2(&CodecParameters) ->
+  Result<Box<dyn Encoder>, Error>` mirrors `make_encoder`'s
+  `sample_rate` + `channels` (required) / `bit_rate` (optional)
+  contract but defaults its bitrate to a per-rate / per-channel
+  midpoint on the §2.4.2.3 Layer II ladder (128 / 192 kbit/s at the
+  MPEG-1 rates, 64 / 96 at the 13818-3 §2.4.2.3 LSF rates), drives
+  `Mp1Layer2FrameEncoder`, and consumes 1152 PCM samples per channel
+  per `send_frame` (the Layer II §2.4.2.1 frame granularity) rather
+  than the Layer I 384. The wrapper threads the per-layer granularity
+  through `send_frame` rejection: a Layer I encoder rejects a
+  1152-sample frame and a Layer II encoder rejects a 384-sample
+  frame, each with the matching count in the error text. The
+  §C.1.5.2.5 / Table C.4 perceptual SCFSI selection is still a
+  PDF-image DOCS-GAP, so the Layer II branch keeps emitting `scfsi ==
+  0b00` (three independent scalefactors) for every allocated subband
+  per the inherited `Mp1Layer2FrameEncoder` behaviour — the dispatch
+  switch is purely a routing change and does not alter the per-layer
+  bitstream shape either branch produces. Public surface adds:
+  `LayerSelect` re-exported at the crate root, `EncodeParams::layer`
+  + `EncodeParams::with_layer`, and `encoder::make_encoder_layer2`.
+  - **+4 lib-tests** cover: a regression that the default
+    `make_encoder` factory keeps emitting Layer I (`layer == 0b11`)
+    and rejects a 1152-sample send as off-granularity; a Layer II
+    factory check that 48 kHz / 128 kbit/s mono produces a frame
+    whose header parses as Layer II (`layer == 0b10`), whose length
+    matches the §2.4.2.1 `floor(144 · bitrate / Fs)` value (384 bytes
+    at this configuration), and which rejects a 384-sample send; a
+    44.1 kHz / 192 kbit/s stereo Layer II encode → decode round-trip
+    across six consecutive frames asserting the decoder surfaces 1152
+    samples / 4608 interleaved S16 bytes per frame and that the run
+    carries non-silence end-to-end (the synthesis filterbank ramps);
+    and a parameter-validation rejection test matching the Layer I
+    factory's behaviour for missing `sample_rate` / `channels`.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **278 → 282**.
 - **§2.4.1.8 `ancillary_data()` emission on the Layer II encoder side.**
   A new `encode::encode_layer2_frame_with_ancillary(&Layer2HeaderParams,
   &subbands, &[u8]) -> Result<Vec<u8>, Layer2EncodeError>` is the

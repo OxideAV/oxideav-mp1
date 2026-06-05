@@ -57,6 +57,16 @@
 //! bits are taken out of the per-frame audio-data budget so the
 //! §2.4.2.1 slot count is unchanged.
 //!
+//! The top-level [`Mp1Encoder`] trait object also exposes a Layer-I /
+//! Layer-II dispatch switch via [`encode::EncodeParams::layer`] (a new
+//! [`encode::LayerSelect`] field, default Layer I): callers that want
+//! Layer II output reach for the direct factory
+//! [`encoder::make_encoder_layer2`] (or set `layer = LayerSelect::LayerII`
+//! before constructing [`Mp1Encoder`] manually), which drives the
+//! §C.1.3 [`Mp1Layer2FrameEncoder`] and consumes 1152 PCM samples per
+//! channel per frame (the §2.4.2.1 Layer II granularity) instead of
+//! the Layer I 384.
+//!
 //! One spec gap remains, not blocking decode to PCM: Annex D's
 //! psychoacoustic models are not implemented (the encoder's allocator
 //! is signal-energy-driven); the staged 11172-3 PDF carries Annex D
@@ -101,9 +111,9 @@ pub use encode::{
     EncodeParams, Layer2Allocation, Layer2AllocationFieldError, Layer2EncodeError,
     Layer2HeaderError, Layer2HeaderParams, Layer2SamplesFieldError, Layer2SamplesFieldInput,
     Layer2ScalefactorFieldError, Layer2ScalefactorFieldInput, Layer2ScalefactorIndices,
-    Layer2SubbandPeaks, Mp1FrameEncoder, Mp1Layer2FrameEncoder,
+    Layer2SubbandPeaks, LayerSelect, Mp1FrameEncoder, Mp1Layer2FrameEncoder,
 };
-pub use encoder::make_encoder_with_crc;
+pub use encoder::{make_encoder_layer2, make_encoder_with_crc};
 pub use header::{
     detect_free_format_frame_length, find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader,
     FreeFormatFrameLength, FreeFormatProbeError, HeaderError, Id, Layer, Mode, ModeExtension,

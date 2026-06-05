@@ -49,6 +49,24 @@ pub fn make_encoder_with_crc(params: &CodecParameters) -> Result<Box<dyn Encoder
     crate::codec::make_encoder_with_crc(params)
 }
 
+/// Build a boxed MPEG-1 Audio **Layer II** [`Encoder`] from `params`.
+///
+/// Identical parameter contract to [`make_encoder`] (`sample_rate` and
+/// `channels` required, `bit_rate` optional), but the produced encoder
+/// dispatches to [`Mp1Layer2FrameEncoder`](crate::Mp1Layer2FrameEncoder)
+/// inside the same [`Mp1Encoder`](crate::Mp1Encoder) trait-object
+/// wrapper and consumes **1152** PCM samples per channel per
+/// [`Encoder::send_frame`] call (the §2.4.2.1 Layer II frame
+/// granularity) rather than the Layer I 384. The §2.4.1.4 CRC is
+/// **not** emitted by default.
+///
+/// Defaults to a stereo midpoint on the §2.4.2.3 Layer II bitrate
+/// ladder (128 kbit/s mono / 192 stereo at MPEG-1 rates; 64 / 96 at
+/// 13818-3 §2.4.2.3 LSF rates).
+pub fn make_encoder_layer2(params: &CodecParameters) -> Result<Box<dyn Encoder>, Error> {
+    crate::codec::make_encoder_layer2(params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

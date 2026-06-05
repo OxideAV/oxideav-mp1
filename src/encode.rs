@@ -2358,12 +2358,44 @@ fn encode_layer2_frame_inner(
     Ok(bytes)
 }
 
-/// Parameters for a single Layer I encode: the target bitrate and the
-/// stream's sampling frequency and channel mode.
+/// The MPEG audio layer the top-level [`Mp1Encoder`](crate::Mp1Encoder)
+/// should emit.
+///
+/// The choice selects which inner encoder is driven and consequently
+/// the per-frame PCM granularity:
+///
+/// * [`LayerSelect::LayerI`] — §2.4.1.5 frame structure, 384 PCM
+///   samples per channel per frame (`12 · 32`).
+/// * [`LayerSelect::LayerII`] — §2.4.1.6 frame structure, 1152 PCM
+///   samples per channel per frame (`36 · 32`).
+///
+/// Both branches share the same six sampling-frequency / two-channel
+/// surface (MPEG-1 `ID == 1` plus MPEG-2 LSF `ID == 0`); the bitrate
+/// ladders differ (§2.4.2.3 Layer I vs. Layer II columns), so a
+/// Layer-II encoder built from an [`EncodeParams`] whose bitrate is
+/// only on the Layer I ladder will surface the inner encoder's
+/// ladder-rejection error on first encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayerSelect {
+    /// MPEG-1 Audio Layer I (§2.4.1.5). The default, preserving the
+    /// historical [`EncodeParams`] behaviour before this switch existed.
+    #[default]
+    LayerI,
+    /// MPEG-1 Audio Layer II (§2.4.1.6) — or MPEG-2 LSF Layer II per
+    /// 13818-3 §2.4.2.3 when the chosen sampling frequency is on the
+    /// LSF ladder (16 / 22.05 / 24 kHz).
+    LayerII,
+}
+
+/// Parameters for a single Layer I (or, when [`EncodeParams::layer`] is
+/// set, Layer II) encode: the target bitrate and the stream's sampling
+/// frequency and channel mode.
 #[derive(Debug, Clone, Copy)]
 pub struct EncodeParams {
     /// Target bitrate. Must be a fixed Layer I ladder value
-    /// ([`Bitrate::Fixed`]); free format is not produced by this
+    /// ([`Bitrate::Fixed`]) when [`EncodeParams::layer`] is
+    /// [`LayerSelect::LayerI`], or a Layer II ladder value when it is
+    /// [`LayerSelect::LayerII`]; free format is not produced by this
     /// encoder.
     pub bitrate: Bitrate,
     /// Sampling frequency in Hz (44100, 48000 or 32000).
@@ -2385,12 +2417,24 @@ pub struct EncodeParams {
     /// data budget (`adb` of §C.1.5.1.6) so the slot count remains the
     /// §2.4.2.1 `N = floor(12 · bitrate / Fs) + padding` value.
     pub emit_crc: bool,
+    /// Which MPEG audio layer the top-level
+    /// [`Mp1Encoder`](crate::Mp1Encoder) should emit. Defaults to
+    /// [`LayerSelect::LayerI`], preserving byte-for-byte compatibility
+    /// with the encoder's pre-switch behaviour.
+    ///
+    /// The lower-level [`Mp1FrameEncoder`] always emits Layer I and the
+    /// lower-level [`Mp1Layer2FrameEncoder`] always emits Layer II; this
+    /// field is only consulted by the top-level
+    /// [`Mp1Encoder`](crate::Mp1Encoder) wrapper that adapts an
+    /// [`oxideav_core::Encoder`] to either inner encoder.
+    pub layer: LayerSelect,
 }
 
 impl EncodeParams {
-    /// A new [`EncodeParams`] with `emit_crc = false`, the encoder's
-    /// historical default (the optional §2.4.1.4 CRC `error_check()` is
-    /// **not** written; `protection_bit == 1`).
+    /// A new [`EncodeParams`] with `emit_crc = false` and `layer =
+    /// LayerI`, the encoder's historical defaults (the optional §2.4.1.4
+    /// CRC `error_check()` is **not** written, `protection_bit == 1`,
+    /// and the top-level encoder produces Layer I output).
     ///
     /// `bitrate` is a fixed Layer I ladder value (free format is not
     /// produced); `sampling_frequency` must be one of the six Layer I
@@ -2403,6 +2447,7 @@ impl EncodeParams {
             sampling_frequency,
             mode,
             emit_crc: false,
+            layer: LayerSelect::LayerI,
         }
     }
 
@@ -2410,6 +2455,16 @@ impl EncodeParams {
     /// `error_check()` CRC field (see [`EncodeParams::emit_crc`]).
     pub fn with_emit_crc(mut self, emit: bool) -> EncodeParams {
         self.emit_crc = emit;
+        self
+    }
+
+    /// Builder: select which MPEG audio layer the top-level
+    /// [`Mp1Encoder`](crate::Mp1Encoder) should emit. Layer I (the
+    /// default) drives [`Mp1FrameEncoder`] and consumes 384 PCM samples
+    /// per channel per frame; Layer II drives [`Mp1Layer2FrameEncoder`]
+    /// and consumes 1152.
+    pub fn with_layer(mut self, layer: LayerSelect) -> EncodeParams {
+        self.layer = layer;
         self
     }
 }
