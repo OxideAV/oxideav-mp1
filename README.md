@@ -608,6 +608,46 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     §2.4.2.1 byte count. Public surface add: re-exported
     `Mp1Layer2FrameEncoder` at the crate root.
   - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+- **Annex D Phase-3 — Table D.3a (Fs = 32 kHz) calculation-partition
+  partial anchor**: clause D.2 prints **Table D.3a** "Psychoacoustic
+  Model 2 calculation partition table" at the 32 kHz sampling rate
+  as a 63-row block — partition index `n`, FFT-line span
+  `[ωlow_n, ωhigh_n]`, median Bark value `bval`, minimum
+  masking-spread floor `minval` (dB) and tone-masking-noise offset
+  `TMN` (dB). The dense table page is staged behind a PNG render
+  (`docs/audio/mp3/annex-d-renders/Table-D.3a-calc-partition-32kHz-p133.png`)
+  and the docs extract transcribes the **first 20 rows** as text;
+  those 20 rows now land in [`psy`] as
+  `CALC_PARTITION_32K_PARTIAL: [CalcPartition; 20]` — a typed
+  five-column const with a `CalcPartition::width()` accessor for
+  the implicit `ωhigh − ωlow + 1` per-row FFT-line count. The
+  printed-table length lands as `CALC_PARTITION_32K_FULL_LEN = 63`
+  and the lookup helper `calc_partition_32k(n)` returns `Some(row)`
+  for the anchor `n ∈ 1..=20` and `None` for the still-DOCS-GAP
+  tail `n ∈ 21..=63`, so consumers wiring the Annex D allocator can
+  branch on `None` to fall back through the energy-driven path
+  until the remainder is transcribed. The shape mirrors the prior
+  `CODER_PARTITIONS` (Table D.5) staging — typed `const`, explicit
+  1-based numbering, and the DOCS-GAP boundary surfaced in the type
+  rather than papered over.
+  - Nine new lib-tests cover: the anchor row count
+    (`CALC_PARTITION_32K_PARTIAL.len() == 20` and
+    `CALC_PARTITION_32K_FULL_LEN == 63`); the 1-based densely-
+    packed `index` field on every row; the contiguous FFT-line
+    tiling (`ωlow[0] == 1`; `next.ωlow == prev.ωhigh + 1` across
+    every adjacent pair); the `width()` accessor matching
+    `ωhigh − ωlow + 1` per row; the partition-1 anchor (ω = 1,
+    bval = 0,00, minval = 0,0, TMN = 24,5); the strictly-monotonic
+    Bark axis across the anchor; the head-region TMN plateau
+    `24.5` dB for partitions 1..=14 plus the strictly-increasing
+    TMN tail 15..=20 with the 24.8 dB anchor at partition 15; the
+    settled-region `minval == 4.5` dB for partitions 17..=20; the
+    `calc_partition_32k(n)` lookup helper returning `Some` for
+    anchor indices and `None` for both `n == 0` (1-based
+    underflow) and the DOCS-GAP tail `n ∈ 21..=63`; and the
+    per-row widths matching the extract (partition 1 = 1 line,
+    partitions 2..=13 = 3 lines, partitions 14..=20 = 4 lines).
+  - Total `cargo test -p oxideav-mp1 --lib` count: **282 → 292**.
 - **Annex D Phase-3 — Step 3 `LTq` offset + Model 2 spreading
   pieces**: closed-form helpers from the text-extractable portions of
   Annex D continue to land in the [`psy`] module without touching the

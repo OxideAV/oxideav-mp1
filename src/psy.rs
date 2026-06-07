@@ -1193,6 +1193,267 @@ pub const CODER_PARTITIONS: [CoderPartition; 33] = [
 ];
 
 // -----------------------------------------------------------------
+// Annex D Table D.3a — Psychoacoustic Model 2 calculation-partition
+// table at Fs = 32 kHz (partial anchor: partitions 1..=20 of 63).
+//
+// Spec context: clause D.2 (Psychoacoustic Model 2). Each row of
+// Table D.3x describes one Model-2 threshold-calculation partition
+// at the given sampling frequency and carries five columns: the
+// 1-based partition index `n`, the inclusive FFT-line span
+// `[ωlow_n, ωhigh_n]` (also 1-based), the median Bark value `bval`
+// of the partition, the minimum masking-spread floor `minval` (dB),
+// and the tone-masking-noise offset `TMN` (dB).
+//
+// The staged docs extract
+// (`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`,
+// "Table D.3a–c — Model 2 calculation partition table")
+// transcribes only the first 20 partitions of the 32 kHz row
+// (D.3a) as text — the remaining 43 partitions of D.3a and the
+// full D.3b (44,1 kHz) / D.3c (48 kHz) tables are staged as
+// authoritative PNG renders under
+// `docs/audio/mp3/annex-d-renders/` because the PDF page is too
+// dense for the text layer to extract reliably.
+//
+// This partial transcription parallels the prior
+// `CODER_PARTITIONS` (Table D.5) staging: the legible portion of
+// the spec lands as a typed `const` table with explicit row
+// numbering, and downstream consumers can branch on
+// `CALC_PARTITION_32K_PARTIAL.len() < 63` to detect the
+// still-DOCS-GAP tail rather than treat the array as the full
+// table. The Annex D allocator wiring proper still waits on the
+// remaining rows (and on D.3b/c and D.4a–c), per the README spec
+// gap list.
+// -----------------------------------------------------------------
+
+/// One row of Annex D Table D.3x ("Psychoacoustic Model 2
+/// calculation partition table").
+///
+/// Carries the five spec columns verbatim: 1-based partition index
+/// `n` (`index`), the inclusive FFT-line span `[omega_low,
+/// omega_high]` (also 1-based), the median Bark value `bval`, the
+/// minimum masking-spread floor `minval` in dB, and the
+/// tone-masking-noise offset `tmn` in dB.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalcPartition {
+    /// Partition number `n` (1-based, per the printed spec).
+    pub index: u16,
+    /// Lower FFT-line bound `ωlow_n` (1-based, inclusive).
+    pub omega_low: u16,
+    /// Upper FFT-line bound `ωhigh_n` (1-based, inclusive).
+    pub omega_high: u16,
+    /// Median Bark value of the partition.
+    pub bval: f64,
+    /// Minimum masking-spread floor (dB).
+    pub minval: f64,
+    /// Tone-masking-noise offset (dB).
+    pub tmn: f64,
+}
+
+impl CalcPartition {
+    /// Width of the partition in FFT lines, `ωhigh − ωlow + 1`.
+    ///
+    /// Convenience accessor for the (otherwise implicit) per-row
+    /// count of FFT lines the partition spans.
+    pub fn width(self) -> u16 {
+        self.omega_high - self.omega_low + 1
+    }
+}
+
+/// Annex D Table D.3a — calculation-partition table at
+/// **Fs = 32 kHz**, partial anchor carrying the **first 20** of
+/// the 63 partitions printed in ISO/IEC 11172-3 (1993) PDF page
+/// 139 (printed 133).
+///
+/// The remaining 43 rows are typeset as a dense PDF page whose
+/// text layer does not extract reliably; they are staged under
+/// `docs/audio/mp3/annex-d-renders/Table-D.3a-calc-partition-32kHz-p133.png`
+/// and remain a DOCS-GAP awaiting a higher-DPI / differently-OCR'd
+/// pass (mirroring the `annex-b-renders/` → text cycle that
+/// unblocked Tables B.1 / B.3). Consumers wiring the full
+/// allocator should branch on `len() < 63` to fall back through
+/// the energy-driven path until the remainder lands.
+pub const CALC_PARTITION_32K_PARTIAL: [CalcPartition; 20] = [
+    CalcPartition {
+        index: 1,
+        omega_low: 1,
+        omega_high: 1,
+        bval: 0.00,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 2,
+        omega_low: 2,
+        omega_high: 4,
+        bval: 0.63,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 3,
+        omega_low: 5,
+        omega_high: 7,
+        bval: 1.56,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 4,
+        omega_low: 8,
+        omega_high: 10,
+        bval: 2.50,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 5,
+        omega_low: 11,
+        omega_high: 13,
+        bval: 3.44,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 6,
+        omega_low: 14,
+        omega_high: 16,
+        bval: 4.34,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 7,
+        omega_low: 17,
+        omega_high: 19,
+        bval: 5.17,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 8,
+        omega_low: 20,
+        omega_high: 22,
+        bval: 5.94,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 9,
+        omega_low: 23,
+        omega_high: 25,
+        bval: 6.63,
+        minval: 17.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 10,
+        omega_low: 26,
+        omega_high: 28,
+        bval: 7.28,
+        minval: 15.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 11,
+        omega_low: 29,
+        omega_high: 31,
+        bval: 7.90,
+        minval: 15.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 12,
+        omega_low: 32,
+        omega_high: 34,
+        bval: 8.50,
+        minval: 10.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 13,
+        omega_low: 35,
+        omega_high: 37,
+        bval: 9.06,
+        minval: 7.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 14,
+        omega_low: 38,
+        omega_high: 41,
+        bval: 9.65,
+        minval: 7.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 15,
+        omega_low: 42,
+        omega_high: 45,
+        bval: 10.28,
+        minval: 4.4,
+        tmn: 24.8,
+    },
+    CalcPartition {
+        index: 16,
+        omega_low: 46,
+        omega_high: 49,
+        bval: 10.87,
+        minval: 4.4,
+        tmn: 25.4,
+    },
+    CalcPartition {
+        index: 17,
+        omega_low: 50,
+        omega_high: 53,
+        bval: 11.41,
+        minval: 4.5,
+        tmn: 25.9,
+    },
+    CalcPartition {
+        index: 18,
+        omega_low: 54,
+        omega_high: 57,
+        bval: 11.92,
+        minval: 4.5,
+        tmn: 26.4,
+    },
+    CalcPartition {
+        index: 19,
+        omega_low: 58,
+        omega_high: 61,
+        bval: 12.39,
+        minval: 4.5,
+        tmn: 26.9,
+    },
+    CalcPartition {
+        index: 20,
+        omega_low: 62,
+        omega_high: 65,
+        bval: 12.83,
+        minval: 4.5,
+        tmn: 27.3,
+    },
+];
+
+/// Total number of partitions in the full Annex D Table D.3a
+/// (Fs = 32 kHz). The text-extractable anchor in
+/// [`CALC_PARTITION_32K_PARTIAL`] carries the first 20; the
+/// remaining `CALC_PARTITION_32K_FULL_LEN − 20` rows are still
+/// DOCS-GAP behind the PNG render.
+pub const CALC_PARTITION_32K_FULL_LEN: usize = 63;
+
+/// Look up the partial-anchor row for partition index `n`
+/// (1-based, per the printed spec) at Fs = 32 kHz. Returns
+/// `Some(row)` when `n ∈ 1..=20` and `None` otherwise — including
+/// the still-DOCS-GAP tail `n ∈ 21..=63`. Callers wiring the
+/// Annex D allocator should treat `None` as "fall back to the
+/// energy-driven path" until the remainder is transcribed.
+pub fn calc_partition_32k(n: u16) -> Option<CalcPartition> {
+    let idx = usize::from(n).checked_sub(1)?;
+    CALC_PARTITION_32K_PARTIAL.get(idx).copied()
+}
+
+// -----------------------------------------------------------------
 // Annex D Step 3 — threshold-in-quiet `LTq` bit-rate-dependent offset
 //
 // Quoted verbatim from the staged docs extract (text-layer readable
@@ -1838,6 +2099,197 @@ mod tests {
                 w[0],
                 w[1]
             );
+        }
+    }
+
+    // ---- Annex D Table D.3a partial anchor (Fs = 32 kHz) ----
+
+    #[test]
+    fn calc_partition_32k_partial_has_twenty_rows() {
+        // The text-extractable anchor in the staged docs covers
+        // exactly the first 20 of the printed 63 partitions; the
+        // constant should match that count and `_FULL_LEN` should
+        // remain at the printed 63.
+        assert_eq!(CALC_PARTITION_32K_PARTIAL.len(), 20);
+        assert_eq!(CALC_PARTITION_32K_FULL_LEN, 63);
+    }
+
+    #[test]
+    fn calc_partition_32k_indices_are_one_based_and_dense() {
+        // Spec column 1 ("Index") is 1-based and dense over the
+        // anchor 1..=20 with no gaps; the `index` field stamped
+        // into each row must match its array slot's 1-based
+        // counterpart.
+        for (slot, row) in CALC_PARTITION_32K_PARTIAL.iter().enumerate() {
+            let expected = (slot + 1) as u16;
+            assert_eq!(
+                row.index,
+                expected,
+                "row at slot {slot} carries index {got}, expected {expected}",
+                got = row.index
+            );
+        }
+    }
+
+    #[test]
+    fn calc_partition_32k_omega_ranges_are_contiguous() {
+        // The spec's per-partition FFT-line spans tile the line
+        // axis with no overlap and no gap: each `omega_low` must
+        // equal the previous row's `omega_high + 1`, and the
+        // first row anchors at line 1 (1-based per the printed
+        // table).
+        assert_eq!(CALC_PARTITION_32K_PARTIAL[0].omega_low, 1);
+        for w in CALC_PARTITION_32K_PARTIAL.windows(2) {
+            let prev = w[0];
+            let next = w[1];
+            assert_eq!(
+                next.omega_low,
+                prev.omega_high + 1,
+                "discontinuity between partition {} (omega_high = {}) and {} (omega_low = {})",
+                prev.index,
+                prev.omega_high,
+                next.index,
+                next.omega_low
+            );
+            assert!(
+                prev.omega_high >= prev.omega_low,
+                "partition {} has inverted omega range [{}, {}]",
+                prev.index,
+                prev.omega_low,
+                prev.omega_high
+            );
+        }
+    }
+
+    #[test]
+    fn calc_partition_32k_widths_match_omega_span() {
+        // The `width()` accessor must equal `omega_high - omega_low + 1`
+        // for every row.
+        for row in CALC_PARTITION_32K_PARTIAL.iter() {
+            assert_eq!(
+                row.width(),
+                row.omega_high - row.omega_low + 1,
+                "width mismatch on partition {}",
+                row.index
+            );
+        }
+    }
+
+    #[test]
+    fn calc_partition_32k_first_row_matches_spec() {
+        // Spec anchor: partition 1 spans the single line ω = 1
+        // with bval = 0,00, minval = 0,0, TMN = 24,5.
+        let p1 = CALC_PARTITION_32K_PARTIAL[0];
+        assert_eq!(p1.index, 1);
+        assert_eq!(p1.omega_low, 1);
+        assert_eq!(p1.omega_high, 1);
+        assert!((p1.bval - 0.00).abs() < 1e-9);
+        assert!((p1.minval - 0.0).abs() < 1e-9);
+        assert!((p1.tmn - 24.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calc_partition_32k_bval_is_monotonically_non_decreasing() {
+        // Bark values are monotonically non-decreasing across the
+        // partition axis (the Bark scale is monotonic in
+        // frequency, and the partitions tile by ascending FFT
+        // line); strict on the anchor — every printed `bval` is
+        // strictly larger than its predecessor.
+        for w in CALC_PARTITION_32K_PARTIAL.windows(2) {
+            assert!(
+                w[1].bval > w[0].bval,
+                "bval not strictly increasing at partition {} -> {}",
+                w[0].index,
+                w[1].index
+            );
+        }
+    }
+
+    #[test]
+    fn calc_partition_32k_tmn_constant_then_rises_at_partition_15() {
+        // Per the staged extract: "From partition 17 onward
+        // minval is a constant 4,5 dB and TMN rises monotonically"
+        // — the visible anchor shows the TMN rise actually starts
+        // at partition 15 (10,28 Bark, TMN = 24,8 dB), with
+        // partitions 1..=14 holding TMN at 24,5 dB.
+        for row in CALC_PARTITION_32K_PARTIAL.iter().take(14) {
+            assert!(
+                (row.tmn - 24.5).abs() < 1e-9,
+                "partition {} (head region) carries TMN = {}, expected 24.5",
+                row.index,
+                row.tmn
+            );
+        }
+        // Partitions 15..=20 carry strictly increasing TMN.
+        let tail: Vec<f64> = CALC_PARTITION_32K_PARTIAL[14..]
+            .iter()
+            .map(|r| r.tmn)
+            .collect();
+        for w in tail.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "TMN not strictly increasing in the tail: {} -> {}",
+                w[0],
+                w[1]
+            );
+        }
+        // And the partition-15 anchor value lands at 24.8 dB
+        // exactly per the printed table.
+        assert!((CALC_PARTITION_32K_PARTIAL[14].tmn - 24.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calc_partition_32k_minval_settles_to_four_point_five_from_partition_17() {
+        // Same staged-extract anchor: "From partition 17 onward
+        // minval is a constant 4,5 dB". Check explicitly for
+        // partitions 17..=20.
+        for row in CALC_PARTITION_32K_PARTIAL.iter().filter(|r| r.index >= 17) {
+            assert!(
+                (row.minval - 4.5).abs() < 1e-9,
+                "partition {} (settled region) carries minval = {}, expected 4.5",
+                row.index,
+                row.minval
+            );
+        }
+    }
+
+    #[test]
+    fn calc_partition_32k_lookup_resolves_anchor_indices() {
+        // The `calc_partition_32k(n)` helper resolves 1-based `n`
+        // into the partial-anchor array. Every anchor index
+        // 1..=20 returns `Some(row)` with matching fields, every
+        // tail index 21..=63 returns `None` (DOCS-GAP), and the
+        // 1-based `n == 0` underflow is also `None`.
+        assert!(calc_partition_32k(0).is_none());
+        for n in 1..=20u16 {
+            let row = calc_partition_32k(n).expect("anchor partition resolves");
+            assert_eq!(row.index, n);
+        }
+        for n in 21..=CALC_PARTITION_32K_FULL_LEN as u16 {
+            assert!(
+                calc_partition_32k(n).is_none(),
+                "partition {n} unexpectedly resolved before DOCS-GAP tail is staged"
+            );
+        }
+    }
+
+    #[test]
+    fn calc_partition_32k_widths_match_extract_anchor() {
+        // Width-by-width regression against the staged extract:
+        // partition 1 width 1, partition 2 width 3, partitions
+        // 3..=13 width 3, partition 14 width 4, partitions 15..=20
+        // width 4 (the FFT-line spans broaden once the Bark scale
+        // exits the linear regime).
+        let widths: Vec<u16> = CALC_PARTITION_32K_PARTIAL
+            .iter()
+            .map(|r| r.width())
+            .collect();
+        assert_eq!(widths[0], 1, "partition 1 spans one FFT line");
+        for w in &widths[1..=12] {
+            assert_eq!(*w, 3, "partitions 2..=13 span three FFT lines");
+        }
+        for w in &widths[13..] {
+            assert_eq!(*w, 4, "partitions 14..=20 span four FFT lines");
         }
     }
 }

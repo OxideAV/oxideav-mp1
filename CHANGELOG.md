@@ -8,6 +8,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Table D.3a (Fs = 32 kHz) calculation-partition partial
+  anchor.** Clause D.2 prints "Psychoacoustic Model 2 calculation
+  partition table" at the 32 kHz sampling rate as a 63-row block
+  (partition index `n`, FFT-line span `[ωlow_n, ωhigh_n]`, median
+  Bark value `bval`, minimum masking-spread floor `minval` dB and
+  tone-masking-noise offset `TMN` dB); the dense page is staged
+  behind a PNG render in
+  `docs/audio/mp3/annex-d-renders/Table-D.3a-calc-partition-32kHz-p133.png`
+  and the docs extract transcribes the first 20 rows as text.
+  Those 20 rows now land in `psy` as a typed five-column const
+  `CALC_PARTITION_32K_PARTIAL: [CalcPartition; 20]`, with a
+  `CalcPartition::width()` accessor for the implicit
+  `ωhigh − ωlow + 1` FFT-line count. The printed full-table length
+  lands as `CALC_PARTITION_32K_FULL_LEN = 63` and the lookup helper
+  `calc_partition_32k(n)` returns `Some(row)` for the anchor
+  `n ∈ 1..=20` and `None` for the still-DOCS-GAP tail
+  `n ∈ 21..=63`, so downstream consumers wiring the Annex D
+  allocator can branch on `None` to fall back through the
+  signal-energy-driven path until the remainder is transcribed.
+  This mirrors the prior Table D.5 (`CODER_PARTITIONS`) staging
+  shape — typed const, explicit 1-based numbering, DOCS-GAP
+  boundary surfaced in the type. Nine new lib-tests cover the
+  anchor row count, the dense 1-based `index` field, the
+  contiguous FFT-line tiling, the `width()` accessor, the
+  partition-1 anchor, the strictly-monotonic Bark axis, the
+  head-region TMN plateau (24.5 dB through partition 14) plus the
+  strictly-increasing TMN tail (partitions 15..=20 starting at the
+  24.8 dB anchor), the settled-region `minval == 4.5` dB for
+  partitions 17..=20, the `calc_partition_32k(n)` lookup helper
+  (anchor → `Some`, both 1-based underflow and DOCS-GAP tail →
+  `None`), and the per-row widths matching the extract (1 line for
+  partition 1, 3 lines for partitions 2..=13, 4 lines for
+  partitions 14..=20). Public surface: new `CalcPartition` struct,
+  `CALC_PARTITION_32K_PARTIAL` const, `CALC_PARTITION_32K_FULL_LEN`
+  const and `calc_partition_32k` helper in the `psy` module.
+  Total `cargo test -p oxideav-mp1 --lib` count: **282 → 292**.
+
 - **`Mp1Encoder` §2.4.1.5 / §2.4.1.6 Layer-I / Layer-II top-level
   dispatch switch.** The `oxideav_core::Encoder` trait object the
   registry hands back from `make_encoder` (and the direct factory twin
