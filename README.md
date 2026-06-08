@@ -608,6 +608,33 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     §2.4.2.1 byte count. Public surface add: re-exported
     `Mp1Layer2FrameEncoder` at the crate root.
   - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+- **Model 2 spreading-function `x` term — per-pair adapter +
+  active-region predicate**: two narrow helpers in the [`psy`]
+  module close the `(j_bark, i_bark)` composition gap between the
+  already-staged `model2_tmpx` and `model2_x` text-extracted pieces
+  of clause D.2. `psy::model2_x_for_pair(j_bark, i_bark)` is the
+  one-line composition `model2_x(model2_tmpx(j_bark, i_bark))` —
+  mirrors the `step3_apply_ltq_offset` adapter style and exposes
+  the per-pair spreading-function `x` contribution as a single call
+  so callers walking calculation partition pairs do not have to
+  re-derive the composition.
+  `psy::model2_x_is_active(j_bark, i_bark)` is the matching `bool`
+  predicate, `true` iff the `x` term is strictly negative for this
+  pair — equivalently `tmpx ∈ (0.5, 2.5)` (open) or `(j − i) ∈
+  (0.5/1.05, 2.5/1.05) ≈ (0.476, 2.381)` Bark. Outside that
+  interval `_for_pair` is exactly `0.0` (the `min(_, 0)` clamp
+  engages); the predicate lets consumers short-circuit the
+  still-DOCS-GAP per-pair `tmpy` evaluation site for inactive
+  pairs.
+  - Nine new lib-tests cover the `_for_pair` adapter (two-step
+    composition agreement on points spanning every region, sign
+    clamp `<= 0` on a 26×26 integer grid, `j == i → 0`, strict
+    negativity inside the active window, exact `0.0` on both
+    outside-window directions including the closed endpoints), and
+    the `_is_active` predicate (fine-grid agreement with the
+    numerical `< 0` check of `_for_pair`, exclusive open-interval
+    endpoints, `false` at `j == i`, `false` for `j < i`).
+  - Total `cargo test -p oxideav-mp1 --lib` count: **307 → 316**.
 - **Annex D Step 4 / Step 3 / Step 7 composer helpers**: three
   closed-form adapters in the [`psy`] module that join the existing
   Annex D building blocks into the per-line composition sites the

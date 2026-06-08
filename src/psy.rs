@@ -1694,6 +1694,69 @@ pub fn global_threshold_db_from_maskers(
     10.0 * acc.log10()
 }
 
+// -----------------------------------------------------------------
+// Model 2 spreading function — `x` term per (masker-Bark, line-Bark)
+//
+// Composes the two text-extractable pieces already staged
+// ([`model2_tmpx`] and [`model2_x`]) into the per-pair site the
+// allocator wires when walking calculation-partition pairs. Mirrors
+// the [`step3_apply_ltq_offset`] adapter style for [`ltq_offset_db`].
+//
+// Spec composition (clause D.2):
+//
+//   tmpx = 1,05 * (j - i)
+//   x    = 8 * minimum( (tmpx - 0,5)^2 - 2*(tmpx - 0,5), 0 )
+//
+// The `model2_x` clamp guarantees `x <= 0` everywhere; the open
+// interval where the inner term is strictly negative is
+// `tmpx ∈ (0.5, 2.5)`, i.e. `j - i ∈ (0.5/1.05, 2.5/1.05) ≈
+// (0.476, 2.381)`. Outside that open interval the `x` term is
+// exactly zero, so the spreading-function contribution from `x`
+// vanishes — the still-DOCS-GAP `tmpy` line will reduce to its
+// `minval` term alone for those pairs (per the prose convention).
+// `model2_x_is_active` exposes the predicate so callers can
+// short-circuit the `tmpy` evaluation site for inactive pairs.
+// -----------------------------------------------------------------
+
+/// Model 2 spreading-function `x` term evaluated for a `(j_bark,
+/// i_bark)` pair (clause D.2).
+///
+/// Composes [`model2_tmpx`] with [`model2_x`]:
+///
+/// `x(i, j) = model2_x(model2_tmpx(j_bark, i_bark))`
+///
+/// `j_bark` is the Bark of the band the masker is spread into;
+/// `i_bark` is the Bark of the signal being spread. The function is
+/// non-positive everywhere (the `model2_x` `min(_, 0)` clamp) and
+/// strictly negative only when `j_bark - i_bark ∈ (0.5/1.05,
+/// 2.5/1.05)` — see [`model2_x_is_active`] for the same predicate
+/// exposed as a `bool`.
+#[inline]
+pub fn model2_x_for_pair(j_bark: f64, i_bark: f64) -> f64 {
+    model2_x(model2_tmpx(j_bark, i_bark))
+}
+
+/// Predicate: is the Model 2 spreading-function `x` term strictly
+/// negative for this `(j_bark, i_bark)` pair?
+///
+/// Returns `true` iff `tmpx ∈ (0.5, 2.5)` (the open interval where
+/// `(tmpx - 0.5)^2 - 2·(tmpx - 0.5)` is negative and the
+/// [`model2_x`] `min(_, 0)` clamp is *not* engaged). Equivalently in
+/// Bark coordinates: `j_bark - i_bark ∈ (0.5/1.05, 2.5/1.05) ≈
+/// (0.47619…, 2.38095…)`.
+///
+/// Outside this open interval `model2_x_for_pair(j, i) == 0.0`
+/// exactly, which lets callers walking calculation-partition pairs
+/// skip the per-pair `tmpy` evaluation site entirely (the
+/// `x`-contribution is zero, and the post-step
+/// [`sprdngf_from_tmpy`] only depends on the remaining `tmpy`
+/// terms).
+#[inline]
+pub fn model2_x_is_active(j_bark: f64, i_bark: f64) -> bool {
+    let t = model2_tmpx(j_bark, i_bark);
+    t > 0.5 && t < 2.5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2698,5 +2761,137 @@ mod tests {
             strong > weak + 30.0,
             "loud masker (X=80 dB) should raise LTg by ≫ 30 dB; got weak={weak:.2} strong={strong:.2}"
         );
+    }
+
+    // -----------------------------------------------------------
+    // Model 2 spreading function — `x` term per (j_bark, i_bark)
+    // -----------------------------------------------------------
+
+    #[test]
+    fn model2_x_for_pair_matches_two_step_call() {
+        // The `_for_pair` adapter is defined as the composition of
+        // `model2_tmpx` and `model2_x` — verify literal agreement on
+        // a handful of `(j, i)` pairs spanning the relevant regions.
+        for &(j, i) in &[
+            (0.0f64, 0.0), // tmpx = 0  -> clamp -> 0
+            (0.5, 0.0),    // tmpx ≈ 0.525, near peak edge (still 0)
+            (1.0, 0.0),    // tmpx = 1.05, inside (0.5, 2.5) — active
+            (2.0, 0.5),    // tmpx ≈ 1.575, active
+            (2.5, 0.0),    // tmpx ≈ 2.625, outside (clamp -> 0)
+            (3.0, 5.0),    // tmpx < 0, clamp -> 0
+            (10.0, 8.0),   // tmpx = 2.1, active
+        ] {
+            let want = model2_x(model2_tmpx(j, i));
+            let got = model2_x_for_pair(j, i);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "model2_x_for_pair({j}, {i}) = {got}, two-step = {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_x_for_pair_is_non_positive_everywhere() {
+        // The `min(_, 0)` clamp inside `model2_x` propagates through
+        // the adapter; the per-pair value is `<= 0` for any input.
+        for j in -5..=20 {
+            for i in -5..=20 {
+                let (jb, ib) = (j as f64, i as f64);
+                let v = model2_x_for_pair(jb, ib);
+                assert!(
+                    v <= 0.0,
+                    "model2_x_for_pair({jb}, {ib}) = {v} should be <= 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model2_x_for_pair_zero_when_j_equals_i() {
+        // j == i  →  tmpx = 0  →  inner = 0.25 > 0  →  clamp -> 0.
+        for &z in &[0.0f64, 1.5, 5.0, 12.0, 23.5] {
+            assert_eq!(model2_x_for_pair(z, z), 0.0);
+        }
+    }
+
+    #[test]
+    fn model2_x_for_pair_active_inside_bark_window() {
+        // tmpx is in (0.5, 2.5) iff (j - i) is in
+        // (0.5/1.05, 2.5/1.05) ≈ (0.47619, 2.38095). Inside that
+        // window the `x` term must be strictly negative.
+        for &dz in &[0.48f64, 0.6, 1.0, 1.5, 2.0, 2.37] {
+            let v = model2_x_for_pair(dz, 0.0);
+            assert!(
+                v < 0.0,
+                "model2_x_for_pair with j-i = {dz} should be < 0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_x_for_pair_zero_outside_bark_window() {
+        // Outside the (≈0.476, ≈2.381) (j - i) window the inner term
+        // is non-negative so the clamp engages and the value is
+        // exactly 0. Cover both sides plus the closed boundaries.
+        for &dz in &[-5.0f64, -1.0, 0.0, 0.4, 0.47619047, 2.38095239, 2.5, 5.0] {
+            assert_eq!(
+                model2_x_for_pair(dz, 0.0),
+                0.0,
+                "expected exact 0 for (j - i) = {dz}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_x_is_active_predicate_matches_negative_region() {
+        // The predicate is `true` iff `model2_x_for_pair` is strictly
+        // negative — they must agree as boolean / numeric forms of
+        // the same condition. Sweep a fine grid of (j - i) values.
+        let step = 0.05;
+        let mut dz = -3.0;
+        while dz <= 3.0 + step / 2.0 {
+            let active = model2_x_is_active(dz, 0.0);
+            let v = model2_x_for_pair(dz, 0.0);
+            assert_eq!(
+                active,
+                v < 0.0,
+                "predicate {active} but value {v} at (j - i) = {dz}"
+            );
+            dz += step;
+        }
+    }
+
+    #[test]
+    fn model2_x_is_active_endpoints_are_exclusive() {
+        // tmpx == 0.5 -> inner = 0 -> v == 0 -> predicate false.
+        // tmpx == 2.5 -> inner = 0 -> v == 0 -> predicate false.
+        // The matching (j - i) values are 0.5/1.05 and 2.5/1.05.
+        let dz_low = 0.5 / 1.05;
+        let dz_high = 2.5 / 1.05;
+        assert!(!model2_x_is_active(dz_low, 0.0));
+        assert!(!model2_x_is_active(dz_high, 0.0));
+        // Just inside the open interval the predicate must be true.
+        assert!(model2_x_is_active(dz_low + 1e-9, 0.0));
+        assert!(model2_x_is_active(dz_high - 1e-9, 0.0));
+    }
+
+    #[test]
+    fn model2_x_is_active_false_when_j_equals_i() {
+        // j == i -> tmpx = 0 -> outside (0.5, 2.5) -> not active.
+        for &z in &[0.0f64, 1.5, 5.0, 12.0, 23.5] {
+            assert!(
+                !model2_x_is_active(z, z),
+                "model2_x_is_active({z}, {z}) should be false"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_x_is_active_false_for_j_below_i() {
+        // tmpx = 1.05 * (j - i); when j < i the value is negative
+        // and certainly outside (0.5, 2.5).
+        for &(j, i) in &[(0.0f64, 1.0), (3.0, 5.0), (5.0, 12.5), (1.0, 10.0)] {
+            assert!(!model2_x_is_active(j, i));
+        }
     }
 }

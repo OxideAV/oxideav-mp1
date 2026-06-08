@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 2 spreading-function `x` term — per-pair adapter +
+  active-region predicate.** Two narrow helpers close the
+  `(j_bark, i_bark)` composition gap between the already-staged
+  [`model2_tmpx`] (`tmpx = 1.05 · (j − i)`) and [`model2_x`]
+  (`x = 8 · min((tmpx − 0.5)² − 2·(tmpx − 0.5), 0)`) text-extracted
+  pieces of clause D.2:
+
+  * `psy::model2_x_for_pair(j_bark, i_bark) -> f64` — one-line
+    composition `model2_x(model2_tmpx(j_bark, i_bark))`. Mirrors
+    the existing `step3_apply_ltq_offset` adapter for
+    `ltq_offset_db` — exposes the per-pair spreading-function `x`
+    contribution as a single call so callers walking calculation
+    partition pairs do not have to re-derive the composition.
+  * `psy::model2_x_is_active(j_bark, i_bark) -> bool` — `true`
+    iff the `x` term is strictly negative for this pair, i.e.
+    `tmpx ∈ (0.5, 2.5)` (equivalently `(j − i) ∈
+    (0.5/1.05, 2.5/1.05) ≈ (0.476, 2.381)` Bark). Outside that open
+    interval `model2_x_for_pair` is exactly `0.0` (the `min(_, 0)`
+    clamp engages); the predicate lets callers short-circuit the
+    still-DOCS-GAP per-pair `tmpy` evaluation site for inactive
+    pairs.
+
+  Nine new lib-tests cover the `_for_pair` adapter (two-step
+  composition agreement on points spanning every region, sign
+  clamp `<= 0` on a 26×26 integer grid, `j == i → 0`, strict
+  negativity inside the active window, exact `0.0` on both
+  outside-window directions including the closed endpoints), and
+  the `_is_active` predicate (fine-grid agreement with the
+  numerical `< 0` test of `_for_pair`, exclusive open-interval
+  endpoints, `false` at `j == i`, `false` for `j < i`).
+
+  Lib test count: **307 → 316**.
+
 - **Annex D Step 4 + Step 3 + Step 7 composer helpers.** Three
   closed-form adapter helpers join the existing Annex D building
   blocks into the per-line composition sites the eventual perceptual
