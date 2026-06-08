@@ -1555,6 +1555,145 @@ pub fn sprdngf_from_tmpy(tmpy_db: f64) -> f64 {
     }
 }
 
+// -----------------------------------------------------------------
+// Step 4 helper — FFT-line → critical-band lookup
+//
+// Tables D.2a..f give critical-band boundaries as the **top** FFT-line
+// index (column `index F&CB`, 1-based into the matching Table D.1x).
+// Step 4 of the Annex D Model 1 prose (clause D.1) walks every FFT
+// line of the analysis window and asks "which critical band does this
+// line fall into?". The mapping is a strict closed-form over the
+// already-staged D.2x boundary list: the band containing line `i` is
+// the lowest band `k` whose `index_fcb >= i`.
+//
+// Returning the 0-based band index makes this composable with `.len()`
+// / iteration over the band slice the caller obtained from
+// `critical_band_table()`.
+// -----------------------------------------------------------------
+
+/// Map an FFT-line index (1-based into the Table D.1x
+/// `index F&CB` column) to the 0-based critical-band number that
+/// contains it, per the Table D.2x boundaries staged in
+/// [`critical_band_table`].
+///
+/// Returns `None` when:
+///
+/// * `(layer, sampling_frequency_hz)` is outside the
+///   `{32 000, 44 100, 48 000}` × `{Layer::I, Layer::II}` set
+///   Annex D covers (mirrors [`critical_band_table`]).
+/// * `line_index_fcb == 0` — the spec is 1-based.
+/// * `line_index_fcb` is above the table's highest band-top
+///   (`bands.last().index_fcb`) — the line lies above the top of the
+///   audio band the D.1x/D.2x tables cover and is therefore not
+///   masked by any critical band.
+///
+/// The band containing line `i` is the smallest band `k` such that
+/// `bands[k].index_fcb >= i`. The Table D.2x boundary column is the
+/// **upper** edge of each band, so this is the correct comparator
+/// (a line with `index_fcb == bands[k].index_fcb` belongs to band
+/// `k`, not `k+1`).
+pub fn critical_band_for_line(
+    layer: Layer,
+    sampling_frequency_hz: u32,
+    line_index_fcb: u16,
+) -> Option<usize> {
+    if line_index_fcb == 0 {
+        return None;
+    }
+    let bands = critical_band_table(layer, sampling_frequency_hz)?;
+    bands.iter().position(|b| b.index_fcb >= line_index_fcb)
+}
+
+// -----------------------------------------------------------------
+// Step 3 — apply `LTq` bit-rate-dependent offset to a per-line value
+//
+// The offset itself is staged as [`ltq_offset_db`]. This is the
+// trivial adapter the allocator wires at the per-line site:
+//
+//   LTq_used(i) = LTq_table(i) + ltq_offset_db(per_channel_rate)
+//
+// Splitting the two functions keeps the bit-rate predicate
+// independently testable (it is the part the encoder may evaluate
+// **once** per frame) while the per-line apply is a pure addition.
+// -----------------------------------------------------------------
+
+/// Annex D Step 3 — apply the bit-rate offset to a single tabulated
+/// threshold-in-quiet value.
+///
+/// `ltq_table_db` is the Table D.1x absolute-threshold column for an
+/// FFT line; `bit_rate_per_channel_kbps` selects the offset per
+/// [`ltq_offset_db`]. Returns the per-line `LTq_used(i) = LTq +
+/// offset` in dB.
+///
+/// This is a one-line helper; its purpose is to document the Step 3
+/// composition site so callers can reach for a single function rather
+/// than re-deriving the addition. The D.1x table values are still
+/// DOCS-GAP (PNG-only), so this helper exists ahead of its primary
+/// data source.
+#[inline]
+pub fn step3_apply_ltq_offset(ltq_table_db: f64, bit_rate_per_channel_kbps: u32) -> f64 {
+    ltq_table_db + ltq_offset_db(bit_rate_per_channel_kbps)
+}
+
+// -----------------------------------------------------------------
+// Step 7 — filtered global-threshold variant
+//
+// The base [`global_threshold_db`] takes pre-filtered slices of
+// individual masker thresholds (the Bark-window predicate is left to
+// the caller). The Step 7 prose also says, verbatim:
+//
+//   "For a given i the range of j may be reduced to maskers within
+//    −8…+3 Bark of i."
+//
+// That secondary window is wider than the `vf` Bark window
+// (`-3 <= dz < 8`, applied per masker by [`masking_function`] /
+// [`individual_threshold_tonal`] / [`individual_threshold_non_tonal`]).
+// In practice the `vf` `None` is the stricter filter — a masker that
+// `vf` ignores will never contribute. The convenience entry point
+// here takes raw `(masker_bark, masker_spl_db)` pairs, evaluates each
+// masker through the matching `individual_threshold_*` helper at the
+// evaluation-line Bark `z_i`, drops the `None` cases, and feeds the
+// rest into the same power-domain sum [`global_threshold_db`]
+// performs — surfacing the composite Step-6+Step-7 evaluation as one
+// call instead of asking the caller to build the slices.
+// -----------------------------------------------------------------
+
+/// Annex D Step 6 + Step 7 — composite per-line global masking
+/// threshold from raw masker lists, evaluated at FFT-line Bark `z_i`.
+///
+/// `tonal_maskers` and `non_tonal_maskers` each carry `(z_j, X_db)`
+/// pairs — masker Bark `z_j` and masker SPL `X` in dB. Maskers whose
+/// Bark distance `z_i − z_j` lies outside the `[-3, 8)` spreading-
+/// function window are ignored automatically (the matching
+/// `individual_threshold_*` helper returns `None` and the contribution
+/// is dropped). The remaining individual thresholds are accumulated
+/// into the power-domain Step 7 sum
+///
+/// `LTg(i) = 10·log10( 10^(LTq/10) + Σ 10^(LT_tm/10) + Σ 10^(LT_nm/10) )`
+///
+/// alongside `ltq_used_db` (the **already-offset** Step 3 threshold —
+/// callers can compose [`step3_apply_ltq_offset`] for the per-line
+/// term).
+pub fn global_threshold_db_from_maskers(
+    z_i: f64,
+    ltq_used_db: f64,
+    tonal_maskers: &[(f64, f64)],
+    non_tonal_maskers: &[(f64, f64)],
+) -> f64 {
+    let mut acc = 10f64.powf(ltq_used_db / 10.0);
+    for &(z_j, x_db) in tonal_maskers {
+        if let Some(lt) = individual_threshold_tonal(z_j, z_i, x_db) {
+            acc += 10f64.powf(lt / 10.0);
+        }
+    }
+    for &(z_j, x_db) in non_tonal_maskers {
+        if let Some(lt) = individual_threshold_non_tonal(z_j, z_i, x_db) {
+            acc += 10f64.powf(lt / 10.0);
+        }
+    }
+    10.0 * acc.log10()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2291,5 +2430,273 @@ mod tests {
         for w in &widths[13..] {
             assert_eq!(*w, 4, "partitions 14..=20 span four FFT lines");
         }
+    }
+
+    // -----------------------------------------------------------
+    // Step 4 helper — `critical_band_for_line`
+    // -----------------------------------------------------------
+
+    #[test]
+    fn critical_band_for_line_rejects_zero_line() {
+        for &(layer, fs) in &[
+            (Layer::I, 32_000u32),
+            (Layer::I, 44_100),
+            (Layer::I, 48_000),
+            (Layer::II, 32_000),
+            (Layer::II, 44_100),
+            (Layer::II, 48_000),
+        ] {
+            assert!(
+                critical_band_for_line(layer, fs, 0).is_none(),
+                "(layer={layer:?}, fs={fs}) line 0 must be rejected (spec is 1-based)"
+            );
+        }
+    }
+
+    #[test]
+    fn critical_band_for_line_rejects_unsupported_rates() {
+        for &fs in &[16_000u32, 22_050, 24_000, 8_000, 11_025, 12_000] {
+            assert!(critical_band_for_line(Layer::I, fs, 1).is_none());
+            assert!(critical_band_for_line(Layer::II, fs, 1).is_none());
+        }
+    }
+
+    #[test]
+    fn critical_band_for_line_returns_none_above_top() {
+        // The Table D.2x boundary list's last row's `index_fcb` is the
+        // highest FFT line covered. A line above that lies outside the
+        // tabulated audio band.
+        for &(layer, fs) in &[
+            (Layer::I, 32_000u32),
+            (Layer::I, 44_100),
+            (Layer::I, 48_000),
+            (Layer::II, 32_000),
+            (Layer::II, 44_100),
+            (Layer::II, 48_000),
+        ] {
+            let bands = critical_band_table(layer, fs).unwrap();
+            let top = bands.last().unwrap().index_fcb;
+            assert!(critical_band_for_line(layer, fs, top + 1).is_none());
+            assert!(critical_band_for_line(layer, fs, u16::MAX).is_none());
+        }
+    }
+
+    #[test]
+    fn critical_band_for_line_lookup_matches_boundary_walk() {
+        // Brute-force cross-check: for every FFT line up to and
+        // including the highest tabulated index_fcb, the lookup
+        // returns the smallest band whose top index_fcb >= line.
+        for &(layer, fs) in &[
+            (Layer::I, 32_000u32),
+            (Layer::I, 44_100),
+            (Layer::I, 48_000),
+            (Layer::II, 32_000),
+            (Layer::II, 44_100),
+            (Layer::II, 48_000),
+        ] {
+            let bands = critical_band_table(layer, fs).unwrap();
+            let top = bands.last().unwrap().index_fcb;
+            for line in 1..=top {
+                let expect = bands
+                    .iter()
+                    .position(|b| b.index_fcb >= line)
+                    .expect("line within top must hit a band");
+                assert_eq!(
+                    critical_band_for_line(layer, fs, line),
+                    Some(expect),
+                    "mismatch at (layer={layer:?}, fs={fs}, line={line})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn critical_band_for_line_top_edge_belongs_to_band_k_not_k_plus_1() {
+        // The Table D.2x `index_fcb` column is the **upper** edge of
+        // each band, so a line equal to a band's top must map to
+        // that band (k) not the next one (k+1).
+        for &(layer, fs) in &[
+            (Layer::I, 32_000u32),
+            (Layer::I, 44_100),
+            (Layer::I, 48_000),
+            (Layer::II, 32_000),
+            (Layer::II, 44_100),
+            (Layer::II, 48_000),
+        ] {
+            let bands = critical_band_table(layer, fs).unwrap();
+            for (k, band) in bands.iter().enumerate() {
+                assert_eq!(
+                    critical_band_for_line(layer, fs, band.index_fcb),
+                    Some(k),
+                    "(layer={layer:?}, fs={fs}) line {} (top of band {k}) must map to band {k}",
+                    band.index_fcb
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn critical_band_for_line_d2a_known_anchors() {
+        // Layer I, 32 kHz: band 0 covers FFT line 1 only
+        // (band 0 top = 1); band 1 covers lines 2..=3 (band 1 top =
+        // 3); band 2 covers lines 4..=5; band 23 covers lines
+        // 95..=108. These anchors come straight from the D.2a
+        // boundary list.
+        assert_eq!(
+            critical_band_for_line(Layer::I, 32_000, 1),
+            Some(0),
+            "line 1 falls in band 0 (top index_fcb = 1)"
+        );
+        assert_eq!(
+            critical_band_for_line(Layer::I, 32_000, 2),
+            Some(1),
+            "line 2 falls in band 1 (top index_fcb = 3)"
+        );
+        assert_eq!(
+            critical_band_for_line(Layer::I, 32_000, 3),
+            Some(1),
+            "line 3 falls in band 1 (top index_fcb = 3)"
+        );
+        assert_eq!(
+            critical_band_for_line(Layer::I, 32_000, 4),
+            Some(2),
+            "line 4 falls in band 2 (top index_fcb = 5)"
+        );
+        assert_eq!(
+            critical_band_for_line(Layer::I, 32_000, 95),
+            Some(23),
+            "line 95 falls in band 23 (top index_fcb = 108)"
+        );
+        assert_eq!(
+            critical_band_for_line(Layer::I, 32_000, 108),
+            Some(23),
+            "line 108 is the top of band 23"
+        );
+    }
+
+    #[test]
+    fn critical_band_for_line_d2e_layer2_44k1_anchors() {
+        // Layer II, 44.1 kHz: a few midband + top anchors against the
+        // staged D.2e boundaries (bands 0/1/2 = lines up to 1/2/3,
+        // last band 26 = line 130).
+        assert_eq!(critical_band_for_line(Layer::II, 44_100, 1), Some(0));
+        assert_eq!(critical_band_for_line(Layer::II, 44_100, 2), Some(1));
+        assert_eq!(critical_band_for_line(Layer::II, 44_100, 3), Some(2));
+        assert_eq!(critical_band_for_line(Layer::II, 44_100, 130), Some(26));
+        assert!(critical_band_for_line(Layer::II, 44_100, 131).is_none());
+    }
+
+    // -----------------------------------------------------------
+    // Step 3 — `step3_apply_ltq_offset`
+    // -----------------------------------------------------------
+
+    #[test]
+    fn step3_apply_ltq_offset_high_rate_subtracts_twelve_db() {
+        // ≥ 96 kbit/s per channel → -12 dB offset added to LTq.
+        let tabulated = 33.44; // Table D.1a row 1 anchor value.
+        assert!((step3_apply_ltq_offset(tabulated, 96) - 21.44).abs() < 1e-9);
+        assert!((step3_apply_ltq_offset(tabulated, 192) - 21.44).abs() < 1e-9);
+        assert!((step3_apply_ltq_offset(tabulated, 448) - 21.44).abs() < 1e-9);
+    }
+
+    #[test]
+    fn step3_apply_ltq_offset_low_rate_passes_through() {
+        // < 96 kbit/s per channel → 0 dB offset; LTq passes through.
+        let tabulated = 33.44;
+        for kbps in [8u32, 32, 64, 80, 95] {
+            assert!((step3_apply_ltq_offset(tabulated, kbps) - tabulated).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn step3_apply_ltq_offset_boundary_at_96_inclusive() {
+        // The boundary is inclusive on the -12 dB side: exactly 96
+        // already counts as "≥ 96", matching ltq_offset_db's
+        // documented semantics.
+        let tabulated = -4.97; // i ≈ 51, near the LTq minimum.
+        assert!((step3_apply_ltq_offset(tabulated, 95) - tabulated).abs() < 1e-9);
+        assert!((step3_apply_ltq_offset(tabulated, 96) - (tabulated - 12.0)).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------
+    // Step 7 — `global_threshold_db_from_maskers`
+    // -----------------------------------------------------------
+
+    #[test]
+    fn global_threshold_db_from_maskers_empty_yields_ltq() {
+        // No maskers → the per-line LTq is the global threshold.
+        let v = global_threshold_db_from_maskers(8.0, -10.0, &[], &[]);
+        assert!((v - -10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_threshold_db_from_maskers_drops_out_of_window_maskers() {
+        // dz = z_i - z_j: a masker at z_j = 0 evaluated at z_i = 9
+        // (dz = +9) is outside the [-3, 8) vf window and must be
+        // dropped. The remaining call should match an empty-masker
+        // call.
+        let z_i = 9.0;
+        let ltq = 0.0;
+        let v_with = global_threshold_db_from_maskers(z_i, ltq, &[(0.0, 60.0)], &[]);
+        let v_without = global_threshold_db_from_maskers(z_i, ltq, &[], &[]);
+        assert!((v_with - v_without).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_threshold_db_from_maskers_matches_pre_filtered_sum() {
+        // Cross-check against the existing `global_threshold_db`
+        // (which takes pre-filtered LT slices) on a contrived
+        // masker set entirely inside the window.
+        let z_i = 8.0;
+        let ltq = -5.0;
+        let tonal_maskers = [(7.5, 70.0), (8.2, 65.0)];
+        let non_tonal_maskers = [(7.0, 55.0)];
+
+        let lt_tm: Vec<f64> = tonal_maskers
+            .iter()
+            .map(|&(z_j, x)| individual_threshold_tonal(z_j, z_i, x).unwrap())
+            .collect();
+        let lt_nm: Vec<f64> = non_tonal_maskers
+            .iter()
+            .map(|&(z_j, x)| individual_threshold_non_tonal(z_j, z_i, x).unwrap())
+            .collect();
+        let expect = global_threshold_db(ltq, &lt_tm, &lt_nm);
+
+        let got = global_threshold_db_from_maskers(z_i, ltq, &tonal_maskers, &non_tonal_maskers);
+        assert!(
+            (got - expect).abs() < 1e-9,
+            "expected {expect:.6}, got {got:.6}"
+        );
+    }
+
+    #[test]
+    fn global_threshold_db_from_maskers_mixed_in_and_out_of_window() {
+        // One in-window tonal masker, one out-of-window tonal
+        // masker, one in-window non-tonal masker. The result must
+        // equal the same call with the out-of-window entry removed.
+        let z_i = 10.0;
+        let ltq = -8.0;
+        let with_outlier = global_threshold_db_from_maskers(
+            z_i,
+            ltq,
+            &[(9.5, 72.0), (0.0, 90.0)], // second masker has dz = 10, outside [-3, 8).
+            &[(10.2, 50.0)],
+        );
+        let only_inside =
+            global_threshold_db_from_maskers(z_i, ltq, &[(9.5, 72.0)], &[(10.2, 50.0)]);
+        assert!((with_outlier - only_inside).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_threshold_db_from_maskers_strong_masker_dominates() {
+        // A loud in-window masker pushes LTg(i) well above LTq.
+        let z_i = 8.0;
+        let ltq = 0.0;
+        let weak = global_threshold_db_from_maskers(z_i, ltq, &[], &[]);
+        let strong = global_threshold_db_from_maskers(z_i, ltq, &[(8.0, 80.0)], &[]);
+        assert!(
+            strong > weak + 30.0,
+            "loud masker (X=80 dB) should raise LTg by ≫ 30 dB; got weak={weak:.2} strong={strong:.2}"
+        );
     }
 }

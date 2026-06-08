@@ -608,6 +608,42 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     §2.4.2.1 byte count. Public surface add: re-exported
     `Mp1Layer2FrameEncoder` at the crate root.
   - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+- **Annex D Step 4 / Step 3 / Step 7 composer helpers**: three
+  closed-form adapters in the [`psy`] module that join the existing
+  Annex D building blocks into the per-line composition sites the
+  eventual perceptual allocator wires.
+  `psy::critical_band_for_line(layer, fs, line_index_fcb)` maps an
+  FFT-line index (1-based into Table D.1x's `index F&CB` column) to
+  the 0-based critical-band number from the matching Table D.2x
+  list, walking the staged boundaries with the spec's `index_fcb` =
+  upper-edge convention (a line equal to a band's top belongs to that
+  band, not the next). `psy::step3_apply_ltq_offset(ltq_table_db,
+  per_channel_kbps)` is the one-line per-line application of the
+  already-staged Step 3 offset (`-12 dB ≥ 96 kbit/s`, `0 dB`
+  otherwise) to a single Table D.1x absolute-threshold value, so the
+  composition site is fixed ahead of the still-DOCS-GAP D.1x render.
+  `psy::global_threshold_db_from_maskers(z_i, ltq_used_db, &[(z_j,
+  x_db); …], &[(z_j, x_db); …])` is the Step 6+7 composite entry
+  point that takes raw masker `(Bark, SPL_dB)` pairs, evaluates each
+  through the matching `individual_threshold_*` helper, drops any
+  masker the `vf` spreading-function window (`-3 <= dz < 8`) ignores
+  via the `None` return, and feeds the survivors into the same
+  power-domain Step 7 sum the existing `global_threshold_db`
+  performs — removing the caller-side trap of having to pre-filter
+  the slices against the spreading-function window.
+  - Fifteen new lib-tests cover the Step 4 helper (zero-line
+    rejection, unsupported-rate rejection, above-top return-`None`,
+    a brute-force cross-check against the boundary walk for every
+    line up to each table's top, the band-top edge convention `line
+    == bands[k].index_fcb → band k`, and known D.2a / D.2e anchors),
+    the Step 3 helper (high-rate `-12 dB` subtraction, low-rate
+    pass-through, the 95/96 inclusive boundary), and the Step 7
+    composer (empty maskers yield LTq, out-of-window maskers are
+    dropped, the result matches the pre-filtered
+    `global_threshold_db` call on the same input, mixed
+    in/out-of-window maskers reduce to the only-inside call, and a
+    loud in-window masker raises LTg by ≫ 30 dB above LTq).
+  - Total `cargo test -p oxideav-mp1 --lib` count: **292 → 307**.
 - **Annex D Phase-3 — Table D.3a (Fs = 32 kHz) calculation-partition
   partial anchor**: clause D.2 prints **Table D.3a** "Psychoacoustic
   Model 2 calculation partition table" at the 32 kHz sampling rate

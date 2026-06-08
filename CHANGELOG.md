@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Step 4 + Step 3 + Step 7 composer helpers.** Three
+  closed-form adapter helpers join the existing Annex D building
+  blocks into the per-line composition sites the eventual perceptual
+  allocator wires:
+
+  * `psy::critical_band_for_line(layer, fs, line_index_fcb) ->
+    Option<usize>` — Step 4 FFT-line → critical-band lookup. Given an
+    FFT-line index (1-based into the matching Table D.1x `index F&CB`
+    column), returns the 0-based critical-band number from the
+    matching Table D.2x list. Rejects `line == 0` (the spec is
+    1-based), unsupported `(layer, fs)` combinations (anything outside
+    `{Layer::I, Layer::II} × {32 000, 44 100, 48 000}` Hz — Annex D is
+    MPEG-1-only), and lines above `bands.last().index_fcb`. The
+    boundary column is the **upper** edge of each band, so a line
+    equal to a band's top maps to that band (k) not the next (k+1).
+  * `psy::step3_apply_ltq_offset(ltq_table_db,
+    bit_rate_per_channel_kbps) -> f64` — Step 3 per-line composition
+    site. One-line adapter that adds `ltq_offset_db(kbps)` (already
+    staged: `-12 dB` for `kbps ≥ 96`, `0 dB` otherwise) to a Table
+    D.1x absolute-threshold value to yield `LTq_used(i)`. The
+    function exists ahead of the still-DOCS-GAP D.1x render so the
+    composition site is fixed.
+  * `psy::global_threshold_db_from_maskers(z_i, ltq_used_db,
+    tonal_maskers, non_tonal_maskers) -> f64` — Step 6 + Step 7
+    composite per-line global-threshold convenience entry point that
+    takes raw `(z_j, X_db)` masker pairs and an evaluation-line Bark
+    `z_i`, evaluates each masker through the matching
+    `individual_threshold_*` helper, drops any masker the `vf`
+    spreading-function window (`-3 <= dz < 8`) ignores via the `None`
+    return, and feeds the survivors into the same power-domain Step 7
+    sum the existing `global_threshold_db` performs. Removes the
+    caller-side trap of having to pre-filter the slices manually
+    against the spreading-function window.
+
+  Fifteen new lib-tests cover the Step 4 helper (zero-line rejection,
+  unsupported-rate rejection, above-top return-`None`, brute-force
+  cross-check against the boundary walk for every line up to each
+  table's top, the band-top edge convention `line == bands[k].index_fcb
+  → band k`, and known D.2a / D.2e anchors), the Step 3 helper (high-
+  rate `-12 dB` subtraction, low-rate pass-through, the 95/96
+  inclusive boundary), and the Step 7 composer (empty maskers yield
+  LTq, out-of-window maskers are dropped, the result matches the
+  pre-filtered `global_threshold_db` call on the same input, mixed
+  in/out-of-window maskers reduce to the only-inside call, and a loud
+  in-window masker raises LTg by ≫ 30 dB above LTq).
+
+  Lib test count: **292 → 307**.
+
 - **Annex D Table D.3a (Fs = 32 kHz) calculation-partition partial
   anchor.** Clause D.2 prints "Psychoacoustic Model 2 calculation
   partition table" at the 32 kHz sampling rate as a 63-row block
