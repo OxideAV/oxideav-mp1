@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Table D.1a (Layer I, 32 kHz) threshold-in-quiet partial
+  anchor + Step 3 composition.** The docs extract transcribes rows
+  `i = 1..=5` plus the final row `i = 108` of Table D.1a
+  ("Frequencies, critical band rates and absolute threshold") as a
+  render-cross-checked text anchor; those six rows now land in the
+  `psy` module:
+
+  * `psy::LtqRow` — typed four-column row (1-based `index`,
+    `freq_hz`, `bark_z`, pre-offset `ltq_db`).
+  * `psy::LTQ_L1_32K_PARTIAL: [LtqRow; 6]` — the anchored rows,
+    plus `LTQ_LAYER1_FULL_LEN = 108` / `LTQ_LAYER2_FULL_LEN = 132`
+    printed-table lengths from the clause D.1 prose.
+  * `psy::ltq_layer1_32k(i) -> Option<LtqRow>` — `Some` on the
+    anchor, `None` on the 1-based underflow, the DOCS-GAP body
+    `i ∈ 6..=107`, and `i > 108` (mirrors the `calc_partition_32k`
+    contract so allocator wiring can fall back through the
+    energy-driven path).
+  * `psy::ltq_layer1_32k_used(i, kbps) -> Option<f64>` — the Step 3
+    composition `LTq_table(i) + ltq_offset_db(per-channel rate)`,
+    feeding the first real Table D.1x data through the previously
+    data-starved `step3_apply_ltq_offset` site.
+
+  Eleven new lib-tests cover the verbatim rows, the anchor/full
+  lengths, strict monotonicity, the 62,5 Hz head-row line grid vs
+  the decimated row 108, the head-descending / tail-rising LTq
+  shape, frequency/Bark agreement with every Table D.2a boundary
+  whose `index F&CB` is anchored (1 / 3 / 5 / 108), the lookup hit
+  and miss sets, Step-3 agreement with `step3_apply_ltq_offset`
+  across rates including the 95/96 boundary with `None`
+  propagation, and Step-4 placement of each anchored line into its
+  expected D.2a critical band. Lib test count 327 → 338.
+
 - **Model 2 spreading function complete — `tmpy` backbone + full
   `sprdngf` composition (DOCS-GAP closed).** The clause D.2.3 `tmpy`
   line, previously typeset as an equation image the PDF text layer

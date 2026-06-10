@@ -608,6 +608,44 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     §2.4.2.1 byte count. Public surface add: re-exported
     `Mp1Layer2FrameEncoder` at the crate root.
   - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+- **Annex D Phase-3 — Table D.1a (Layer I, 32 kHz) threshold-in-quiet
+  partial anchor + Step 3 composition**: clause D.1 prints **Tables
+  D.1a–f** "Frequencies, critical band rates and absolute threshold"
+  — per-FFT-line index `i`, frequency (Hz), critical-band rate `z`
+  (Bark) and the threshold-in-quiet `LTq` (dB) that Step 3 offsets
+  and Step 7 sums into the global masking threshold. The six dense
+  pages are staged as PNG renders
+  (`docs/audio/mp3/annex-d-renders/Table-D.1*.png`); the docs
+  extract transcribes rows `i = 1..=5` plus the final row `i = 108`
+  of **D.1a** as a render-cross-checked text anchor, and those six
+  rows now land in [`psy`] as `LTQ_L1_32K_PARTIAL: [LtqRow; 6]` — a
+  typed four-column const with the printed table lengths
+  `LTQ_LAYER1_FULL_LEN = 108` / `LTQ_LAYER2_FULL_LEN = 132` from the
+  clause D.1 prose. `psy::ltq_layer1_32k(i)` returns `Some(row)` for
+  the anchored indices and `None` for the 1-based underflow, the
+  still-DOCS-GAP body `i ∈ 6..=107` and `i > 108`, mirroring the
+  `calc_partition_32k` contract; `psy::ltq_layer1_32k_used(i, kbps)`
+  is the Step 3 composition `LTq_table(i) +
+  ltq_offset_db(per-channel rate)` so the first real Table D.1x data
+  flows through the previously data-starved
+  `step3_apply_ltq_offset` site.
+  - Eleven new lib-tests cover: the anchor/full-length constants
+    (6 < 108 < 132); all four columns of the five head rows and the
+    final row verbatim; strict index/frequency/Bark monotonicity
+    across the anchor; the head rows sitting exactly on the 62,5 Hz
+    FFT-line grid while row 108 (15 kHz) shows the high-index
+    decimation; the head-descending / tail-rising LTq shape from
+    the non-monotonicity prose (minimum near `i = 51`); a
+    cross-table consistency check that every Table D.2a boundary
+    with an anchored `index F&CB` (1, 3, 5, 108) carries identical
+    frequency/Bark values; lookup `Some` on all six anchors and
+    `None` across the gap/out-of-range set; the Step 3 composition
+    agreeing with `step3_apply_ltq_offset` at six rates × three
+    rows including both sides of the 95/96 boundary plus `None`
+    propagation; and Step 4 placement of every anchored line into
+    its expected D.2a critical band (line 1 → band 0 … line 108 →
+    band 23) with the row Bark bounded by the band-top Bark.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **327 → 338**.
 - **Model 2 spreading function complete — `tmpy` backbone + full
   `sprdngf` composition (DOCS-GAP closed)**: the clause D.2.3 `tmpy`
   line, previously typeset as an equation image the PDF text layer
@@ -949,12 +987,18 @@ output, opt in to flip the bit and have the encoder write the matching
    SMR loop additionally requires Tables **D.1a–f** (threshold in
    quiet `LTq`) and the Model-2 Tables **D.3a–c** + **D.4a–c**
    (calculation partition `ωlow / ωhigh / bval / minval / TMN` and
-   per-FFT-line absolute threshold), and those four-column dense
-   tables still live behind PNG renders the text layer does not
-   reliably extract. They are therefore DOCS-GAP awaiting a
-   higher-DPI or differently-OCR'd render pass, mirroring the
-   existing `annex-b-renders/` PNG → text transcription cycle that
-   unblocked Tables B.1 / B.3.
+   per-FFT-line absolute threshold). The text-anchored slices the
+   docs extract carries are in tree — the first 20 of 63 D.3a rows
+   (`psy::CALC_PARTITION_32K_PARTIAL` / `calc_partition_32k`) and
+   six render-cross-checked D.1a rows (`psy::LTQ_L1_32K_PARTIAL` /
+   `ltq_layer1_32k` / the Step-3-composed `ltq_layer1_32k_used`) —
+   but the remaining dense rows (D.1a body `i = 6..=107`, all of
+   D.1b–f, D.3a partitions 21..=63, D.3b–c, D.4a–c) still live
+   behind PNG renders the text layer does not reliably extract.
+   They are therefore DOCS-GAP awaiting a higher-DPI or
+   differently-OCR'd render pass, mirroring the existing
+   `annex-b-renders/` PNG → text transcription cycle that unblocked
+   Tables B.1 / B.3.
 
 ## License
 

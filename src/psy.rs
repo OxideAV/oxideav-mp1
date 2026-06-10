@@ -15,9 +15,13 @@
 //!   readable), the **Step 7 global-threshold formula**, and **Table
 //!   D.5** (Layer I / Layer II coder partition table — text-extracted).
 //! * The same file points at PNG renders of Tables D.1a-f, D.3a-c, and
-//!   D.4a-c — those values still live behind a render the text layer
-//!   does not preserve and are **NOT** in this module (DOCS-GAP for a
-//!   later round; their absence does not block the formulas below).
+//!   D.4a-c — those dense pages still live behind renders the text
+//!   layer does not preserve. The text-anchored slices that *are*
+//!   transcribed there land here as partial consts
+//!   ([`CALC_PARTITION_32K_PARTIAL`] — first 20 of 63 D.3a rows;
+//!   [`LTQ_L1_32K_PARTIAL`] — rows 1..=5 + 108 of D.1a); the
+//!   remainder is DOCS-GAP for a later round and does not block the
+//!   formulas below.
 //!
 //! ### What this module provides
 //!
@@ -1816,6 +1820,151 @@ pub fn model2_sprdngf(j_bark: f64, i_bark: f64) -> f64 {
     }
 }
 
+// -----------------------------------------------------------------
+// Annex D Table D.1a — "Frequencies, critical band rates and
+// absolute threshold" (threshold in quiet, LTq) for Layer I at
+// Fs = 32 kHz (partial anchor: rows i = 1..=5 plus the final row
+// i = 108 of 108).
+//
+// Spec context: clause D.1 Steps 3 and 4 (and D.2). Each row of
+// Table D.1x carries four columns: the 1-based index number `i`
+// (the `index F&CB` namespace Tables D.2x point into), the FFT-line
+// frequency in Hz, the critical-band rate `z` in Bark, and the
+// absolute threshold (threshold in quiet) `LTq` in dB. Layer I
+// tables print 108 entries; Layer II tables print 132.
+//
+// The staged docs extract
+// (`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`,
+// "Table D.1a–f — Threshold in quiet (absolute threshold) LTq")
+// transcribes only the first five rows and the final row of D.1a
+// as a cross-checked text anchor — the six dense table pages are
+// staged as authoritative PNG renders under
+// `docs/audio/mp3/annex-d-renders/` because the PDF text layer
+// corrupts the comma/period and several digits in the tight
+// two-column-per-page layout. The body of D.1a (i = 6..=107) and
+// the full D.1b–f tables therefore remain DOCS-GAP awaiting the
+// same render → text transcription cycle that unblocked Tables
+// B.1 / B.3.
+//
+// This partial transcription parallels the prior
+// `CALC_PARTITION_32K_PARTIAL` (Table D.3a) staging: the legible
+// portion lands as a typed `const` with explicit row numbering,
+// the lookup helper surfaces the DOCS-GAP boundary as `None`, and
+// downstream consumers can branch on it to fall back through the
+// energy-driven allocator path until the remainder is transcribed.
+// -----------------------------------------------------------------
+
+/// One row of Annex D Table D.1x ("Frequencies, critical band rates
+/// and absolute threshold").
+///
+/// Carries the four spec columns verbatim: the 1-based index number
+/// `i` (`index`, the `index F&CB` namespace the Table D.2x
+/// `index_fcb` column points into), the FFT-line frequency in Hz
+/// (`freq_hz`), the critical-band rate `z` in Bark (`bark_z`), and
+/// the absolute threshold — threshold in quiet — `LTq` in dB
+/// (`ltq_db`). The tabulated `ltq_db` is the **pre-offset** Step 3
+/// value; apply [`step3_apply_ltq_offset`] (or use
+/// [`ltq_layer1_32k_used`]) to obtain the per-frame `LTq_used`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LtqRow {
+    /// Index number `i` (1-based, per the printed spec; shared with
+    /// the Table D.2x `index F&CB` column).
+    pub index: u16,
+    /// FFT-line frequency in Hz.
+    pub freq_hz: f64,
+    /// Critical-band rate `z` in Bark.
+    pub bark_z: f64,
+    /// Absolute threshold (threshold in quiet) in dB, pre-offset.
+    pub ltq_db: f64,
+}
+
+/// Number of rows in each **Layer I** Table D.1x (D.1a–c) per the
+/// clause D.1 prose: `i = 1…108`.
+pub const LTQ_LAYER1_FULL_LEN: usize = 108;
+
+/// Number of rows in each **Layer II** Table D.1x (D.1d–f) per the
+/// clause D.1 prose: 132 entries.
+pub const LTQ_LAYER2_FULL_LEN: usize = 132;
+
+/// Annex D Table D.1a — threshold in quiet for **Layer I** at
+/// **Fs = 32 kHz**, partial anchor carrying rows `i = 1..=5` plus
+/// the final row `i = 108` of the 108 printed in ISO/IEC 11172-3
+/// (1993) PDF page 122 (printed 116).
+///
+/// The remaining 102 rows are typeset as a dense two-column page
+/// whose text layer does not extract reliably; they are staged
+/// under
+/// `docs/audio/mp3/annex-d-renders/Table-D.1a-threshold-in-quiet-LayerI-32kHz-p116.png`
+/// and remain a DOCS-GAP (as do the full D.1b–f pages). Per the
+/// docs extract the full LTq column is **non-monotonic** — a
+/// minimum near `i = 51` (≈ 3,375 kHz), rising steeply at both
+/// ends — so no interpolation across the gap is attempted here.
+pub const LTQ_L1_32K_PARTIAL: [LtqRow; 6] = [
+    LtqRow {
+        index: 1,
+        freq_hz: 62.50,
+        bark_z: 0.617,
+        ltq_db: 33.44,
+    },
+    LtqRow {
+        index: 2,
+        freq_hz: 125.00,
+        bark_z: 1.232,
+        ltq_db: 19.20,
+    },
+    LtqRow {
+        index: 3,
+        freq_hz: 187.50,
+        bark_z: 1.842,
+        ltq_db: 13.87,
+    },
+    LtqRow {
+        index: 4,
+        freq_hz: 250.00,
+        bark_z: 2.445,
+        ltq_db: 11.01,
+    },
+    LtqRow {
+        index: 5,
+        freq_hz: 312.50,
+        bark_z: 3.037,
+        ltq_db: 9.20,
+    },
+    LtqRow {
+        index: 108,
+        freq_hz: 15_000.00,
+        bark_z: 23.923,
+        ltq_db: 51.04,
+    },
+];
+
+/// Look up a row of Annex D **Table D.1a** (Layer I, Fs = 32 kHz)
+/// by its 1-based index number `i`.
+///
+/// Returns `Some(row)` for the anchored indices (`i ∈ 1..=5` and
+/// `i == 108`) and `None` for `i == 0` (the spec is 1-based), for
+/// the still-DOCS-GAP body `i ∈ 6..=107`, and for `i > 108` (above
+/// the printed table). Consumers wiring the Annex D allocator
+/// should treat `None` on an in-range index as "table not yet
+/// transcribed" and fall back through the energy-driven path,
+/// mirroring the [`calc_partition_32k`] contract.
+pub fn ltq_layer1_32k(i: u16) -> Option<LtqRow> {
+    LTQ_L1_32K_PARTIAL.iter().copied().find(|r| r.index == i)
+}
+
+/// Annex D Step 3 — per-line `LTq_used` for **Table D.1a** (Layer I,
+/// Fs = 32 kHz): the tabulated threshold-in-quiet with the bit-rate
+/// offset applied.
+///
+/// Composes [`ltq_layer1_32k`] with [`step3_apply_ltq_offset`]:
+/// `LTq_used(i) = LTq_table(i) + ltq_offset_db(per-channel rate)` —
+/// `−12 dB` for per-channel rates `>= 96` kbit/s, `0 dB` below.
+/// Returns `None` exactly when [`ltq_layer1_32k`] does (1-based
+/// underflow, the DOCS-GAP body, or above the printed table).
+pub fn ltq_layer1_32k_used(i: u16, bit_rate_per_channel_kbps: u32) -> Option<f64> {
+    ltq_layer1_32k(i).map(|r| step3_apply_ltq_offset(r.ltq_db, bit_rate_per_channel_kbps))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3174,5 +3323,177 @@ mod tests {
         let dip = model2_sprdngf(2.049 / 1.05, 0.0);
         let crest = model2_sprdngf(2.5 / 1.05, 0.0);
         assert!(crest > dip, "expected local crest {crest} > dip {dip}");
+    }
+
+    // -----------------------------------------------------------
+    // Table D.1a — threshold-in-quiet partial anchor (Layer I,
+    // 32 kHz)
+    // -----------------------------------------------------------
+
+    #[test]
+    fn d1a_partial_anchor_len_and_full_table_lens() {
+        assert_eq!(LTQ_L1_32K_PARTIAL.len(), 6);
+        assert_eq!(LTQ_LAYER1_FULL_LEN, 108);
+        assert_eq!(LTQ_LAYER2_FULL_LEN, 132);
+        // The anchor is a strict subset — the DOCS-GAP body remains.
+        assert!(LTQ_L1_32K_PARTIAL.len() < LTQ_LAYER1_FULL_LEN);
+    }
+
+    #[test]
+    fn d1a_head_rows_verbatim() {
+        // Rows i = 1..=5, all four columns verbatim from the docs
+        // extract (cross-checked against the PNG render there).
+        let expect = [
+            (1u16, 62.50, 0.617, 33.44),
+            (2, 125.00, 1.232, 19.20),
+            (3, 187.50, 1.842, 13.87),
+            (4, 250.00, 2.445, 11.01),
+            (5, 312.50, 3.037, 9.20),
+        ];
+        for (k, &(i, f, z, ltq)) in expect.iter().enumerate() {
+            let r = LTQ_L1_32K_PARTIAL[k];
+            assert_eq!(r.index, i);
+            assert!((r.freq_hz - f).abs() < 1e-9, "freq at i = {i}");
+            assert!((r.bark_z - z).abs() < 1e-9, "bark at i = {i}");
+            assert!((r.ltq_db - ltq).abs() < 1e-9, "LTq at i = {i}");
+        }
+    }
+
+    #[test]
+    fn d1a_final_row_verbatim() {
+        let r = LTQ_L1_32K_PARTIAL[5];
+        assert_eq!(r.index, 108);
+        assert!((r.freq_hz - 15_000.00).abs() < 1e-9);
+        assert!((r.bark_z - 23.923).abs() < 1e-9);
+        assert!((r.ltq_db - 51.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn d1a_anchor_strictly_monotonic_index_freq_bark() {
+        for w in LTQ_L1_32K_PARTIAL.windows(2) {
+            assert!(w[1].index > w[0].index);
+            assert!(w[1].freq_hz > w[0].freq_hz);
+            assert!(w[1].bark_z > w[0].bark_z);
+        }
+    }
+
+    #[test]
+    fn d1a_head_line_spacing_62_5_hz() {
+        // The head rows sit on the raw FFT-line grid: 62,5 Hz per
+        // line at Fs = 32 kHz (the table decimates only at higher
+        // indices — row 108 is at 15 kHz, far above 108 × 62,5 Hz).
+        for r in &LTQ_L1_32K_PARTIAL[..5] {
+            assert!(
+                (r.freq_hz - 62.5 * f64::from(r.index)).abs() < 1e-9,
+                "head row i = {} off the 62,5 Hz grid",
+                r.index
+            );
+        }
+        let last = LTQ_L1_32K_PARTIAL[5];
+        assert!(last.freq_hz > 62.5 * f64::from(last.index));
+    }
+
+    #[test]
+    fn d1a_ltq_head_descends_tail_rises() {
+        // Per the docs-extract prose the LTq column is
+        // non-monotonic: a minimum near i = 51, rising steeply at
+        // both ends. The anchored head must therefore be strictly
+        // descending, and the final row must sit well above the
+        // head's tail value.
+        for w in LTQ_L1_32K_PARTIAL[..5].windows(2) {
+            assert!(
+                w[1].ltq_db < w[0].ltq_db,
+                "head LTq not descending at i = {}",
+                w[1].index
+            );
+        }
+        assert!(LTQ_L1_32K_PARTIAL[5].ltq_db > LTQ_L1_32K_PARTIAL[4].ltq_db);
+    }
+
+    #[test]
+    fn d1a_cross_checks_against_d2a_band_boundaries() {
+        // Table D.2a's `index F&CB` column points into Table D.1a;
+        // every D.2a boundary whose index is anchored here must
+        // carry the same frequency and Bark values.
+        let bands = critical_band_table(Layer::I, 32_000).unwrap();
+        let mut checked = 0;
+        for b in bands {
+            if let Some(r) = ltq_layer1_32k(b.index_fcb) {
+                assert!(
+                    (r.freq_hz - b.top_freq_hz).abs() < 1e-9,
+                    "freq mismatch at index {}",
+                    b.index_fcb
+                );
+                assert!(
+                    (r.bark_z - b.bark_z).abs() < 1e-9,
+                    "bark mismatch at index {}",
+                    b.index_fcb
+                );
+                checked += 1;
+            }
+        }
+        // D.2a anchors at indices 1, 3, 5 and 108 — all four must
+        // have been cross-checked.
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn d1a_lookup_some_for_anchored_indices() {
+        for &i in &[1u16, 2, 3, 4, 5, 108] {
+            let r = ltq_layer1_32k(i).expect("anchored index");
+            assert_eq!(r.index, i);
+        }
+    }
+
+    #[test]
+    fn d1a_lookup_none_for_gap_and_out_of_range() {
+        // 1-based underflow, the DOCS-GAP body 6..=107, and indices
+        // above the printed table all miss.
+        for &i in &[0u16, 6, 7, 51, 100, 107, 109, 132, 200] {
+            assert!(ltq_layer1_32k(i).is_none(), "i = {i}");
+        }
+    }
+
+    #[test]
+    fn d1a_used_composes_step3_offset() {
+        // >= 96 kbit/s per channel: −12 dB; below: pass-through.
+        let r1 = ltq_layer1_32k(1).unwrap();
+        assert!((ltq_layer1_32k_used(1, 96).unwrap() - (r1.ltq_db - 12.0)).abs() < 1e-12);
+        assert!((ltq_layer1_32k_used(1, 95).unwrap() - r1.ltq_db).abs() < 1e-12);
+        // Agreement with the generic Step 3 adapter at several rates.
+        for &kbps in &[32u32, 64, 96, 128, 192, 448] {
+            for &i in &[2u16, 5, 108] {
+                let row = ltq_layer1_32k(i).unwrap();
+                assert_eq!(
+                    ltq_layer1_32k_used(i, kbps).unwrap(),
+                    step3_apply_ltq_offset(row.ltq_db, kbps),
+                    "i = {i}, kbps = {kbps}"
+                );
+            }
+        }
+        // None propagates through the composition.
+        assert!(ltq_layer1_32k_used(6, 192).is_none());
+        assert!(ltq_layer1_32k_used(0, 192).is_none());
+    }
+
+    #[test]
+    fn d1a_anchor_lines_map_into_d2a_bands() {
+        // Step 4 consistency: every anchored line lands in a D.2a
+        // critical band, at the expected band number (the D.2a
+        // boundary column is the band's *top* line: band 0 tops at
+        // index 1, band 1 at 3, band 2 at 5, band 23 at 108).
+        let expect = [(1u16, 0usize), (2, 1), (3, 1), (4, 2), (5, 2), (108, 23)];
+        let bands = critical_band_table(Layer::I, 32_000).unwrap();
+        for &(i, band) in &expect {
+            assert_eq!(
+                critical_band_for_line(Layer::I, 32_000, i),
+                Some(band),
+                "line {i}"
+            );
+            // The anchored row's Bark value never exceeds its
+            // band's top-edge Bark.
+            let r = ltq_layer1_32k(i).unwrap();
+            assert!(r.bark_z <= bands[band].bark_z + 1e-9, "line {i}");
+        }
     }
 }
