@@ -1490,26 +1490,30 @@ pub fn ltq_offset_db(bit_rate_per_channel_kbps: u32) -> f64 {
 }
 
 // -----------------------------------------------------------------
-// Annex D clause D.2 (Psychoacoustic Model 2) — spreading function
-// closed-form pieces (text-extractable)
+// Annex D clause D.2.3 (Psychoacoustic Model 2) — the "spreading
+// function", complete
 //
-// Quoted verbatim from the staged docs extract (the `tmpx` and `x`
-// lines extract from the PDF text layer; the `tmpy` intermediate
-// line is typeset as an image and remains a DOCS-GAP). The post-step
-// `sprdngf` cutoff is text-extractable.
+// The `tmpx` / `x` lines and the `sprdngf` cutoff condition extract
+// from the PDF text layer; the `tmpy` line and the `sprdngf`
+// exponent are typeset as equation images and were read from a
+// 150-DPI render of the staged ISO/IEC 11172-3:1993 PDF page 135
+// (printed p.129), where they are fully legible:
 //
-//   tmpx = 1,05 * (j - i)         ; i = Bark of signal spread,
+//   tmpx = 1,05 (j - i)           ; i = Bark of signal spread,
 //                                   j = Bark of band spread into
-//   x    = 8 * minimum( (tmpx - 0,5)^2 - 2*(tmpx - 0,5), 0 )
-//   tmpy = [illegible — typeset as image in PDF]
+//   x    = 8 minimum( (tmpx - 0,5)^2 - 2(tmpx - 0,5), 0 )
+//   tmpy = 15,811389 + 7,5(tmpx + 0,474)
+//          - 17,5(1,0 + (tmpx + 0,474)^2)^0,5
 //   if (tmpy < -100) then sprdngf(i,j) = 0
-//                    else sprdngf(i,j) = 10^(tmpy/10)
+//                    else sprdngf(i,j) = 10^((x + tmpy)/10)
 //
-// `model2_tmpx` and `model2_x` ARE staged here; the `tmpy` →
-// `sprdngf` post-step is staged as `sprdngf_from_tmpy` so callers
-// (once `tmpy` becomes text-extractable) can plug a `tmpy` value
-// straight into the legible cutoff. Intentionally absent: the
-// `tmpy` line itself.
+// NOTE: the PDF *text layer* drops the `x +` term from the
+// `sprdngf` exponent (pdftotext yields `10^(tmpy/10)`); the printed
+// equation image carries `(x + tmpy)/10` and is the authoritative
+// reading. `sprdngf_from_tmpy` below keeps the one-argument
+// reduction (exact whenever `x == 0`, i.e. outside the
+// `model2_x_is_active` window); `model2_sprdngf` is the full
+// printed-form per-pair composition.
 // -----------------------------------------------------------------
 
 /// Model 2 spreading-function `tmpx` term (clause D.2, text-extracted
@@ -1536,16 +1540,16 @@ pub fn model2_x(tmpx: f64) -> f64 {
     8.0 * v.min(0.0)
 }
 
-/// Model 2 spreading-function post-step (clause D.2, text-extracted
-/// verbatim): given the intermediate `tmpy` (dB), returns the
-/// spreading-function magnitude
-/// `sprdngf(i, j) = 0` when `tmpy < -100`, else `10^(tmpy / 10)`.
+/// Model 2 spreading-function post-step (clause D.2.3), **`x = 0`
+/// reduction**: given the intermediate `tmpy` (dB), returns
+/// `0` when `tmpy < -100`, else `10^(tmpy / 10)`.
 ///
-/// `tmpy` itself is the spreading-function dB level; the line that
-/// derives it from `x` / `bval` is rendered as a PDF image and is
-/// **not** captured in this module. Once the docs collaborator stages
-/// a text-extracted `tmpy` formula, the missing piece can be plugged in
-/// without changing the cutoff staged here.
+/// The full printed post-step is `sprdngf(i, j) = 10^((x + tmpy)/10)`
+/// (cutoff still on `tmpy` alone) — see [`model2_sprdngf`] for the
+/// complete per-pair composition. This one-argument form equals the
+/// printed form exactly whenever the `x` term is zero, i.e. for every
+/// pair **outside** the [`model2_x_is_active`] window (`tmpx ∉
+/// (0.5, 2.5)`), where the [`model2_x`] `min(_, 0)` clamp engages.
 #[inline]
 pub fn sprdngf_from_tmpy(tmpy_db: f64) -> f64 {
     if tmpy_db < -100.0 {
@@ -1755,6 +1759,61 @@ pub fn model2_x_for_pair(j_bark: f64, i_bark: f64) -> f64 {
 pub fn model2_x_is_active(j_bark: f64, i_bark: f64) -> bool {
     let t = model2_tmpx(j_bark, i_bark);
     t > 0.5 && t < 2.5
+}
+
+/// Model 2 spreading-function `tmpy` term (clause D.2.3, read from
+/// the 150-DPI render of the staged ISO PDF page 135 / printed
+/// p.129):
+///
+/// `tmpy = 15.811389 + 7.5·(tmpx + 0.474) − 17.5·√(1.0 + (tmpx + 0.474)²)`
+///
+/// This is the dB backbone of the spreading function. With
+/// `u = tmpx + 0.474` it is `15.811389 + 7.5·u − 17.5·√(1 + u²)` — a
+/// hyperbola whose two asymptote slopes are `7.5 + 17.5 = 25` dB per
+/// `tmpx` unit on the `tmpx → −∞` side and `7.5 − 17.5 = −10` dB per
+/// `tmpx` unit on the `tmpx → +∞` side (i.e. `26.25` dB/Bark below
+/// the masker and `10.5` dB/Bark above it after the `tmpx = 1.05·(j −
+/// i)` scaling). The constant `15.811389` equals
+/// `17.5·√(1 + u₀²) − 7.5·u₀` at the stationary point `u₀ = 3/√40`
+/// to within `10⁻⁶`, so the curve's maximum is `0 dB` (within
+/// `~10⁻⁶`), reached at `tmpx ≈ 0` — the spreading backbone never
+/// amplifies.
+#[inline]
+pub fn model2_tmpy(tmpx: f64) -> f64 {
+    let u = tmpx + 0.474;
+    15.811_389 + 7.5 * u - 17.5 * (1.0 + u * u).sqrt()
+}
+
+/// Model 2 spreading function `sprdngf(i, j)` for a `(j_bark,
+/// i_bark)` pair (clause D.2.3, complete printed form):
+///
+/// * `tmpx = 1.05·(j − i)` — [`model2_tmpx`]
+/// * `x = 8·min((tmpx − 0.5)² − 2·(tmpx − 0.5), 0)` — [`model2_x`]
+/// * `tmpy = 15.811389 + 7.5·(tmpx + 0.474) − 17.5·√(1 + (tmpx +
+///   0.474)²)` — [`model2_tmpy`]
+/// * `if tmpy < −100 then sprdngf(i, j) = 0 else sprdngf(i, j) =
+///   10^((x + tmpy)/10)`
+///
+/// `i_bark` is the Bark value of the signal being spread; `j_bark`
+/// is the Bark value of the band being spread into. Note the
+/// **cutoff tests `tmpy` alone** while the surviving branch raises
+/// `10` to `(x + tmpy)/10` — the `x` term sharpens the near-field
+/// skirt (it is non-zero only for `tmpx ∈ (0.5, 2.5)`) but does not
+/// participate in the kill test. The value is a power-domain weight:
+/// `≈ 1` at `j == i`, decaying toward `0` in both directions, with
+/// the `tmpy < −100` cutoff zeroing pairs beyond `j − i ≈ −4.79`
+/// Bark on the steep side and `j − i ≈ +10.51` Bark on the shallow
+/// side.
+#[inline]
+pub fn model2_sprdngf(j_bark: f64, i_bark: f64) -> f64 {
+    let tmpx = model2_tmpx(j_bark, i_bark);
+    let tmpy = model2_tmpy(tmpx);
+    if tmpy < -100.0 {
+        0.0
+    } else {
+        let x = model2_x(tmpx);
+        10f64.powf((x + tmpy) / 10.0)
+    }
 }
 
 #[cfg(test)]
@@ -2893,5 +2952,227 @@ mod tests {
         for &(j, i) in &[(0.0f64, 1.0), (3.0, 5.0), (5.0, 12.5), (1.0, 10.0)] {
             assert!(!model2_x_is_active(j, i));
         }
+    }
+
+    // -----------------------------------------------------------
+    // Clause D.2.3 — `tmpy` backbone + full `sprdngf` composition
+    // -----------------------------------------------------------
+
+    #[test]
+    fn model2_tmpy_matches_printed_form_at_spot_values() {
+        // Direct evaluation of the printed line
+        //   tmpy = 15,811389 + 7,5(tmpx + 0,474)
+        //          - 17,5(1,0 + (tmpx + 0,474)^2)^0,5
+        // at a handful of points, computed independently here.
+        for &tmpx in &[-6.0f64, -2.0, -0.474, 0.0, 1.0, 2.5, 8.0, 12.0] {
+            let u = tmpx + 0.474;
+            let expect = 15.811_389 + 7.5 * u - 17.5 * (1.0 + u * u).sqrt();
+            let got = model2_tmpy(tmpx);
+            assert!(
+                (got - expect).abs() < 1e-12,
+                "tmpy({tmpx}) = {got}, expected {expect}"
+            );
+        }
+        // u = 0 collapses the square root to 1:
+        // tmpy(-0.474) = 15.811389 - 17.5 = -1.688611 exactly.
+        assert!((model2_tmpy(-0.474) - (-1.688_611)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn model2_tmpy_peaks_at_zero_db_near_tmpx_zero() {
+        // The stationary point is at u0 = 3/sqrt(40) (where
+        // 7.5 = 17.5 * u/sqrt(1+u^2)), i.e. tmpx = u0 - 0.474 ~= 0.
+        // The printed constant 15.811389 equals
+        // 17.5*sqrt(1 + u0^2) - 7.5*u0 to within 1e-6, so the
+        // maximum of the backbone is ~0 dB.
+        let u0 = 3.0 / 40.0f64.sqrt();
+        let peak = model2_tmpy(u0 - 0.474);
+        assert!(peak.abs() < 1e-5, "peak {peak} not ~0 dB");
+        // ... and tmpy never exceeds ~0 anywhere on a wide grid.
+        let mut tmpx = -30.0;
+        while tmpx <= 30.0 {
+            assert!(
+                model2_tmpy(tmpx) <= 1e-5,
+                "tmpy({tmpx}) = {} > 0",
+                model2_tmpy(tmpx)
+            );
+            tmpx += 0.01;
+        }
+        // tmpx = 0 itself is within 1e-6 of the peak.
+        assert!(model2_tmpy(0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn model2_tmpy_unimodal_around_the_peak() {
+        // Strictly increasing left of the stationary point, strictly
+        // decreasing right of it.
+        let t0 = 3.0 / 40.0f64.sqrt() - 0.474;
+        let step = 0.05;
+        let mut tmpx = -20.0;
+        while tmpx + step <= t0 {
+            assert!(
+                model2_tmpy(tmpx) < model2_tmpy(tmpx + step),
+                "not increasing at tmpx = {tmpx}"
+            );
+            tmpx += step;
+        }
+        let mut tmpx = t0 + step;
+        while tmpx + step <= 20.0 {
+            assert!(
+                model2_tmpy(tmpx) > model2_tmpy(tmpx + step),
+                "not decreasing at tmpx = {tmpx}"
+            );
+            tmpx += step;
+        }
+    }
+
+    #[test]
+    fn model2_tmpy_asymptote_slopes() {
+        // u -> -inf: sqrt(1 + u^2) -> -u, so dtmpy/dtmpx -> 7.5 +
+        // 17.5 = 25 dB per tmpx unit. u -> +inf: -> 7.5 - 17.5 =
+        // -10 dB per tmpx unit.
+        let left = model2_tmpy(-40.0) - model2_tmpy(-41.0);
+        assert!((left - 25.0).abs() < 0.01, "left slope {left}");
+        let right = model2_tmpy(41.0) - model2_tmpy(40.0);
+        assert!((right - (-10.0)).abs() < 0.01, "right slope {right}");
+    }
+
+    #[test]
+    fn model2_sprdngf_is_one_at_j_equals_i() {
+        // tmpx = 0 -> x = 0 (clamp engaged), tmpy ~= 0 -> 10^~0 ~= 1.
+        for &z in &[0.0f64, 1.5, 5.0, 12.0, 23.5] {
+            let v = model2_sprdngf(z, z);
+            assert!((v - 1.0).abs() < 1e-6, "sprdngf({z}, {z}) = {v}");
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_matches_term_by_term_composition() {
+        // Recompose the printed chain from the staged pieces and
+        // check agreement across a grid covering both branches.
+        let mut dz = -8.0;
+        while dz <= 14.0 {
+            let j = dz;
+            let i = 0.0;
+            let tmpx = model2_tmpx(j, i);
+            let tmpy = model2_tmpy(tmpx);
+            let expect = if tmpy < -100.0 {
+                0.0
+            } else {
+                10f64.powf((model2_x(tmpx) + tmpy) / 10.0)
+            };
+            let got = model2_sprdngf(j, i);
+            assert!(
+                (got - expect).abs() <= 1e-15 * expect.abs().max(1.0),
+                "sprdngf mismatch at dz = {dz}: {got} vs {expect}"
+            );
+            dz += 0.03;
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_never_amplifies() {
+        // x <= 0 and tmpy <= ~1e-6 => sprdngf <= 10^(1e-7) ~ 1.
+        let mut dz = -10.0;
+        while dz <= 16.0 {
+            let v = model2_sprdngf(dz, 0.0);
+            assert!(
+                (0.0..=1.0 + 1e-6).contains(&v),
+                "sprdngf out of range at dz = {dz}: {v}"
+            );
+            dz += 0.01;
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_cutoff_engages_on_tmpy_alone() {
+        // tmpy crosses -100 dB at tmpx ~= -5.0305 (j - i ~= -4.791)
+        // and tmpx ~= +11.0312 (j - i ~= +10.506). Just inside the
+        // window the value is positive; beyond it, exactly 0.
+        assert!(model2_sprdngf(-4.7, 0.0) > 0.0);
+        assert_eq!(model2_sprdngf(-4.9, 0.0), 0.0);
+        assert!(model2_sprdngf(10.4, 0.0) > 0.0);
+        assert_eq!(model2_sprdngf(10.6, 0.0), 0.0);
+        // Spot anchors bracketing the same crossings in tmpx space:
+        assert!(model2_tmpy(-4.5) > -100.0);
+        assert!(model2_tmpy(-5.2) < -100.0);
+        assert!(model2_tmpy(11.0) > -100.0);
+        assert!(model2_tmpy(12.0) < -100.0);
+    }
+
+    #[test]
+    fn model2_sprdngf_reduces_to_one_arg_form_outside_active_window() {
+        // Outside the model2_x_is_active window x == 0 exactly, so
+        // the printed 10^((x + tmpy)/10) collapses to the staged
+        // one-argument sprdngf_from_tmpy(tmpy).
+        let mut dz = -10.0;
+        while dz <= 16.0 {
+            if !model2_x_is_active(dz, 0.0) {
+                let tmpy = model2_tmpy(model2_tmpx(dz, 0.0));
+                let a = model2_sprdngf(dz, 0.0);
+                let b = sprdngf_from_tmpy(tmpy);
+                assert!(
+                    (a - b).abs() <= 1e-15 * b.abs().max(1.0),
+                    "x = 0 reduction mismatch at dz = {dz}: {a} vs {b}"
+                );
+            }
+            dz += 0.07;
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_x_term_sharpens_inside_active_window() {
+        // Inside (0.5, 2.5) the x term is strictly negative, so the
+        // full form must sit strictly below the x = 0 reduction.
+        for &tmpx in &[0.7f64, 1.0, 1.5, 2.0, 2.3] {
+            let dz = tmpx / 1.05;
+            let full = model2_sprdngf(dz, 0.0);
+            let no_x = sprdngf_from_tmpy(model2_tmpy(tmpx));
+            assert!(
+                full < no_x,
+                "x term did not lower sprdngf at tmpx = {tmpx}: {full} vs {no_x}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_decays_away_from_the_masker() {
+        // Downward (j < i, the steep 26.25 dB/Bark side) the weight
+        // decays strictly monotonically.
+        let mut prev = model2_sprdngf(-0.25, 0.0);
+        let mut dz = -0.5;
+        while dz >= -4.5 {
+            let v = model2_sprdngf(dz, 0.0);
+            assert!(v < prev, "not decaying downward at dz = {dz}");
+            prev = v;
+            dz -= 0.25;
+        }
+        // Upward the printed form is *piecewise* monotone: the x
+        // term (active for tmpx in (0.5, 2.5)) overshoots the tmpy
+        // backbone, producing a local dip at tmpx ~= 2.049
+        // (dz ~= 1.951) and a local crest where x returns to 0 at
+        // tmpx = 2.5 (dz ~= 2.381), after which the backbone decay
+        // resumes. Assert strict decay on both monotone stretches.
+        let mut prev = model2_sprdngf(0.25, 0.0);
+        let mut dz = 0.5;
+        while dz <= 1.95 {
+            let v = model2_sprdngf(dz, 0.0);
+            assert!(v < prev, "not decaying on the pre-dip stretch at dz = {dz}");
+            prev = v;
+            dz += 0.25;
+        }
+        let mut prev = model2_sprdngf(2.5, 0.0);
+        let mut dz = 2.75;
+        while dz <= 10.0 {
+            let v = model2_sprdngf(dz, 0.0);
+            assert!(v < prev, "not decaying past the x window at dz = {dz}");
+            prev = v;
+            dz += 0.25;
+        }
+        // ... and the dip/crest pair is real: the window-exit crest
+        // sits strictly above the in-window dip.
+        let dip = model2_sprdngf(2.049 / 1.05, 0.0);
+        let crest = model2_sprdngf(2.5 / 1.05, 0.0);
+        assert!(crest > dip, "expected local crest {crest} > dip {dip}");
     }
 }

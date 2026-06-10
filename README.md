@@ -608,6 +608,43 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     §2.4.2.1 byte count. Public surface add: re-exported
     `Mp1Layer2FrameEncoder` at the crate root.
   - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+- **Model 2 spreading function complete — `tmpy` backbone + full
+  `sprdngf` composition (DOCS-GAP closed)**: the clause D.2.3 `tmpy`
+  line, previously typeset as an equation image the PDF text layer
+  could not extract, is fully legible in a 150-DPI render of the
+  staged ISO/IEC 11172-3:1993 PDF page 135 (printed p.129) and now
+  lands in [`psy`] as `psy::model2_tmpy(tmpx)`:
+  `tmpy = 15.811389 + 7.5·(tmpx + 0.474) − 17.5·√(1 + (tmpx +
+  0.474)²)` — a hyperbola with asymptote slopes `25` dB per tmpx
+  unit below the masker and `−10` above (26.25 / 10.5 dB per Bark
+  after the `tmpx = 1.05·(j − i)` scaling), whose printed constant
+  puts the maximum at `0 dB` (within `10⁻⁶`) at `tmpx ≈ 0`. The
+  same render shows the printed `sprdngf` exponent is
+  `10^((x + tmpy)/10)` — the PDF *text layer* drops the `x +` term
+  (it reads `10^(tmpy/10)` under extraction), so the
+  previously-staged one-argument `sprdngf_from_tmpy` is now
+  documented as the exact `x = 0` reduction (valid outside the
+  `model2_x_is_active` window) and the new
+  `psy::model2_sprdngf(j_bark, i_bark)` is the complete
+  printed-form per-pair composition: cutoff on `tmpy < −100`
+  **alone**, else `10^((x + tmpy)/10)`. The weight is `≈ 1` at
+  `j == i`, never amplifies, and the cutoff zeroes pairs beyond
+  `j − i ≈ −4.79` / `+10.51` Bark.
+  - Eleven new lib-tests cover: term-by-term agreement with the
+    printed line at spot values (plus the exact
+    `tmpy(−0.474) = −1.688611` collapse), the `~0 dB` peak at
+    `tmpx ≈ 0` / global non-positivity on a wide grid, unimodality
+    around the stationary point `u₀ = 3/√40`, both asymptote
+    slopes, `sprdngf(z, z) ≈ 1`, full-grid agreement with the
+    recomposed `tmpx → x → tmpy → 10^((x+tmpy)/10)` chain, the
+    never-amplifies range bound, the cutoff engaging on `tmpy`
+    alone at both Bark crossings, the `x = 0` reduction matching
+    `sprdngf_from_tmpy` outside the active window, the `x` term
+    strictly sharpening the skirt inside it, and the piecewise
+    decay shape — including the genuine printed-form local dip
+    (`tmpx ≈ 2.049`) / crest (`tmpx = 2.5`) pair where the `x`
+    window closes.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **316 → 327**.
 - **Model 2 spreading-function `x` term — per-pair adapter +
   active-region predicate**: two narrow helpers in the [`psy`]
   module close the `(j_bark, i_bark)` composition gap between the
@@ -902,22 +939,22 @@ output, opt in to flip the bit and have the encoder write the matching
    power-domain `LTg` global-threshold sum, the 33-row Table D.5
    coder partition table, the **Step 3 `LTq` bit-rate offset rule**
    (`psy::ltq_offset_db`: `−12 dB` for per-channel rates `≥ 96
-   kbit/s`, `0 dB` below), and the **clause D.2 Model 2 spreading
-   function** text-extractable pieces (`psy::model2_tmpx`,
-   `psy::model2_x`, and the post-step `psy::sprdngf_from_tmpy`
-   cutoff `sprdngf = 0` when `tmpy < −100 dB`, else `10^(tmpy/10)`).
-   The encoder's bit allocator itself is **still** signal-energy-
-   driven — wiring `LTg` into the SMR loop additionally requires
-   Tables **D.1a–f** (threshold in quiet `LTq`) and the Model-2
-   Tables **D.3a–c** + **D.4a–c** (calculation partition `ωlow /
-   ωhigh / bval / minval / TMN` and per-FFT-line absolute threshold),
-   and those four-column dense tables still live behind PNG renders
-   the text layer does not reliably extract. They are therefore
-   DOCS-GAP awaiting a higher-DPI or differently-OCR'd render pass,
-   mirroring the existing `annex-b-renders/` PNG → text transcription
-   cycle that unblocked Tables B.1 / B.3. The Model 2 `tmpy = …`
-   intermediate line that bridges `x` to `sprdngf` is similarly
-   typeset as an image in the PDF and is part of the same DOCS-GAP.
+   kbit/s`, `0 dB` below), and the **complete clause D.2.3 Model 2
+   spreading function** (`psy::model2_tmpx`, `psy::model2_x`,
+   `psy::model2_tmpy`, and the full per-pair composition
+   `psy::model2_sprdngf` — cutoff `sprdngf = 0` when `tmpy <
+   −100 dB`, else `10^((x + tmpy)/10)`; `psy::sprdngf_from_tmpy`
+   remains as the `x = 0` reduction). The encoder's bit allocator
+   itself is **still** signal-energy-driven — wiring `LTg` into the
+   SMR loop additionally requires Tables **D.1a–f** (threshold in
+   quiet `LTq`) and the Model-2 Tables **D.3a–c** + **D.4a–c**
+   (calculation partition `ωlow / ωhigh / bval / minval / TMN` and
+   per-FFT-line absolute threshold), and those four-column dense
+   tables still live behind PNG renders the text layer does not
+   reliably extract. They are therefore DOCS-GAP awaiting a
+   higher-DPI or differently-OCR'd render pass, mirroring the
+   existing `annex-b-renders/` PNG → text transcription cycle that
+   unblocked Tables B.1 / B.3.
 
 ## License
 

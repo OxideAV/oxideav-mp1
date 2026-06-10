@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 2 spreading function complete — `tmpy` backbone + full
+  `sprdngf` composition (DOCS-GAP closed).** The clause D.2.3 `tmpy`
+  line, previously typeset as an equation image the PDF text layer
+  could not extract, is fully legible in a 150-DPI render of the
+  staged ISO/IEC 11172-3:1993 PDF page 135 (printed p.129):
+
+  * `psy::model2_tmpy(tmpx) -> f64` — the printed
+    `tmpy = 15,811389 + 7,5(tmpx + 0,474) − 17,5(1,0 + (tmpx +
+    0,474)²)^0,5`. Asymptote slopes `25` dB per tmpx unit on the
+    steep (below-masker) side and `−10` on the shallow side
+    (26.25 / 10.5 dB per Bark after the `tmpx = 1.05·(j − i)`
+    scaling); maximum `0 dB` (within `10⁻⁶`) at `tmpx ≈ 0`.
+  * `psy::model2_sprdngf(j_bark, i_bark) -> f64` — the complete
+    printed-form per-pair spreading function: `tmpx → x → tmpy`,
+    then `sprdngf = 0` when `tmpy < −100` (cutoff on `tmpy`
+    **alone**), else `10^((x + tmpy)/10)`. The same render shows
+    the printed exponent carries the `x +` term that the PDF text
+    layer drops (extraction reads `10^(tmpy/10)`); the
+    previously-staged one-argument `sprdngf_from_tmpy` is therefore
+    redocumented as the exact `x = 0` reduction, valid outside the
+    `model2_x_is_active` window where the `x` clamp engages.
+
+  Eleven new lib-tests cover the printed-form spot values (including
+  the exact `tmpy(−0.474) = −1.688611` collapse), the `~0 dB` peak /
+  global non-positivity / unimodality / both asymptote slopes of the
+  backbone, `sprdngf(z, z) ≈ 1`, full-grid agreement with the
+  recomposed chain, the never-amplifies bound, the `tmpy`-alone
+  cutoff at both Bark crossings (`j − i ≈ −4.79` / `+10.51`), the
+  `x = 0` reduction agreement outside the active window, the strict
+  in-window sharpening, and the piecewise decay shape with the
+  genuine printed-form dip (`tmpx ≈ 2.049`) / crest (`tmpx = 2.5`)
+  pair at the `x`-window exit.
+
+  Total `cargo test -p oxideav-mp1 --lib` count: **316 → 327**.
+
 - **Model 2 spreading-function `x` term — per-pair adapter +
   active-region predicate.** Two narrow helpers close the
   `(j_bark, i_bark)` composition gap between the already-staged
