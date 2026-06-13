@@ -608,6 +608,35 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     §2.4.2.1 byte count. Public surface add: re-exported
     `Mp1Layer2FrameEncoder` at the crate root.
   - Total `cargo test -p oxideav-mp1 --lib` count: **266 → 273**.
+- **Annex D Phase-3 — Table D.3a (Fs = 32 kHz) calculation-partition
+  table COMPLETED (all 49 rows)**: the docs collaborator's `docs`
+  #129 correction transcribed the complete 32 kHz Model 2 calculation
+  partition table as text (cross-checked against the authoritative
+  PNG render) and fixed the earlier "63 partitions" OCR miscount to
+  the printed `bmax = 49`. The prior 20-row partial anchor
+  `CALC_PARTITION_32K_PARTIAL` is replaced in [`psy`] by the full
+  `CALC_PARTITION_32K: [CalcPartition; 49]`; `CALC_PARTITION_32K_FULL_LEN`
+  is corrected `63 → 49`; and `calc_partition_32k(n)` now resolves
+  every partition `n ∈ 1..=49` (the DOCS-GAP tail is closed at this
+  rate). The final partition `[497, 513]` reaches the Nyquist FFT
+  line 513 of the 1024-point Model 2 analysis FFT, with `bval`
+  rising to 24,07 Bark, `minval` settled at 4,5 dB and `TMN`
+  climbing to 38,6 dB. The D.3b (44,1 kHz, `bmax = 57`) / D.3c
+  (48 kHz, `bmax = 58`) tables remain staged as PNG renders.
+  - The D.3a lib-tests are reworked from the 20-row anchor to the
+    full 49-row table: the row count (`len() == 49`,
+    `FULL_LEN == 49`); 1-based dense `index`; contiguity to Nyquist
+    (`ωlow[0] == 1`; `next.ωlow == prev.ωhigh + 1`; last
+    `ωhigh == 513`) with the per-row widths tiling FFT lines
+    1..=513; the `width()` accessor; first/last-row spec anchors
+    (partition 1 = ω 1 / bval 0,00 / TMN 24,5; partition 49 =
+    [497, 513] / bval 24,07 / TMN 38,6); strictly-increasing
+    `bval`; the `TMN` head plateau 24,5 dB (partitions 1..=14) then
+    monotone rise to 38,6 dB; `minval` settling to 4,5 dB from
+    partition 17 through 49; and the lookup resolving every
+    partition `Some` with `n == 0` / `n > 49` → `None`.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **338 → 338**
+    (the 10 D.3a tests are reworked in place, not added).
 - **Annex D Phase-3 — Table D.1a (Layer I, 32 kHz) threshold-in-quiet
   partial anchor + Step 3 composition**: clause D.1 prints **Tables
   D.1a–f** "Frequencies, critical band rates and absolute threshold"
@@ -987,13 +1016,14 @@ output, opt in to flip the bit and have the encoder write the matching
    SMR loop additionally requires Tables **D.1a–f** (threshold in
    quiet `LTq`) and the Model-2 Tables **D.3a–c** + **D.4a–c**
    (calculation partition `ωlow / ωhigh / bval / minval / TMN` and
-   per-FFT-line absolute threshold). The text-anchored slices the
-   docs extract carries are in tree — the first 20 of 63 D.3a rows
-   (`psy::CALC_PARTITION_32K_PARTIAL` / `calc_partition_32k`) and
-   six render-cross-checked D.1a rows (`psy::LTQ_L1_32K_PARTIAL` /
-   `ltq_layer1_32k` / the Step-3-composed `ltq_layer1_32k_used`) —
-   but the remaining dense rows (D.1a body `i = 6..=107`, all of
-   D.1b–f, D.3a partitions 21..=63, D.3b–c, D.4a–c) still live
+   per-FFT-line absolute threshold). The text-transcribed Model-2
+   calculation-partition table at 32 kHz is now **complete** — all
+   49 rows of D.3a (`psy::CALC_PARTITION_32K` / `calc_partition_32k`,
+   `bmax` corrected `63 → 49` per `docs` #129) — and six
+   render-cross-checked D.1a rows (`psy::LTQ_L1_32K_PARTIAL` /
+   `ltq_layer1_32k` / the Step-3-composed `ltq_layer1_32k_used`) are
+   in tree, but the remaining dense rows (D.1a body `i = 6..=107`,
+   all of D.1b–f, D.3b (44,1 kHz) / D.3c (48 kHz), D.4a–c) still live
    behind PNG renders the text layer does not reliably extract.
    They are therefore DOCS-GAP awaiting a higher-DPI or
    differently-OCR'd render pass, mirroring the existing

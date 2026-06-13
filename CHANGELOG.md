@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Table D.3a (Model 2 calculation partition, Fs = 32 kHz)
+  completed — all 49 rows.** The docs extract
+  (`mp3-annex-d-psychoacoustic-extracts.md`) now transcribes the
+  complete 49-partition 32 kHz table, cross-checked against the
+  authoritative PNG render, with the partition count corrected from
+  the earlier 63 OCR miscount to the printed `bmax = 49` (`docs`
+  #129). The `psy` module's prior 20-row partial anchor is replaced
+  by the full table:
+
+  * `psy::CALC_PARTITION_32K: [CalcPartition; 49]` — the complete
+    Table D.3a (`ωlow`, `ωhigh`, `bval`, `minval`, `TMN` per row);
+    replaces the removed `CALC_PARTITION_32K_PARTIAL`.
+  * `psy::CALC_PARTITION_32K_FULL_LEN` corrected `63 → 49`.
+  * `psy::calc_partition_32k(n)` now resolves every partition
+    `n ∈ 1..=49` to `Some(row)` (no more DOCS-GAP tail); `n == 0`
+    and `n > 49` return `None`.
+
+  The final partition `[497, 513]` reaches the Nyquist FFT line
+  513 of the 1024-point Model 2 analysis FFT, with `bval` rising
+  to 24,07 Bark, `minval` settled at 4,5 dB and `TMN` climbing to
+  38,6 dB. Tests reworked to the full 49-row table: contiguity to
+  Nyquist with widths tiling lines 1..=513, strictly-increasing
+  `bval`, the `TMN` head-plateau / monotone tail, `minval`
+  settling to 4,5 dB from partition 17, the first/last row spec
+  anchors, and the lookup resolving every partition. The D.3b
+  (44,1 kHz, `bmax = 57`) / D.3c (48 kHz, `bmax = 58`) tables
+  remain staged as PNG renders.
+
 - **Annex D Table D.1a (Layer I, 32 kHz) threshold-in-quiet partial
   anchor + Step 3 composition.** The docs extract transcribes rows
   `i = 1..=5` plus the final row `i = 108` of Table D.1a
