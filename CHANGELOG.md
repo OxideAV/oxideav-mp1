@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cargo-fuzz` decode harness (round 296 depth-mode lane).** A new
+  self-contained `fuzz/` sub-crate (not a workspace member) carries a
+  libFuzzer `decode` target over the registered
+  [`oxideav_core::Decoder`] surface. It splits attacker bytes into a
+  packet stream of raw slices and crafted frames (valid 4-byte header,
+  every field — ID / layer I-or-II / bitrate / sample-rate / mode /
+  mode-ext / CRC / padding — attacker-chosen, body sized to the
+  header-implied frame length), driving `send_packet` → `receive_frame`
+  plus mid-stream `reset` / `flush` and a forced double-flush. The
+  contract under test is panic-freedom on arbitrary input across both
+  the Layer I and Layer II decode chains and the §2.4.3.1 Mute /
+  RepeatPrevious concealment paths. The current run is clean — no crash
+  artifacts across ~160k executions. No decoder code changed; the fuzzer
+  found no panic / overflow / OOB to fix.
+
 - **Annex D Table D.3a (Model 2 calculation partition, Fs = 32 kHz)
   completed — all 49 rows.** The docs extract
   (`mp3-annex-d-psychoacoustic-extracts.md`) now transcribes the

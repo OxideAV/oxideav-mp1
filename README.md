@@ -965,6 +965,28 @@ encode-with-CRC → decode loop reaches PCM without tripping the
 §2.4.3.1 concealment path). Test bytes are constructed locally from the
 §2.4.1 field layouts — no external fixtures.
 
+## Robustness (fuzzing)
+
+A `cargo-fuzz` / libFuzzer harness lives under `fuzz/` (a
+self-contained sub-crate, not a workspace member). The `decode` target
+drives attacker-controlled bytes through the registered
+[`oxideav_core::Decoder`] trait object (`send_packet` → `receive_frame`,
+plus mid-stream `reset` / `flush` and a forced post-flush double-flush).
+Each iteration splits the input into a packet stream: some packets are
+raw attacker slices (exercising the `< 4 bytes` / `BadSync` /
+truncated-frame rejections), others are crafted frames built around a
+structurally-valid 4-byte header whose every field — ID (MPEG-1 vs
+13818-3 LSF), layer (I vs II), bitrate index, sample-rate index, channel
+mode, mode extension, CRC flag, padding — is attacker-chosen, then sized
+to the header-implied frame length and filled with attacker bytes for the
+optional CRC slot, the allocation / scalefactor field, and the sample
+slots. The contract under test is panic-freedom: every public decode
+entry returns a `Result` (no panic, no debug-build integer overflow, no
+out-of-bounds index) on arbitrary input. The current run is clean — no
+crash artifacts across ~160k executions covering both the Layer I and
+Layer II decode chains and the §2.4.3.1 Mute / RepeatPrevious
+concealment paths.
+
 ## Spec gaps (DOCS-GAP)
 
 The staged `ISO_IEC_11172-3-MP3-1993.pdf` (157-page edition) carries

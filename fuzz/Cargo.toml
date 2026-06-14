@@ -1,0 +1,65 @@
+# cargo-fuzz manifest for the oxideav-mp1 Layer I / Layer II DECODE
+# attacker surface.
+#
+# Round 296 depth-mode lane. The crate is mature (decode + encode for
+# both layers across MPEG-1 and the 13818-3 LSF rates). The remaining
+# depth-mode lane with no coverage is a libFuzzer panic-freedom fuzzer
+# over the public Layer I / Layer II decode path.
+#
+# Spec basis for the target: ISO/IEC 11172-3 §2.4.2.3 (frame header /
+# sync), §2.4.1.4 / §2.4.3.1 (CRC error_check + concealment), §2.4.1.5
+# / §2.4.3.2 (Layer I bit allocation, scalefactor indices,
+# requantisation, polyphase synthesis), §2.4.1.6 (Layer II allocation /
+# scfsi / grouped samples). The harness drives the registered
+# `Decoder` trait object with attacker-supplied bytes split into a
+# packet stream; the contract under test is panic-freedom on every
+# entry, irrespective of input shape.
+
+[package]
+name = "oxideav-mp1-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-mp1]
+path = ".."
+
+# Self-contained workspace so the umbrella's `crates/*` member glob
+# (one level deep — this manifest is two levels deep and would not
+# match anyway) cannot pull this package in.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz target.
+# ------------------------------------------------------------------
+
+# Target — `decode`. Drives attacker-controlled bytes through
+# `Decoder::send_packet` / `receive_frame` on a freshly registered
+# Layer I / Layer II decoder. The input is split into a sequence of
+# variable-length packets so the cross-frame synthesis-filterbank
+# overlap-add history and the §2.4.3.1 concealment state machine
+# (last-good-frame storage for RepeatPrevious, the Mute ring-out) are
+# exercised across a mixed sequence of frames. Each crafted packet is
+# built with a structurally-valid 4-byte header (so the deep decode
+# chain is actually reached) whose every field is attacker-chosen,
+# then sized to the header-implied frame length and filled with
+# attacker bytes for the CRC / allocation / scalefactor / sample slots.
+# Also exercises `flush()`, `reset()`, and a forced double-flush so
+# the post-flush `Eof` path is covered, and feeds raw short slices so
+# the `< 4 bytes` / `BadSync` / truncated-frame rejections are hit.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
