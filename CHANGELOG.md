@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Free-format Layer I *encoding* (§2.4.2.3 `bitrate_index == 0b0000`).**
+  The Layer I encoder can now emit free-format frames via the new
+  `EncodeParams::free_format_kbps` field / `EncodeParams::with_free_format(kbps)`
+  builder. When set, the header's four-bit `bitrate_index` is written as
+  `0b0000` while the frame is sized to a fixed, possibly off-ladder rate
+  via the same §2.4.2.1 slot formula `N = floor(12 · kbps / Fs)` the
+  fixed ladder uses. Targets whose slot count would exceed the §2.4.3.1
+  512-slot Layer I limit (or a zero-rate target) are rejected with
+  `EncodeError::UnsupportedBitrate`. This closes the encode-side
+  counterpart to the existing decode-side
+  `detect_free_format_frame_length` probe: a two-frame round trip
+  confirms the probe recovers the same `N`, byte length and back-derived
+  bitrate the encoder used, and a free-format frame still decodes to PCM
+  through the standard §2.4.3.2 audio-data path. Free format composes
+  with the optional §2.4.1.4 CRC (`with_emit_crc`), which still verifies.
+
 - **`cargo-fuzz` decode harness (round 296 depth-mode lane).** A new
   self-contained `fuzz/` sub-crate (not a workspace member) carries a
   libFuzzer `decode` target over the registered

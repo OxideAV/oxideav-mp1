@@ -2395,9 +2395,24 @@ pub struct EncodeParams {
     /// Target bitrate. Must be a fixed Layer I ladder value
     /// ([`Bitrate::Fixed`]) when [`EncodeParams::layer`] is
     /// [`LayerSelect::LayerI`], or a Layer II ladder value when it is
-    /// [`LayerSelect::LayerII`]; free format is not produced by this
-    /// encoder.
+    /// [`LayerSelect::LayerII`]. Free format is selected by setting
+    /// [`EncodeParams::free_format_kbps`] instead; when that field is
+    /// `Some`, this `bitrate` field is ignored.
     pub bitrate: Bitrate,
+    /// When `Some(k)`, the encoder emits a **free-format** frame
+    /// (§2.4.2.3 `bitrate_index == 0b0000`): the four-bit
+    /// `bitrate_index` header field is written as `0b0000` and the
+    /// frame is sized to a fixed, possibly off-ladder rate of `k`
+    /// kbit/s via the same §2.4.2.1 slot formula
+    /// `N = floor(12 · k / Fs)` the fixed ladder uses. The §2.4.3.1
+    /// prose permits the bitrate to be any constant value the syntax
+    /// can carry (a frame holds at most `2^9 = 512` four-byte slots
+    /// for Layer I); a free-format stream must hold this rate
+    /// **constant** across every frame so the decoder's §2.4.3.1
+    /// next-syncword distance probe ([`detect_free_format_frame_length`](crate::header::detect_free_format_frame_length))
+    /// recovers the same `N`. When set, [`EncodeParams::bitrate`] is
+    /// ignored. Defaults to `None` (fixed-ladder output).
+    pub free_format_kbps: Option<u16>,
     /// Sampling frequency in Hz (44100, 48000 or 32000).
     pub sampling_frequency: u32,
     /// Channel mode. The encoder writes one allocation/scalefactor/
@@ -2444,11 +2459,23 @@ impl EncodeParams {
     pub fn new(bitrate: Bitrate, sampling_frequency: u32, mode: Mode) -> EncodeParams {
         EncodeParams {
             bitrate,
+            free_format_kbps: None,
             sampling_frequency,
             mode,
             emit_crc: false,
             layer: LayerSelect::LayerI,
         }
+    }
+
+    /// Builder: select **free-format** Layer I output (§2.4.2.3
+    /// `bitrate_index == 0b0000`) at the fixed, possibly off-ladder
+    /// rate `kbps`. See [`EncodeParams::free_format_kbps`]. When set,
+    /// the [`EncodeParams::bitrate`] field is ignored and the encoder
+    /// writes `0b0000` into the header's four-bit `bitrate_index`
+    /// field, sizing the frame to `N = floor(12 · kbps / Fs)` slots.
+    pub fn with_free_format(mut self, kbps: u16) -> EncodeParams {
+        self.free_format_kbps = Some(kbps);
+        self
     }
 
     /// Builder: select whether the encoder emits the optional §2.4.1.4
@@ -2607,15 +2634,38 @@ impl Mp1FrameEncoder {
                 got: pcm.len() / nch.max(1),
             });
         }
-        let bitrate_kbps = match self.params.bitrate {
-            Bitrate::Fixed(k) => k,
-            _ => return Err(EncodeError::UnsupportedBitrate),
-        };
         let (id_bit, samp_code) = sampling_code(self.params.sampling_frequency).ok_or(
             EncodeError::UnsupportedSamplingFrequency(self.params.sampling_frequency),
         )?;
-        let brate_idx =
-            bitrate_index(bitrate_kbps, id_bit).ok_or(EncodeError::UnsupportedBitrate)?;
+        // Free format (§2.4.2.3 `bitrate_index == 0b0000`) is selected
+        // by `free_format_kbps`: the header carries `0b0000` while the
+        // frame is sized to the fixed, possibly off-ladder target rate.
+        // Otherwise the fixed ladder rate must resolve to a valid
+        // `bitrate_index`.
+        let (bitrate_kbps, brate_idx) = match self.params.free_format_kbps {
+            Some(k) => {
+                // §2.4.3.1: free format carries a constant bitrate, but
+                // a frame holds at most 2^9 = 512 four-byte slots
+                // (`N` is read back from a 9-bit-significant distance
+                // by the decoder probe). Reject a target whose slot
+                // count would not fit, and reject a zero target (no
+                // audio-data budget at all).
+                let slots = (12 * k as u32 * 1000) / self.params.sampling_frequency;
+                if k == 0 || slots == 0 || slots > 512 {
+                    return Err(EncodeError::UnsupportedBitrate);
+                }
+                (k, 0u8)
+            }
+            None => {
+                let bitrate_kbps = match self.params.bitrate {
+                    Bitrate::Fixed(k) => k,
+                    _ => return Err(EncodeError::UnsupportedBitrate),
+                };
+                let brate_idx =
+                    bitrate_index(bitrate_kbps, id_bit).ok_or(EncodeError::UnsupportedBitrate)?;
+                (bitrate_kbps, brate_idx)
+            }
+        };
 
         // --- 1. Analysis: 12 slots * 32 subband samples per channel ---
         // subbands[ch][sb][slot]
@@ -3295,6 +3345,129 @@ mod tests {
             .verify_crc(&bytes[..4], &bytes[4..])
             .expect("CRC region present");
         assert!(matches!(status, CrcStatus::Ok(_)));
+    }
+
+    // ---- Free-format Layer I encode (§2.4.2.3 bitrate_index 0b0000) ----
+
+    #[test]
+    fn free_format_builder_sets_target_and_keeps_other_fields() {
+        let p = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel)
+            .with_free_format(200);
+        assert_eq!(p.free_format_kbps, Some(200));
+        // The builder must not disturb the unrelated fields.
+        assert_eq!(p.sampling_frequency, 48_000);
+        assert_eq!(p.mode, Mode::SingleChannel);
+        assert!(!p.emit_crc);
+        // The default constructor leaves free format off.
+        let d = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel);
+        assert_eq!(d.free_format_kbps, None);
+    }
+
+    #[test]
+    fn free_format_header_carries_bitrate_index_zero_and_off_ladder_length() {
+        // §2.4.2.3: a free-format frame writes `bitrate_index == 0b0000`
+        // into the header. The frame is still sized by §2.4.2.1
+        // `N = floor(12 * kbps / Fs)`, here at an OFF-ladder 200 kbit/s
+        // (the MPEG-1 Layer I ladder has 192 then 224, never 200).
+        let params = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel)
+            .with_free_format(200);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let bytes = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        // The parsed header must report free format, not a ladder rate.
+        assert_eq!(h.bitrate, Bitrate::Free);
+        // 12 * 200000 / 48000 = 50 slots * 4 bytes = 200 bytes.
+        assert_eq!(bytes.len(), 200);
+        // protection_bit defaults to 1 (no CRC) in the free path too.
+        assert!(h.protection);
+    }
+
+    #[test]
+    fn free_format_frame_length_recovered_by_decoder_probe() {
+        // The decoder cannot size a free-format frame from the header
+        // alone (§2.4.3.1): it measures the byte distance to the next
+        // syncword. Encode two consecutive constant-rate free-format
+        // frames and confirm the §2.4.3.1 probe recovers the same `N`,
+        // byte length and back-derived bitrate the encoder used.
+        use crate::header::detect_free_format_frame_length;
+        let params = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel)
+            .with_free_format(200);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let f0 = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let f1 = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let mut stream = f0.clone();
+        stream.extend_from_slice(&f1);
+
+        let h = TestFrameHeader::parse(&stream[..4]).unwrap();
+        assert_eq!(h.bitrate, Bitrate::Free);
+        let probe = detect_free_format_frame_length(&h, &stream[4..])
+            .expect("next syncword present after first free-format frame");
+        // 50 slots, 200 bytes, 200 kbit/s — exactly what we encoded.
+        assert_eq!(probe.base_slot_count, 50);
+        assert_eq!(probe.frame_length_bytes as usize, f0.len());
+        assert_eq!(probe.bitrate_kbps, 200);
+    }
+
+    #[test]
+    fn free_format_round_trips_to_pcm() {
+        // A free-format frame must still decode to PCM through the
+        // standard §2.4.3.2 audio-data path — the free-format marker
+        // only affects frame sizing, not the audio-data syntax.
+        use crate::decode::decode_audio_data;
+        let params = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel)
+            .with_free_format(200);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let bytes = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        // Audio data begins immediately after the 4-byte header (no CRC).
+        let sb = decode_audio_data(&h, &bytes[4..]).expect("free-format audio data decodes");
+        // At least one subband must carry a non-zero requantized sample
+        // for the 1 kHz test tone.
+        let any_nonzero = sb.subbands[0]
+            .iter()
+            .any(|band| band.allocated && band.samples.iter().any(|&v| v != 0.0));
+        assert!(any_nonzero, "decoded free-format frame is silent");
+    }
+
+    #[test]
+    fn free_format_rejects_zero_and_oversized_targets() {
+        // §2.4.3.1: a free-format frame holds at most 512 four-byte
+        // slots, and a zero-rate target leaves no audio-data budget.
+        let mut zero = Mp1FrameEncoder::new(
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel).with_free_format(0),
+        );
+        assert!(matches!(
+            zero.encode_frame(&unit_mono_pcm()),
+            Err(EncodeError::UnsupportedBitrate)
+        ));
+        // 12 * 2100 kbit/s / 48 kHz = 525 slots > 512.
+        let mut big = Mp1FrameEncoder::new(
+            EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel)
+                .with_free_format(2100),
+        );
+        assert!(matches!(
+            big.encode_frame(&unit_mono_pcm()),
+            Err(EncodeError::UnsupportedBitrate)
+        ));
+    }
+
+    #[test]
+    fn free_format_with_crc_verifies() {
+        // Free format and the optional §2.4.1.4 CRC are independent
+        // switches; combining them must still write `bitrate_index == 0`
+        // AND a verifying CRC word.
+        let params = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::SingleChannel)
+            .with_free_format(160)
+            .with_emit_crc(true);
+        let mut enc = Mp1FrameEncoder::new(params);
+        let bytes = enc.encode_frame(&unit_mono_pcm()).unwrap();
+        let h = TestFrameHeader::parse(&bytes[..4]).unwrap();
+        assert_eq!(h.bitrate, Bitrate::Free);
+        assert!(h.has_crc());
+        let status = h
+            .verify_crc(&bytes[..4], &bytes[4..])
+            .expect("CRC region present");
+        assert!(status.is_good(), "free-format CRC failed: {status:?}");
     }
 
     // ---- Layer II bit allocation (§C.1.5.2.7) -----------------

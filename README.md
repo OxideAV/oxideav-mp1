@@ -59,6 +59,20 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
   candidates with `NoNextSync`, and a Layer I distance that is not a
   whole-slot multiple with `InconsistentDistance`. Stream-parameter
   mismatches in candidate syncwords are skipped over.
+- **§2.4.2.3 free-format Layer I *encoding***: the encode-side
+  counterpart to the probe above. `EncodeParams::with_free_format(kbps)`
+  (field `free_format_kbps`) makes the Layer I encoder write
+  `bitrate_index == 0b0000` into the header while sizing the frame to a
+  fixed, possibly off-ladder rate via the same §2.4.2.1 slot formula
+  `N = floor(12 · kbps / Fs)` the fixed ladder uses (e.g. 200 kbit/s at
+  48 kHz → 50 slots → 200-byte frames, a rate the MPEG-1 ladder has no
+  index for). The rate must be held constant across frames so the
+  decoder's `detect_free_format_frame_length` probe recovers the same
+  `N`; a two-frame round trip verifies it does, and the frame still
+  decodes to PCM through the standard §2.4.3.2 audio-data path. Targets
+  whose slot count exceeds the §2.4.3.1 512-slot Layer I limit (or a
+  zero rate) are rejected with `EncodeError::UnsupportedBitrate`. Free
+  format composes with the optional §2.4.1.4 CRC (`with_emit_crc`).
 - **CRC `error_check()` verification** (§2.4.1.4 / §2.4.3.1):
   `protection_bit` drives whether a 16-bit CRC word follows;
   `FrameHeader::verify_crc` computes the CRC-16
