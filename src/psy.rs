@@ -2305,6 +2305,54 @@ pub fn model2_spread_normalization_32k() -> Vec<f64> {
         .collect()
 }
 
+/// Apply the clause D.2.3 energy-conserving spreading operator at
+/// Fs = 32 kHz to a per-partition source-energy vector, producing the
+/// spread excitation `eb(b)` per destination partition `b`.
+///
+/// `partition_energy[s]` is the (linear power) energy accumulated into
+/// source partition `s`, indexed 0-based over the
+/// [`MODEL2_PARTITIONS_32K`] calculation partitions of Table D.3a. The
+/// returned vector `eb[d]` is the same length and carries the spread
+/// excitation
+///
+/// ```text
+/// eb[d] = Σ_s  (partition_energy[s] · rnorm[s]) · sprdngf[d][s]
+/// ```
+///
+/// — i.e. each source's energy is first scaled by its clause D.2.3
+/// `rnorm[s]` energy-conservation factor (so a unit source impulse
+/// spreads to a total of exactly 1 over all destinations, see
+/// [`model2_spread_normalization_32k`]) and then distributed across
+/// destinations through the asymmetric Bark spreading weights of
+/// [`model2_spreading_matrix_32k`]. This is the matrix–vector product
+/// the eventual Model 2 threshold step consumes as its spread
+/// excitation; it does **not** yet apply the per-partition `minval`
+/// floor or the TMN/NMT tonality offset (clause D.2.4 combination
+/// rule), which remain a DOCS-GAP — the noise-masking-tone offset and
+/// the tonality-index blend are not transcribed in the staged Annex D
+/// extract.
+///
+/// Returns `None` if `partition_energy.len() != MODEL2_PARTITIONS_32K`.
+/// Because the operator is energy-conserving, the spread total
+/// `Σ_d eb[d]` equals the source total `Σ_s partition_energy[s]` (up
+/// to floating-point rounding), so the operator redistributes energy
+/// across partitions without creating or destroying it.
+pub fn model2_spread_energy_32k(partition_energy: &[f64]) -> Option<Vec<f64>> {
+    let n = MODEL2_PARTITIONS_32K;
+    if partition_energy.len() != n {
+        return None;
+    }
+    let matrix = model2_spreading_matrix_32k();
+    let rnorm = model2_spread_normalization_32k();
+    // Pre-scale each source by its energy-conservation factor once,
+    // then accumulate into every destination.
+    let scaled: Vec<f64> = (0..n).map(|s| partition_energy[s] * rnorm[s]).collect();
+    let eb = (0..n)
+        .map(|d| (0..n).map(|s| scaled[s] * matrix[d][s]).sum())
+        .collect();
+    Some(eb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4002,6 +4050,109 @@ mod tests {
             assert!(
                 (spread_total - 1.0).abs() < 1e-12,
                 "rnorm-scaled spread of source {s} sums to {spread_total}, expected 1"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_spread_energy_32k_rejects_wrong_length() {
+        assert!(model2_spread_energy_32k(&[]).is_none());
+        assert!(model2_spread_energy_32k(&[1.0; MODEL2_PARTITIONS_32K - 1]).is_none());
+        assert!(model2_spread_energy_32k(&[1.0; MODEL2_PARTITIONS_32K + 1]).is_none());
+        // Exact length succeeds.
+        assert!(model2_spread_energy_32k(&[0.0; MODEL2_PARTITIONS_32K]).is_some());
+    }
+
+    #[test]
+    fn model2_spread_energy_32k_matches_explicit_matrix_product() {
+        // The function must equal the explicit Σ_s (e[s]·rnorm[s])·m[d][s].
+        let m = model2_spreading_matrix_32k();
+        let rnorm = model2_spread_normalization_32k();
+        let n = MODEL2_PARTITIONS_32K;
+        // A non-trivial source vector (a ramp, so every source differs).
+        let energy: Vec<f64> = (0..n).map(|s| (s as f64) + 1.0).collect();
+        let eb = model2_spread_energy_32k(&energy).unwrap();
+        assert_eq!(eb.len(), n);
+        for d in 0..n {
+            let want: f64 = (0..n).map(|s| energy[s] * rnorm[s] * m[d][s]).sum();
+            assert!(
+                (eb[d] - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "eb[{d}] = {} != explicit product {want}",
+                eb[d]
+            );
+        }
+    }
+
+    #[test]
+    fn model2_spread_energy_32k_conserves_total_energy() {
+        // The energy-conserving operator redistributes but neither
+        // creates nor destroys energy: Σ eb == Σ source.
+        let n = MODEL2_PARTITIONS_32K;
+        let energy: Vec<f64> = (0..n).map(|s| 0.5 + 0.25 * (s as f64)).collect();
+        let total_in: f64 = energy.iter().sum();
+        let eb = model2_spread_energy_32k(&energy).unwrap();
+        let total_out: f64 = eb.iter().sum();
+        assert!(
+            (total_out - total_in).abs() <= 1e-9 * total_in,
+            "spread total {total_out} != source total {total_in}"
+        );
+    }
+
+    #[test]
+    fn model2_spread_energy_32k_unit_impulse_recovers_normalized_column() {
+        // A unit impulse at source s spreads, per destination, to
+        // rnorm[s]·m[d][s] — and over all destinations sums to 1.
+        let m = model2_spreading_matrix_32k();
+        let rnorm = model2_spread_normalization_32k();
+        let n = MODEL2_PARTITIONS_32K;
+        for s in [0usize, 5, 24, n - 1] {
+            let mut energy = vec![0.0f64; n];
+            energy[s] = 1.0;
+            let eb = model2_spread_energy_32k(&energy).unwrap();
+            let sum: f64 = eb.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-12,
+                "unit impulse at {s} spreads to total {sum}, expected 1"
+            );
+            for (d, &got) in eb.iter().enumerate() {
+                let want = rnorm[s] * m[d][s];
+                assert!(
+                    (got - want).abs() <= 1e-12,
+                    "impulse {s}: eb[{d}] = {got} != rnorm·m {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model2_spread_energy_32k_zero_source_is_all_zero() {
+        let eb = model2_spread_energy_32k(&[0.0; MODEL2_PARTITIONS_32K]).unwrap();
+        assert!(eb.iter().all(|&e| e == 0.0), "zero source spread non-zero");
+    }
+
+    #[test]
+    fn model2_spread_energy_32k_is_linear() {
+        // Superposition: spread(a + b) == spread(a) + spread(b), and
+        // spread(k·a) == k·spread(a). A linear operator must satisfy both.
+        let n = MODEL2_PARTITIONS_32K;
+        let a: Vec<f64> = (0..n).map(|s| (s as f64).sin().abs() + 0.1).collect();
+        let b: Vec<f64> = (0..n).map(|s| (s as f64 * 0.3).cos().abs() + 0.2).collect();
+        let sum: Vec<f64> = (0..n).map(|s| a[s] + b[s]).collect();
+        let ea = model2_spread_energy_32k(&a).unwrap();
+        let eb = model2_spread_energy_32k(&b).unwrap();
+        let esum = model2_spread_energy_32k(&sum).unwrap();
+        for d in 0..n {
+            assert!(
+                (esum[d] - (ea[d] + eb[d])).abs() <= 1e-12 * (ea[d] + eb[d]).abs().max(1.0),
+                "additivity failed at {d}"
+            );
+        }
+        let scaled: Vec<f64> = a.iter().map(|&x| 3.5 * x).collect();
+        let escaled = model2_spread_energy_32k(&scaled).unwrap();
+        for d in 0..n {
+            assert!(
+                (escaled[d] - 3.5 * ea[d]).abs() <= 1e-12 * (3.5 * ea[d]).abs().max(1.0),
+                "homogeneity failed at {d}"
             );
         }
     }

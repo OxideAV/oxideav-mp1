@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D clause D.2.3 — Model 2 spread-excitation application
+  (Fs = 32 kHz).** `psy::model2_spread_energy_32k(&[f64]) -> Option<Vec<f64>>`
+  applies the energy-conserving spreading operator (the already-landed
+  `model2_spreading_matrix_32k` × `model2_spread_normalization_32k`) to a
+  per-partition source-energy vector, returning the spread excitation
+  `eb[d] = Σ_s (energy[s]·rnorm[s])·sprdngf[d][s]` per destination
+  partition. This is the matrix–vector product the eventual Model 2
+  threshold step consumes; it carries no `minval` floor or TMN/NMT
+  tonality offset (clause D.2.4 combination rule), which remain a
+  DOCS-GAP — the noise-masking-tone offset and tonality-index blend are
+  not transcribed in the staged Annex D extract. Returns `None` on a
+  length mismatch against `MODEL2_PARTITIONS_32K`. **+6 lib-tests**
+  cover the length guard, exact agreement with the explicit matrix
+  product, energy conservation (`Σ eb == Σ source`), unit-impulse
+  column recovery, the zero-source case, and operator linearity
+  (additivity + homogeneity). Total `cargo test -p oxideav-mp1 --lib`
+  count: **355 → 361**.
+
 - **Annex D clause D.2.3 — Model 2 partition-domain spreading operator
   (Fs = 32 kHz).** The per-pair spreading function `model2_sprdngf` is
   now composed over the **complete** 49-row Table D.3a (`bval` column,
