@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D clause D.2.3 — Model 2 partition-domain spreading operator
+  (Fs = 32 kHz).** The per-pair spreading function `model2_sprdngf` is
+  now composed over the **complete** 49-row Table D.3a (`bval` column,
+  `CALC_PARTITION_32K`) into the full partition-domain spreading
+  operator Model 2 evaluates — the matrix that takes per-partition
+  energy and spreads it across the calculation partitions. New `psy`
+  surface:
+
+  * `psy::MODEL2_PARTITIONS_32K` — partition count (`bmax = 49`).
+  * `psy::model2_spread_weight_32k(into, from) -> Option<f64>` — the
+    per-pair power-domain weight `model2_sprdngf(bval[into],
+    bval[from])` for 1-based partition indices (the destination's
+    median Bark is the spread-into `j` argument, the source's is the
+    masker `i` argument); `None` for `0` / out-of-range indices.
+  * `psy::model2_spreading_matrix_32k() -> Vec<Vec<f64>>` — the dense
+    `49 × 49` matrix `[d][s] = model2_sprdngf(bval[d], bval[s])`.
+    Non-symmetric (Bark spreading is steeper below the masker than
+    above), every entry a non-negative power weight that never exceeds
+    the `≈ 1` diagonal.
+  * `psy::model2_spread_normalization_32k() -> Vec<f64>` — the clause
+    D.2.3 `rnorm[s] = 1 / Σ_d sprdngf[d][s]` per-source-partition
+    normalisation factors that make the operator energy-conserving.
+
+  The 32 kHz operator is fully derivable in tree because D.3a is the
+  one calculation-partition table transcribed complete; the 44,1 /
+  48 kHz operators stay DOCS-GAP until Tables D.3b / D.3c are
+  transcribed off their PNG renders. No allocator wiring changed —
+  this assembles the spreading operator the eventual Model 2 allocator
+  will use. **+11 lib-tests** cover the partition count, the `≈ 1`
+  diagonal, per-pair / matrix agreement, out-of-range `None`, the
+  never-amplify bound, the down-vs-up asymmetry, off-diagonal decay on
+  the shallow side, and the `rnorm` finite-positive + energy-
+  conservation properties (a unit source impulse scaled by `rnorm[s]`
+  and spread over every destination sums back to exactly 1). Total
+  `cargo test -p oxideav-mp1 --lib` count: **344 → 355**.
+
 - **Free-format Layer I *encoding* (§2.4.2.3 `bitrate_index == 0b0000`).**
   The Layer I encoder can now emit free-format frames via the new
   `EncodeParams::free_format_kbps` field / `EncodeParams::with_free_format(kbps)`

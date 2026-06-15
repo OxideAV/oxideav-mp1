@@ -689,6 +689,31 @@ plus the ISO/IEC 13818-3 §2.4.2.3 LSF extension:
     its expected D.2a critical band (line 1 → band 0 … line 108 →
     band 23) with the row Bark bounded by the band-top Bark.
   - Total `cargo test -p oxideav-mp1 --lib` count: **327 → 338**.
+- **Model 2 partition-domain spreading operator (Fs = 32 kHz)**: the
+  per-pair clause D.2.3 spreading function is now composed over the
+  **complete** 49-row Table D.3a (`bval` column) into the full
+  partition-domain spreading operator Model 2 evaluates.
+  [`psy::model2_spread_weight_32k(into, from)`] returns the per-pair
+  power weight `model2_sprdngf(bval[into], bval[from])` (destination
+  median Bark = spread-into `j`, source median Bark = masker `i`);
+  [`psy::model2_spreading_matrix_32k`] builds the dense `49 × 49`
+  matrix; [`psy::model2_spread_normalization_32k`] returns the clause
+  D.2.3 `rnorm[s] = 1 / Σ_d sprdngf[d][s]` per-source factors that make
+  the operator energy-conserving. The matrix is non-symmetric (Bark
+  spreading is steeper below the masker than above), every entry a
+  non-negative power weight ≤ the `≈ 1` diagonal, and `rnorm`-scaling a
+  unit source impulse spreads back to exactly 1 over all destinations.
+  Only 32 kHz is derivable in tree (D.3a is the one complete
+  calculation-partition table); 44,1 / 48 kHz stay DOCS-GAP pending
+  Tables D.3b / D.3c off their PNG renders. No allocator wiring changed
+  — this assembles the spreading operator the eventual Model 2
+  allocator will use.
+  - Eleven new lib-tests cover the partition count (`bmax = 49`), the
+    `≈ 1` diagonal, per-pair / matrix agreement, out-of-range `None`,
+    the never-amplify bound, the down-vs-up asymmetry, off-diagonal
+    decay on the shallow side, and the `rnorm` finite-positive +
+    energy-conservation properties.
+  - Total `cargo test -p oxideav-mp1 --lib` count: **344 → 355**.
 - **Model 2 spreading function complete — `tmpy` backbone + full
   `sprdngf` composition (DOCS-GAP closed)**: the clause D.2.3 `tmpy`
   line, previously typeset as an equation image the PDF text layer

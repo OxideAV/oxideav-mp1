@@ -33,6 +33,11 @@
 //! 4. [`masking_function`] — closed-form `vf(dz, X)` with the
 //!    four-piece spreading-function definition.
 //! 5. [`CODER_PARTITIONS`] — Table D.5 (33 rows × `(boundary, width)`).
+//! 6. [`model2_spreading_matrix_32k`] / [`model2_spread_weight_32k`] /
+//!    [`model2_spread_normalization_32k`] — the clause D.2.3 Model 2
+//!    partition-domain spreading operator composed over the complete
+//!    Table D.3a (`bval` column), at Fs = 32 kHz only (D.3b / D.3c
+//!    stay DOCS-GAP).
 //!
 //! No allocator wiring is changed in this round; the existing
 //! [`crate::encode::allocate_bits`] path still drives subband bits
@@ -2194,6 +2199,112 @@ pub fn ltq_layer1_32k_used(i: u16, bit_rate_per_channel_kbps: u32) -> Option<f64
     ltq_layer1_32k(i).map(|r| step3_apply_ltq_offset(r.ltq_db, bit_rate_per_channel_kbps))
 }
 
+// -----------------------------------------------------------------
+// Annex D clause D.2.3 — Model 2 partition-domain spreading operator
+// at Fs = 32 kHz.
+//
+// The per-pair spreading function `model2_sprdngf(j, i)` (above)
+// gives the power-domain weight with which a unit of energy located
+// at the Bark value `i` (the masker / source) spreads onto the Bark
+// value `j` (the band spread into / destination). Model 2 evaluates
+// that function over the **calculation partitions** of Table D.3a —
+// each partition `b` carries a representative (median) Bark value
+// `bval[b]` (the third column of the table). The spreading operator
+// is therefore the `bmax × bmax` matrix
+//
+//     sprdngf[d][s] = model2_sprdngf(bval[d], bval[s])
+//
+// (`d` = destination partition, `s` = source partition), and the
+// energy spread into partition `d` is `Σ_s e[s] · sprdngf[d][s]`.
+//
+// Clause D.2.3 further normalises the spread so the operator
+// conserves total energy: `rnorm[s] = 1 / Σ_d sprdngf[d][s]` scales
+// each source column, equivalently the normalised destination value
+// is divided by the column sum of the contributing source. The
+// per-partition `bval` data needed for this composition is the
+// complete 49-row `CALC_PARTITION_32K` (Table D.3a), so the 32 kHz
+// operator is fully derivable in tree; the 44,1 / 48 kHz operators
+// stay DOCS-GAP until Tables D.3b / D.3c are transcribed off their
+// PNG renders.
+// -----------------------------------------------------------------
+
+/// Number of Model 2 calculation partitions at Fs = 32 kHz
+/// (`bmax = 49`, the length of Table D.3a / [`CALC_PARTITION_32K`]).
+pub const MODEL2_PARTITIONS_32K: usize = CALC_PARTITION_32K.len();
+
+/// Model 2 per-pair partition spreading weight at Fs = 32 kHz: the
+/// power-domain weight with which energy in source partition
+/// `from_partition` spreads onto destination partition
+/// `into_partition`.
+///
+/// Both arguments are **1-based** partition indices into Table D.3a
+/// (`1..=49`), matching [`calc_partition_32k`]. The weight is
+/// `model2_sprdngf(bval[into], bval[from])` — i.e. the destination
+/// partition's median Bark is the `j` (spread-into) argument and the
+/// source partition's median Bark is the `i` (masker) argument. The
+/// result is a non-negative power weight `≈ 1` on the diagonal
+/// (`from == into`), decaying away from it and cut off entirely
+/// beyond the `model2_sprdngf` `tmpy < −100` window.
+///
+/// Returns `None` if either index is `0` (the table is 1-based) or
+/// greater than [`MODEL2_PARTITIONS_32K`].
+pub fn model2_spread_weight_32k(into_partition: u16, from_partition: u16) -> Option<f64> {
+    let into = calc_partition_32k(into_partition)?;
+    let from = calc_partition_32k(from_partition)?;
+    Some(model2_sprdngf(into.bval, from.bval))
+}
+
+/// The complete Model 2 partition-domain spreading matrix at
+/// Fs = 32 kHz: `matrix[d][s]` is the spreading weight from source
+/// partition `s` onto destination partition `d`, both 0-based here
+/// (the returned matrix is dense over all
+/// [`MODEL2_PARTITIONS_32K`] × [`MODEL2_PARTITIONS_32K`] partitions).
+///
+/// `matrix[d][s] == model2_sprdngf(bval[d], bval[s])` where
+/// `bval[k] == CALC_PARTITION_32K[k].bval`. Each row `d` collects
+/// every source partition's contribution into destination `d`; each
+/// column `s` is source partition `s` spread across all
+/// destinations. The matrix is **not** symmetric — the spreading
+/// function is asymmetric in Bark (steeper below the masker than
+/// above) — but every entry is a non-negative power weight that
+/// never exceeds the on-diagonal value.
+pub fn model2_spreading_matrix_32k() -> Vec<Vec<f64>> {
+    let n = MODEL2_PARTITIONS_32K;
+    let mut matrix = vec![vec![0.0f64; n]; n];
+    for (d, row) in matrix.iter_mut().enumerate() {
+        let bval_d = CALC_PARTITION_32K[d].bval;
+        for (s, cell) in row.iter_mut().enumerate() {
+            let bval_s = CALC_PARTITION_32K[s].bval;
+            *cell = model2_sprdngf(bval_d, bval_s);
+        }
+    }
+    matrix
+}
+
+/// Model 2 spreading normalisation factors at Fs = 32 kHz
+/// (clause D.2.3 `rnorm`): for each **source** partition `s`,
+/// `rnorm[s] = 1 / Σ_d sprdngf[d][s]` — the reciprocal of the total
+/// power the source spreads across every destination partition.
+///
+/// Multiplying source-partition energy by `rnorm[s]` before
+/// spreading makes the operator energy-conserving (the spread total
+/// over all destinations equals the source energy). The returned
+/// vector is indexed 0-based by source partition over all
+/// [`MODEL2_PARTITIONS_32K`] partitions. Every column sum of
+/// [`model2_spreading_matrix_32k`] is strictly positive (the
+/// diagonal entry alone is `≈ 1`), so each factor is finite and
+/// strictly positive.
+pub fn model2_spread_normalization_32k() -> Vec<f64> {
+    let matrix = model2_spreading_matrix_32k();
+    let n = MODEL2_PARTITIONS_32K;
+    (0..n)
+        .map(|s| {
+            let col_sum: f64 = (0..n).map(|d| matrix[d][s]).sum();
+            1.0 / col_sum
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3729,6 +3840,169 @@ mod tests {
             // band's top-edge Bark.
             let r = ltq_layer1_32k(i).unwrap();
             assert!(r.bark_z <= bands[band].bark_z + 1e-9, "line {i}");
+        }
+    }
+
+    // --- Model 2 partition-domain spreading operator (32 kHz) ---
+
+    #[test]
+    fn model2_partition_count_32k_matches_table() {
+        // bmax = 49 at 32 kHz, equal to the complete D.3a length.
+        assert_eq!(MODEL2_PARTITIONS_32K, 49);
+        assert_eq!(MODEL2_PARTITIONS_32K, CALC_PARTITION_32K.len());
+    }
+
+    #[test]
+    fn model2_spread_weight_32k_diagonal_is_one() {
+        // from == into ⇒ bval[d] == bval[s] ⇒ sprdngf(z, z) ≈ 1
+        // (the spreading backbone peaks at 0 dB on the diagonal).
+        for n in 1..=MODEL2_PARTITIONS_32K as u16 {
+            let w = model2_spread_weight_32k(n, n).unwrap();
+            assert!(
+                (w - 1.0).abs() < 1e-6,
+                "diagonal weight at partition {n} = {w}, expected ≈ 1"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_spread_weight_32k_matches_sprdngf_composition() {
+        // The per-pair weight is exactly model2_sprdngf(bval[into],
+        // bval[from]) — the destination Bark is the spread-into (j)
+        // argument and the source Bark is the masker (i) argument.
+        for &(into, from) in &[(1u16, 1u16), (10, 8), (8, 10), (49, 1), (1, 49), (25, 30)] {
+            let got = model2_spread_weight_32k(into, from).unwrap();
+            let bval_into = calc_partition_32k(into).unwrap().bval;
+            let bval_from = calc_partition_32k(from).unwrap().bval;
+            let want = model2_sprdngf(bval_into, bval_from);
+            assert!(
+                (got - want).abs() < 1e-15,
+                "weight({into},{from}) = {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_spread_weight_32k_out_of_range_is_none() {
+        assert!(model2_spread_weight_32k(0, 1).is_none());
+        assert!(model2_spread_weight_32k(1, 0).is_none());
+        assert!(model2_spread_weight_32k(50, 1).is_none());
+        assert!(model2_spread_weight_32k(1, 50).is_none());
+        // In-range endpoints are present.
+        assert!(model2_spread_weight_32k(1, 1).is_some());
+        assert!(model2_spread_weight_32k(49, 49).is_some());
+    }
+
+    #[test]
+    fn model2_spreading_matrix_32k_shape_and_diagonal() {
+        let m = model2_spreading_matrix_32k();
+        assert_eq!(m.len(), MODEL2_PARTITIONS_32K);
+        for row in &m {
+            assert_eq!(row.len(), MODEL2_PARTITIONS_32K);
+        }
+        for (d, row) in m.iter().enumerate() {
+            assert!(
+                (row[d] - 1.0).abs() < 1e-6,
+                "matrix[{d}][{d}] = {} expected ≈ 1",
+                row[d]
+            );
+        }
+    }
+
+    #[test]
+    fn model2_spreading_matrix_32k_agrees_with_per_pair_weight() {
+        let m = model2_spreading_matrix_32k();
+        for (d, row) in m.iter().enumerate() {
+            for (s, &cell) in row.iter().enumerate() {
+                // 0-based matrix index == 1-based partition number − 1.
+                let want = model2_spread_weight_32k(d as u16 + 1, s as u16 + 1).unwrap();
+                assert!(
+                    (cell - want).abs() < 1e-15,
+                    "matrix[{d}][{s}] = {cell}, per-pair = {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model2_spreading_matrix_32k_entries_never_amplify() {
+        // Every entry is a non-negative power weight that never
+        // exceeds the on-diagonal value (the backbone maxes at 0 dB).
+        let m = model2_spreading_matrix_32k();
+        for row in &m {
+            for &cell in row {
+                assert!(cell >= 0.0, "negative weight {cell}");
+                assert!(
+                    cell <= 1.0 + 1e-6,
+                    "weight {cell} exceeds the diagonal peak"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model2_spreading_matrix_32k_is_asymmetric() {
+        // The Bark-domain spreading is steeper below the masker than
+        // above, so spreading down (toward a lower destination
+        // partition) differs from spreading up. Pick a near pair
+        // inside the cutoff window where both directions are non-zero.
+        let m = model2_spreading_matrix_32k();
+        // Partitions 10 and 12 (bval 7.28 and 8.50, Δ ≈ 1.22 Bark).
+        let up = m[11][9]; // source 10 → destination 12 (j > i)
+        let down = m[9][11]; // source 12 → destination 10 (j < i)
+        assert!(up > 0.0 && down > 0.0, "both directions should survive");
+        assert!(
+            (up - down).abs() > 1e-3,
+            "spreading should be asymmetric: up {up} vs down {down}"
+        );
+    }
+
+    #[test]
+    fn model2_spreading_matrix_32k_decays_off_diagonal() {
+        // Walking away from the masker source partition the weight
+        // is monotonically non-increasing on the shallow (upward)
+        // side until the cutoff zeroes it.
+        let m = model2_spreading_matrix_32k();
+        let src = 5usize; // 0-based source partition
+        let mut prev = m[src][src]; // diagonal == 1
+        for (d, row) in m.iter().enumerate().skip(src + 1) {
+            let cur = row[src];
+            assert!(
+                cur <= prev + 1e-12,
+                "weight rose moving away: m[{d}][{src}] = {cur} > prev {prev}"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn model2_spread_normalization_32k_is_finite_positive() {
+        let r = model2_spread_normalization_32k();
+        assert_eq!(r.len(), MODEL2_PARTITIONS_32K);
+        for (s, &factor) in r.iter().enumerate() {
+            assert!(
+                factor.is_finite() && factor > 0.0,
+                "rnorm[{s}] = {factor} not finite-positive"
+            );
+            // The diagonal weight alone is ≈ 1, so each column sum is
+            // ≥ 1, hence each normalisation factor is ≤ 1.
+            assert!(factor <= 1.0 + 1e-9, "rnorm[{s}] = {factor} > 1");
+        }
+    }
+
+    #[test]
+    fn model2_spread_normalization_32k_conserves_energy() {
+        // Multiplying a unit source impulse by rnorm[s] and spreading
+        // it over every destination must sum back to exactly 1 (the
+        // clause D.2.3 energy-conservation property of rnorm).
+        let m = model2_spreading_matrix_32k();
+        let rnorm = model2_spread_normalization_32k();
+        for s in 0..MODEL2_PARTITIONS_32K {
+            let spread_total: f64 = (0..MODEL2_PARTITIONS_32K).map(|d| m[d][s] * rnorm[s]).sum();
+            assert!(
+                (spread_total - 1.0).abs() < 1e-12,
+                "rnorm-scaled spread of source {s} sums to {spread_total}, expected 1"
+            );
         }
     }
 }
