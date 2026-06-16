@@ -43,10 +43,14 @@ and MPEG-2 LSF:
 - **Layer I encoder**: header writer, per-sample quantization, and an
   iterative bit allocator, with optional CRC and free-format support.
 - **Layer II encoder**: the §C.1.3 polyphase analysis filterbank,
-  per-part scalefactor extraction, the §C.1.5.2.7 bit allocator, the
-  §2.4.3.3.4 quantizer, the four §2.4.1.6 region writers, and a
-  top-level `encode_layer2_frame` / stateful `Mp1Layer2FrameEncoder`,
-  with optional CRC and §2.4.1.8 ancillary-data emission.
+  per-part scalefactor extraction, the §C.1.5.2.5 / Table C.4 perceptual
+  SCFSI selection (classifies the two successive scalefactor-index
+  differences, looks up the transmission pattern, and collapses the
+  three scalefactors to one/two where the pattern allows), the
+  §C.1.5.2.7 bit allocator, the §2.4.3.3.4 quantizer, the four §2.4.1.6
+  region writers, and a top-level `encode_layer2_frame` / stateful
+  `Mp1Layer2FrameEncoder`, with optional CRC and §2.4.1.8 ancillary-data
+  emission.
 
 The encoder uses a non-psychoacoustic signal-energy SMR proxy; the
 Annex D psychoacoustic models (Model 1 / Model 2) are partially staged
@@ -64,9 +68,10 @@ also selectable via `EncodeParams::with_layer(LayerSelect)`.
 
 ## Not yet supported
 
-- The §C.1.5.2.5 / Table C.4 perceptual SCFSI selection (the Layer II
-  encoder emits `scfsi == 0b00` for every allocated subband).
-- Psychoacoustic-model-driven encode quality (rate-driven only).
+- Psychoacoustic-model-driven encode quality. The §C.1.5.2.7 allocator
+  uses a signal-energy SMR proxy; the Annex D psychoacoustic models
+  (Model 1 / Model 2) are partially staged in `psy` but not yet wired
+  into bit allocation.
 
 ## Robustness
 

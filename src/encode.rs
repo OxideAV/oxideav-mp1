@@ -478,12 +478,11 @@ pub fn layer2_subband_peak_per_part(
 /// returned, mirroring the Layer I helper's "tiniest scalefactor"
 /// fallback.
 ///
-/// The returned indices are intended to populate
-/// [`Layer2ScalefactorFieldInput::scalefactor_indices`] directly; the
-/// SCFSI selection that may collapse them to one or two values is a
-/// separate step (Table C.4 — DOCS-GAP) and is the caller's
-/// responsibility. Writing `scfsi == 0b00` (three independent
-/// scalefactors) consumes all three indices as produced.
+/// The returned indices are the three *computed* per-part scalefactors;
+/// the §C.1.5.2.5 / Table C.4 SCFSI selection that may collapse them to
+/// one or two values is a separate step ([`select_layer2_scfsi`]) and is
+/// the caller's responsibility. Feeding the three indices straight to the
+/// writer with `scfsi == 0b00` emits all three independently.
 ///
 /// `subbands[ch][sb]` carries the 36 analysed sub-band sample values
 /// the encoder's [`AnalysisFilter`] has produced for the frame, in
@@ -512,6 +511,181 @@ pub fn select_layer2_scalefactors(
         }
     }
     out
+}
+
+// ---- Layer II SCFSI selection (§C.1.5.2.5 / §C.1.5.2.6) --------
+
+/// The §C.1.5.2.5 difference class of one scalefactor-index difference
+/// `dscf = scf_n − scf_{n+1}`.
+///
+/// The class boundaries are read verbatim from ISO/IEC 11172-3:1993
+/// §C.1.5.2.5 (the table is rendered as a page image; the boundaries
+/// were transcribed from the in-repo PDF page render):
+///
+/// | class | dscf |
+/// |------:|------|
+/// | 1 | `dscf <= -3` |
+/// | 2 | `-3 < dscf < 0` |
+/// | 3 | `dscf == 0` |
+/// | 4 | `0 < dscf < 3` |
+/// | 5 | `dscf >= 3` |
+///
+/// `scf` is the Table 3-B.1 *index* (0..=62), where index `0` is the
+/// largest multiplier and the multiplier strictly decreases with the
+/// index. The difference is therefore taken on the indices directly, as
+/// the spec's `dscf = scf1 − scf2` prescribes. Returns a class in
+/// `1..=5`.
+fn layer2_dscf_class(dscf: i32) -> u8 {
+    if dscf <= -3 {
+        1
+    } else if dscf < 0 {
+        2
+    } else if dscf == 0 {
+        3
+    } else if dscf < 3 {
+        4
+    } else {
+        5
+    }
+}
+
+/// One row of ISO/IEC 11172-3:1993 Table C.4 "Layer II scalefactor
+/// transmission patterns": for a `(class1, class2)` pair this records
+/// which of the three computed scalefactors the *encoder actually uses*
+/// (`pick`, where `0`/`1`/`2` select the first/second/third computed
+/// scalefactor and `3` selects the maximum — i.e. the largest multiplier
+/// = smallest index — of the three, the spec's value "4"), and the 2-bit
+/// `scfsi` "selection information" code that tells the decoder how many
+/// scalefactors are transmitted and how they are replayed across the
+/// three parts.
+///
+/// The `pick` triple is applied to the three computed indices to obtain
+/// the three *used* indices (collapsing equal neighbours), and `scfsi`
+/// then governs how many are written:
+///
+/// * `0b00` — three transmitted (parts 0, 1, 2 independent)
+/// * `0b01` — two transmitted: one for parts 0 & 1, one for part 2
+/// * `0b10` — one transmitted: replayed across all three parts
+/// * `0b11` — two transmitted: one for part 0, one for parts 1 & 2
+#[derive(Debug, Clone, Copy)]
+struct Layer2ScfsiPattern {
+    /// `pick[part]` selects the source of the *used* scalefactor for
+    /// each of the three parts: `0`/`1`/`2` = first/second/third
+    /// computed index, `3` = max-multiplier (min index) of the three.
+    pick: [u8; 3],
+    /// The 2-bit §C.1.5.2.6 SCFSI code.
+    scfsi: u8,
+}
+
+/// ISO/IEC 11172-3:1993 Table C.4, indexed `[class1 - 1][class2 - 1]`
+/// (`class1`, `class2` each 1..=5). Transcribed column-by-column from
+/// the 400-DPI page render of the in-repo PDF (Table C.4, printed
+/// page 76 / PDF page 82). Columns mapped:
+///
+/// * "Scalefactors used in encoder" → [`Layer2ScfsiPattern::pick`]
+///   (the spec's `1`/`2`/`3` → `0`/`1`/`2`; the spec's `4` → `3`).
+/// * "Selection Information" → [`Layer2ScfsiPattern::scfsi`].
+///
+/// (The spec's third "Transmission pattern" column is redundant with the
+/// scfsi code — it merely lists the parts the decoder reads — so it is
+/// not stored.)
+const LAYER2_SCFSI_TABLE_C4: [[Layer2ScfsiPattern; 5]; 5] = {
+    // Helper to keep the rows readable; const fn closures are not
+    // available, so spell each entry out.
+    macro_rules! p {
+        ($a:expr, $b:expr, $c:expr, $s:expr) => {
+            Layer2ScfsiPattern {
+                pick: [$a, $b, $c],
+                scfsi: $s,
+            }
+        };
+    }
+    [
+        // class1 = 1
+        [
+            p!(0, 1, 2, 0b00), // c2=1: used 1 2 3, scfsi 00
+            p!(0, 1, 1, 0b11), // c2=2: used 1 2 2, scfsi 11
+            p!(0, 1, 1, 0b11), // c2=3: used 1 2 2, scfsi 11
+            p!(0, 2, 2, 0b11), // c2=4: used 1 3 3, scfsi 11
+            p!(0, 1, 2, 0b00), // c2=5: used 1 2 3, scfsi 00
+        ],
+        // class1 = 2
+        [
+            p!(0, 0, 2, 0b01), // c2=1: used 1 1 3, scfsi 01
+            p!(0, 0, 0, 0b10), // c2=2: used 1 1 1, scfsi 10
+            p!(0, 0, 0, 0b10), // c2=3: used 1 1 1, scfsi 10
+            p!(3, 3, 3, 0b10), // c2=4: used 4 4 4, scfsi 10
+            p!(0, 0, 2, 0b01), // c2=5: used 1 1 3, scfsi 01
+        ],
+        // class1 = 3
+        [
+            p!(0, 0, 0, 0b10), // c2=1: used 1 1 1, scfsi 10
+            p!(0, 0, 0, 0b10), // c2=2: used 1 1 1, scfsi 10
+            p!(0, 0, 0, 0b10), // c2=3: used 1 1 1, scfsi 10
+            p!(2, 2, 2, 0b10), // c2=4: used 3 3 3, scfsi 10
+            p!(0, 0, 2, 0b01), // c2=5: used 1 1 3, scfsi 01
+        ],
+        // class1 = 4
+        [
+            p!(1, 1, 1, 0b10), // c2=1: used 2 2 2, scfsi 10
+            p!(1, 1, 1, 0b10), // c2=2: used 2 2 2, scfsi 10
+            p!(1, 1, 1, 0b10), // c2=3: used 2 2 2, scfsi 10
+            p!(2, 2, 2, 0b10), // c2=4: used 3 3 3, scfsi 10
+            p!(0, 1, 2, 0b00), // c2=5: used 1 2 3, scfsi 00
+        ],
+        // class1 = 5
+        [
+            p!(0, 1, 2, 0b00), // c2=1: used 1 2 3, scfsi 00
+            p!(0, 1, 1, 0b11), // c2=2: used 1 2 2, scfsi 11
+            p!(0, 1, 1, 0b11), // c2=3: used 1 2 2, scfsi 11
+            p!(0, 2, 2, 0b11), // c2=4: used 1 3 3, scfsi 11
+            p!(0, 1, 2, 0b00), // c2=5: used 1 2 3, scfsi 00
+        ],
+    ]
+};
+
+/// Apply the §C.1.5.2.5 / Table C.4 SCFSI selection to one subband's
+/// three computed scalefactor indices.
+///
+/// Given `scf` = the three Table 3-B.1 indices computed for parts 0/1/2
+/// by [`select_layer2_scalefactors`] (each 0..=62), this:
+///
+/// 1. computes `dscf1 = scf[0] − scf[1]` and `dscf2 = scf[1] − scf[2]`
+///    and their §C.1.5.2.5 classes;
+/// 2. looks up Table C.4 at `[class1 - 1][class2 - 1]` for the
+///    "scalefactors used in encoder" pattern and the `scfsi` code;
+/// 3. rewrites the three indices to the *used* values (collapsing equal
+///    neighbours so the [`write_layer2_scalefactor_field`] consistency
+///    pre-flight accepts them), where the spec's "4" picks the maximum
+///    multiplier — i.e. the **minimum** index — of the three.
+///
+/// Returns `(scfsi_code, used_indices)`. The `used_indices` triple is
+/// laid out so that the parts a given `scfsi` code collapses are already
+/// equal:
+///
+/// * `0b01`: `used[0] == used[1]` (writer emits `used[0]`, `used[2]`)
+/// * `0b10`: `used[0] == used[1] == used[2]`
+/// * `0b11`: `used[1] == used[2]` (writer emits `used[0]`, `used[1]`)
+///
+/// so the returned triple feeds [`Layer2ScalefactorFieldInput`] directly
+/// alongside the returned `scfsi`.
+pub fn select_layer2_scfsi(scf: [u8; 3]) -> (u8, [u8; 3]) {
+    let dscf1 = scf[0] as i32 - scf[1] as i32;
+    let dscf2 = scf[1] as i32 - scf[2] as i32;
+    let class1 = layer2_dscf_class(dscf1);
+    let class2 = layer2_dscf_class(dscf2);
+    let pat = LAYER2_SCFSI_TABLE_C4[(class1 - 1) as usize][(class2 - 1) as usize];
+    // The spec's "4" (pick == 3) selects the maximum *scalefactor* =
+    // maximum multiplier = minimum Table 3-B.1 index of the three.
+    let max_sf_index = scf[0].min(scf[1]).min(scf[2]);
+    let mut used = [0u8; 3];
+    for (part, &pick) in pat.pick.iter().enumerate() {
+        used[part] = match pick {
+            0..=2 => scf[pick as usize],
+            _ => max_sf_index,
+        };
+    }
+    (pat.scfsi, used)
 }
 
 // ---- Layer II bit allocation (§C.1.5.2.7) ----------------------
@@ -545,11 +719,11 @@ fn layer2_class_cost_bits(class: &QuantClass) -> usize {
 /// plus, conservatively, three 6-bit scalefactor indices (the maximum
 /// the §C.1.5.2.5 / Table C.4 selection logic can choose).
 ///
-/// The Table C.4 SCFSI selection table is rendered as an image in the
-/// PDF that the staging text layer cannot extract reliably, so this
-/// encoder writes the worst-case `scfsi == '00'` (three scalefactors)
-/// for every allocated subband. That keeps the encoder's allocation
-/// fit-check sound at the cost of slightly underspending the budget on
+/// The §C.1.5.2.5 / Table C.4 SCFSI selection ([`select_layer2_scfsi`])
+/// may collapse the three scalefactors to one or two, but this allocator
+/// reserves the worst-case three-scalefactor cost for every allocated
+/// subband. That keeps the allocation fit-check sound (the collapsed cost
+/// is never larger) at the cost of slightly underspending the budget on
 /// signals whose successive scalefactors collapse — see the per-frame
 /// "bsel + bscf" terms in the §C.1.5.2.7 budget formula.
 const LAYER2_PER_SUBBAND_OVERHEAD_BITS: usize = 2 + 3 * 6;
@@ -624,13 +798,14 @@ fn layer2_next_alloc(
 /// > a non-zero number of bits is assigned to a subband for the first
 /// > time, bsel has to be updated, and bscf has to be updated.
 ///
-/// Since the perceptual SMR depends on the Annex D model that this
-/// crate documents as a DOCS-GAP, the encoder substitutes a signal-
-/// energy proxy: `MNR = SNR(nlevels) − 20·log10(peak)`. The §C.1.5.2.7
-/// "first non-zero allocation" overhead is the 2-bit scfsi plus three
-/// 6-bit scalefactor indices (the Table C.4 SCFSI selection is a
-/// DOCS-GAP; the encoder writes `scfsi == '00'` so the cost is
-/// independent of the input signal).
+/// Since the full Annex D psychoacoustic model is not yet wired into
+/// allocation, the encoder substitutes a signal-energy proxy:
+/// `MNR = SNR(nlevels) − 20·log10(peak)`. The §C.1.5.2.7 "first non-zero
+/// allocation" overhead is reserved as the 2-bit scfsi plus three 6-bit
+/// scalefactor indices — the worst case the §C.1.5.2.5 / Table C.4 SCFSI
+/// selection ([`select_layer2_scfsi`]) can choose. The actual frame may
+/// collapse some subbands to one or two scalefactors, so this bound is
+/// conservative (never under-reserves), keeping the fit-check sound.
 ///
 /// Subbands at or above `table.sblimit()` are forced to allocation `0`.
 // The §C.1.5.2.7 allocator is naturally an index-driven (ch, sb) double
@@ -2258,11 +2433,41 @@ fn encode_layer2_frame_inner(
         }
     }
 
+    // §C.1.5.2.5 / §C.1.5.2.6 (Table C.4) SCFSI selection. For every
+    // allocated (ch, sb) the three computed per-part scalefactor indices
+    // are run through [`select_layer2_scfsi`], which classifies the two
+    // successive differences and looks up Table C.4 to decide which of
+    // the three scalefactors the encoder actually uses (collapsing equal
+    // neighbours) and the 2-bit `scfsi` selection code that tells the
+    // decoder how many are transmitted. The collapsed indices feed BOTH
+    // quantization (so the decoder reconstructs with the same scalefactor
+    // the encoder quantized against) and the §2.4.1.6 writer. Subbands
+    // with `alloc == 0` keep the as-computed indices and `scfsi == 0b00`
+    // (never emitted). The upper intensity-stereo band shares channel 0's
+    // selection.
+    let mut scfsi_codes = [[0u8; SUBBANDS]; 2];
+    let mut used_scf_indices = scf_indices;
+    for ch in 0..nch {
+        for sb in 0..sblimit {
+            let upper_band = sb >= bound;
+            if upper_band && ch != 0 {
+                continue;
+            }
+            if alloc[ch][sb] == 0 {
+                continue;
+            }
+            let (code, used) = select_layer2_scfsi(scf_indices[ch][sb]);
+            scfsi_codes[ch][sb] = code;
+            used_scf_indices[ch][sb] = used;
+        }
+    }
+
     // §C.1.5.2 quantization — build the per-(ch, gr, sb) triplet of raw
     // codes the §2.4.1.6 writer consumes. The §2.4.2.6 SCFSI schedule
     // splits the 36 slots into three 12-slot scalefactor parts (part =
     // slot / 12); the chosen scalefactor for the corresponding part
-    // normalises each sample before quantization.
+    // normalises each sample before quantization. The part scalefactor is
+    // the *used* (Table C.4-collapsed) index so encoder and decoder agree.
     let mut samples_input = Layer2SamplesFieldInput::default();
     for ch in 0..nch {
         for sb in 0..sblimit {
@@ -2285,7 +2490,7 @@ fn encode_layer2_frame_inner(
                 for s in 0..3 {
                     let slot = gr * 3 + s;
                     let part = slot / 12;
-                    let scf = SCALEFACTORS[scf_indices[ch][sb][part] as usize];
+                    let scf = SCALEFACTORS[used_scf_indices[ch][sb][part] as usize];
                     let value = subbands[ch][sb][slot];
                     samples_input.codes[ch][gr][sb][s] = quantize_layer2_sample(value, scf, class);
                 }
@@ -2293,14 +2498,16 @@ fn encode_layer2_frame_inner(
         }
     }
 
-    // §2.4.2.6 SCFSI: every allocated (ch, sb) carries `0b00` (three
-    // independent scalefactors per part). Table C.4's perceptual collapse
-    // is a PDF-image DOCS-GAP; the worst-case bookkeeping
-    // [`allocate_bits_layer2`] already assumes is exactly this
-    // three-scalefactor cost, so the budget stays sound.
+    // §2.4.2.6 SCFSI: the per-(ch, sb) Table C.4 selection code plus the
+    // collapsed scalefactor indices. [`select_layer2_scfsi`] lays the
+    // collapsed triple out so the parts each `scfsi` code replays are
+    // already equal, satisfying [`write_layer2_scalefactor_field`]'s
+    // consistency pre-flight. The worst-case three-scalefactor cost the
+    // [`allocate_bits_layer2`] bookkeeping reserves still bounds the
+    // collapsed cost (one/two scalefactors), so the budget stays sound.
     let scalefactor_input = Layer2ScalefactorFieldInput {
-        scfsi: [[0u8; SUBBANDS]; 2],
-        scalefactor_indices: scf_indices,
+        scfsi: scfsi_codes,
+        scalefactor_indices: used_scf_indices,
     };
 
     // §C.1.5.1.10-style frame assembly: write each region MSB-first,
@@ -2315,8 +2522,10 @@ fn encode_layer2_frame_inner(
     }
     write_layer2_allocation_field(&mut bw, table, &alloc, nch, bound)
         .expect("allocate_bits_layer2 + layer2_stereo_bound produce shapes the writer accepts");
-    write_layer2_scalefactor_field(&mut bw, table, &alloc, &scalefactor_input, nch, bound)
-        .expect("select_layer2_scalefactors emits indices < 63 and scfsi=0b00 is consistent");
+    write_layer2_scalefactor_field(&mut bw, table, &alloc, &scalefactor_input, nch, bound).expect(
+        "select_layer2_scalefactors emits indices < 63 and select_layer2_scfsi collapses parts \
+         consistently with the chosen scfsi code",
+    );
     write_layer2_samples_field(&mut bw, table, &alloc, &samples_input, nch, bound).expect(
         "quantize_layer2_sample clamps codes to [0, nlevels) so the samples writer accepts them",
     );
@@ -6072,5 +6281,177 @@ mod tests {
             &payload,
             "§2.4.1.8 payload must appear at the differing-byte boundary"
         );
+    }
+
+    // ---- §C.1.5.2.5 / Table C.4 SCFSI selection -------------------
+
+    #[test]
+    fn dscf_class_boundaries_match_spec_table() {
+        // ISO 11172-3 §C.1.5.2.5 class boundaries (page-render transcript):
+        //   1: dscf <= -3 ; 2: -3 < dscf < 0 ; 3: dscf == 0 ;
+        //   4: 0 < dscf < 3 ; 5: dscf >= 3.
+        assert_eq!(layer2_dscf_class(-100), 1);
+        assert_eq!(layer2_dscf_class(-3), 1);
+        assert_eq!(layer2_dscf_class(-2), 2);
+        assert_eq!(layer2_dscf_class(-1), 2);
+        assert_eq!(layer2_dscf_class(0), 3);
+        assert_eq!(layer2_dscf_class(1), 4);
+        assert_eq!(layer2_dscf_class(2), 4);
+        assert_eq!(layer2_dscf_class(3), 5);
+        assert_eq!(layer2_dscf_class(100), 5);
+    }
+
+    #[test]
+    fn scfsi_codes_are_two_bit() {
+        for c1 in 0..5 {
+            for c2 in 0..5 {
+                let s = LAYER2_SCFSI_TABLE_C4[c1][c2].scfsi;
+                assert!(s < 4, "scfsi {s} out of range at [{c1}][{c2}]");
+                for &p in &LAYER2_SCFSI_TABLE_C4[c1][c2].pick {
+                    assert!(p <= 3, "pick {p} out of range at [{c1}][{c2}]");
+                }
+            }
+        }
+    }
+
+    /// The collapsed triple a given scfsi code returns must already have
+    /// the parts that code replays set equal — that is exactly the
+    /// invariant [`write_layer2_scalefactor_field`] pre-flights, so this
+    /// guards that [`select_layer2_scfsi`] never produces a triple the
+    /// writer would reject.
+    #[test]
+    fn scfsi_collapsed_triple_satisfies_writer_invariant() {
+        // Exercise a spread of index triples that hit all 25 class
+        // pairs: vary each part across a few representative indices.
+        let probes = [0u8, 1, 2, 3, 5, 8, 20, 40, 62];
+        for &a in &probes {
+            for &b in &probes {
+                for &c in &probes {
+                    let (code, used) = select_layer2_scfsi([a, b, c]);
+                    match code {
+                        0b00 => {} // three independent, no constraint
+                        0b01 => assert_eq!(
+                            used[0], used[1],
+                            "scfsi 01 must collapse parts 0+1 for [{a},{b},{c}]"
+                        ),
+                        0b10 => {
+                            assert_eq!(used[0], used[1]);
+                            assert_eq!(
+                                used[1], used[2],
+                                "scfsi 10 must collapse all three for [{a},{b},{c}]"
+                            );
+                        }
+                        0b11 => assert_eq!(
+                            used[1], used[2],
+                            "scfsi 11 must collapse parts 1+2 for [{a},{b},{c}]"
+                        ),
+                        other => panic!("unexpected scfsi {other}"),
+                    }
+                    // Every used index stays a legal Table 3-B.1 entry.
+                    for &u in &used {
+                        assert!(u <= MAX_SCF_INDEX as u8);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scfsi_table_c4_spot_rows() {
+        // (class1, class2) -> (scfsi, pattern of "used" sources).
+        // Build index triples that land on a chosen (class1, class2).
+        // class is computed from dscf1 = scf0-scf1, dscf2 = scf1-scf2.
+
+        // class1=1 (dscf1<=-3), class2=1 (dscf2<=-3): scf rising sharply
+        //   e.g. [0, 5, 10] -> dscf1=-5, dscf2=-5 -> (1,1).
+        //   Table C.4: used "1 2 3", scfsi 00 (three transmitted).
+        let (s, used) = select_layer2_scfsi([0, 5, 10]);
+        assert_eq!(s, 0b00);
+        assert_eq!(used, [0, 5, 10]);
+
+        // class1=3 (dscf1==0), class2=3 (dscf2==0): all equal -> (3,3).
+        //   Table C.4: used "1 1 1", scfsi 10 (one transmitted).
+        let (s, used) = select_layer2_scfsi([7, 7, 7]);
+        assert_eq!(s, 0b10);
+        assert_eq!(used, [7, 7, 7]);
+
+        // class1=1 (dscf1<=-3), class2=2 (-3<dscf2<0): [2, 6, 7]
+        //   dscf1 = -4 (class1=1), dscf2 = -1 (class2=2) -> (1,2).
+        //   Table C.4: used "1 2 2", scfsi 11 -> used[1]==used[2]==scf[1].
+        let (s, used) = select_layer2_scfsi([2, 6, 7]);
+        assert_eq!(s, 0b11);
+        assert_eq!(used, [2, 6, 6]);
+
+        // class1=2 (-3<dscf1<0), class2=1 (dscf2<=-3): [4, 6, 10]
+        //   dscf1 = -2 (class1=2), dscf2 = -4 (class2=1) -> (2,1).
+        //   Table C.4: used "1 1 3", scfsi 01 -> used[0]==used[1]==scf[0].
+        let (s, used) = select_layer2_scfsi([4, 6, 10]);
+        assert_eq!(s, 0b01);
+        assert_eq!(used, [4, 4, 10]);
+
+        // class1=2, class2=4: [4, 6, 5] -> dscf1=-2 (c1=2), dscf2=1 (c2=4)
+        //   -> (2,4). Table C.4: used "4 4 4" (max multiplier = min index),
+        //   scfsi 10. min(4,6,5)=4 -> all parts = 4.
+        let (s, used) = select_layer2_scfsi([4, 6, 5]);
+        assert_eq!(s, 0b10);
+        assert_eq!(used, [4, 4, 4]);
+
+        // class1=4, class2=1: [6, 4, 8] -> dscf1=2 (c1=4), dscf2=-4 (c2=1)
+        //   -> (4,1). Table C.4: used "2 2 2", scfsi 10 -> all parts=scf[1].
+        let (s, used) = select_layer2_scfsi([6, 4, 8]);
+        assert_eq!(s, 0b10);
+        assert_eq!(used, [4, 4, 4]);
+    }
+
+    /// Drive the SCFSI-collapsed scalefactor field through the §2.4.1.6
+    /// writer and the [`crate::decode_layer2`] reader and confirm the
+    /// decoder reconstructs the same per-part scalefactor indices the
+    /// encoder selected — i.e. the collapse is lossless under the chosen
+    /// scfsi code.
+    #[test]
+    fn scfsi_collapsed_field_round_trips_through_writer_and_reader() {
+        use crate::decode::BitReader;
+        use crate::tables_layer2::layer2_bit_allocation_table;
+
+        // A simple mono MPEG-1 Layer II header (48 kHz, 128 kbit/s).
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let header_bytes = pack_layer2_header(&params).expect("pack header");
+        let header = FrameHeader::parse(&header_bytes).expect("parse header");
+        let table = layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let nch = 1usize;
+        let bound = sblimit;
+
+        // Allocate subband 0 only, and feed three computed indices that
+        // hit a collapsing class pair (1,2) -> scfsi 11.
+        let mut alloc = [[0u8; SUBBANDS]; 2];
+        // Find a legal non-zero allocation for sb 0.
+        let (a0, _) = layer2_next_alloc(table, 0, 0).expect("sb0 has a level");
+        alloc[0][0] = a0;
+
+        let computed = [2u8, 6, 7];
+        let (code, used) = select_layer2_scfsi(computed);
+        assert_eq!(code, 0b11);
+
+        let mut sf_in = Layer2ScalefactorFieldInput::default();
+        sf_in.scfsi[0][0] = code;
+        sf_in.scalefactor_indices[0][0] = used;
+
+        let mut bw = BitWriter::new();
+        write_layer2_scalefactor_field(&mut bw, table, &alloc, &sf_in, nch, bound)
+            .expect("collapsed field is consistent");
+        let bytes = bw.finish();
+
+        // Read it back: phase 1 scfsi (sb-major/ch-minor over allocated),
+        // phase 2 scalefactors per the §2.4.2.6 schedule.
+        let mut rd = BitReader::new(&bytes);
+        let got_scfsi = rd.read_bits(2).expect("scfsi") as u8;
+        assert_eq!(got_scfsi, code);
+        // scfsi 11: two scalefactors — part0, then parts 1&2 share.
+        let p0 = rd.read_bits(6).expect("scf part0") as u8;
+        let p12 = rd.read_bits(6).expect("scf parts 1+2") as u8;
+        assert_eq!(p0, used[0]);
+        assert_eq!(p12, used[1]);
+        assert_eq!(used[1], used[2], "scfsi 11 collapse invariant");
     }
 }

@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.2.5 / §C.1.5.2.6 / Table C.4 — Layer II perceptual SCFSI
+  selection.** The Layer II encoder previously emitted `scfsi == 0b00`
+  (three independent scalefactors) for every allocated subband. It now
+  implements the ISO/IEC 11172-3 §C.1.5.2.5 scalefactor coding:
+  `select_layer2_scfsi([u8; 3]) -> (u8, [u8; 3])` classifies the two
+  successive scalefactor-index differences `dscf1 = scf0−scf1`,
+  `dscf2 = scf1−scf2` into the five §C.1.5.2.5 difference classes,
+  looks up Table C.4 ("Layer II scalefactor transmission patterns",
+  transcribed from the 400-DPI render of the in-repo ISO PDF page 82)
+  for the "scalefactors used in encoder" pattern (where the spec's "4"
+  selects the maximum-multiplier / minimum-index of the three) and the
+  2-bit `scfsi` "selection information" code, and collapses the three
+  scalefactors to one or two where the pattern allows. The collapsed
+  indices drive **both** sample quantization (so the decoder reconstructs
+  with the same scalefactor the encoder quantized against) and the
+  §2.4.1.6 scfsi+scalefactor writer; the writer's consistency pre-flight
+  is satisfied by construction. The §C.1.5.2.7 allocator continues to
+  reserve the worst-case three-scalefactor cost, so the budget fit-check
+  stays sound while the emitted frame collapses redundant scalefactors.
+  **+5 lib-tests** cover the §C.1.5.2.5 class boundaries, the 2-bit
+  range of every Table C.4 entry, the writer-invariant (collapsed parts
+  pre-equalised) across a 9³ probe sweep, six hand-verified Table C.4
+  rows, and a write→read round-trip confirming the decoder recovers the
+  selected per-part indices losslessly. Closes the README "Not yet
+  supported" §C.1.5.2.5 / Table C.4 frontier item.
+
 - **Annex D clause D.2.3 — Model 2 spread-excitation application
   (Fs = 32 kHz).** `psy::model2_spread_energy_32k(&[f64]) -> Option<Vec<f64>>`
   applies the energy-conserving spreading operator (the already-landed
