@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Table D.1a — complete 108-row threshold-in-quiet table
+  (Layer I, Fs = 32 kHz).** The `psy` module previously carried this
+  absolute-threshold (LTq) table as a 6-row partial anchor (rows 1–5 +
+  108), with the body `i = 6..=107` marked DOCS-GAP behind a PNG render.
+  The docs collaborator's Annex-D extraction round (`docs` #129) staged
+  the full table as text in
+  `docs/audio/mp3/annex-d-table-D1a-threshold-32kHz.csv`; all 108 rows
+  (1-based index, FFT-line frequency, critical-band rate in Bark, and
+  the absolute-threshold dB) are now transcribed into the `LTQ_L1_32K`
+  const. `ltq_layer1_32k(i)` resolves every printed index `1..=108` by
+  direct slot lookup (`LTQ_L1_32K[i - 1]`) instead of returning `None`
+  for the former gap body. New tests verify dense 1-based numbering,
+  strictly-monotonic frequency/Bark, the non-monotonic LTq column's
+  global minimum of `-4.97 dB` at `i = 51`, the 62,5 Hz head grid
+  through `i = 48`, and full cross-checks against every Table D.2a band
+  boundary. The 44,1 / 48 kHz Layer I tables (D.1b/c) and the Layer II
+  tables (D.1d–f) are staged as CSVs but not yet transcribed.
+
 - **§C.1.5.2.5 / §C.1.5.2.6 / Table C.4 — Layer II perceptual SCFSI
   selection.** The Layer II encoder previously emitted `scfsi == 0b00`
   (three independent scalefactors) for every allocated subband. It now

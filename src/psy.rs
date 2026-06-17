@@ -14,14 +14,14 @@
 //!   renders), the **Step 6 av / vf masking coefficients** (text-layer
 //!   readable), the **Step 7 global-threshold formula**, and **Table
 //!   D.5** (Layer I / Layer II coder partition table — text-extracted).
-//! * The same file points at PNG renders of Tables D.1a-f, D.3a-c, and
-//!   D.4a-c — those dense pages still live behind renders the text
-//!   layer does not preserve. The text-anchored slices that *are*
-//!   transcribed there land here as partial consts
-//!   ([`CALC_PARTITION_32K`] — the **complete** 49-row D.3a table;
-//!   [`LTQ_L1_32K_PARTIAL`] — rows 1..=5 + 108 of D.1a); the
-//!   remaining LTq body is DOCS-GAP for a later round and does not
-//!   block the formulas below.
+//! * The docs collaborator's Annex-D extraction round (docs `#129`)
+//!   completed the previously PNG-only dense pages as text/CSV under
+//!   `docs/audio/mp3/annex-d-table-D{1,3,4}{a..f}-*.csv`. The
+//!   text-anchored tables land here as complete consts
+//!   ([`CALC_PARTITION_32K`] — the 49-row D.3a table;
+//!   [`LTQ_L1_32K`] — the full 108-row D.1a threshold-in-quiet
+//!   table). The 44,1 / 48 kHz siblings (D.1b–f, D.3b–c, D.4b–c)
+//!   are staged as CSVs but not yet transcribed into Rust consts.
 //!
 //! ### What this module provides
 //!
@@ -41,9 +41,11 @@
 //!
 //! No allocator wiring is changed in this round; the existing
 //! [`crate::encode::allocate_bits`] path still drives subband bits
-//! from signal energy. Wiring the global masking threshold into the
-//! allocator requires Tables D.1 (threshold-in-quiet) and D.3 / D.4
-//! (Model 2 partition + per-line LTq), which remain PNG-only.
+//! from signal energy. The 32 kHz Layer I threshold-in-quiet table
+//! ([`LTQ_L1_32K`]) and Model 2 partition table
+//! ([`CALC_PARTITION_32K`]) are the building blocks an Annex D
+//! allocator would consume; the 44,1 / 48 kHz LTq and D.4 per-line
+//! tables remain to be transcribed before the full model is wired.
 
 use crate::header::Layer;
 
@@ -2120,20 +2122,30 @@ pub const LTQ_LAYER1_FULL_LEN: usize = 108;
 /// clause D.1 prose: 132 entries.
 pub const LTQ_LAYER2_FULL_LEN: usize = 132;
 
-/// Annex D Table D.1a — threshold in quiet for **Layer I** at
-/// **Fs = 32 kHz**, partial anchor carrying rows `i = 1..=5` plus
-/// the final row `i = 108` of the 108 printed in ISO/IEC 11172-3
-/// (1993) PDF page 122 (printed 116).
+/// Annex D Table D.1a — threshold in quiet (absolute threshold) for
+/// **Layer I** at **Fs = 32 kHz**, the **complete** 108-row table
+/// printed in ISO/IEC 11172-3 (1993) PDF page 122 (printed 116).
 ///
-/// The remaining 102 rows are typeset as a dense two-column page
-/// whose text layer does not extract reliably; they are staged
-/// under
-/// `docs/audio/mp3/annex-d-renders/Table-D.1a-threshold-in-quiet-LayerI-32kHz-p116.png`
-/// and remain a DOCS-GAP (as do the full D.1b–f pages). Per the
-/// docs extract the full LTq column is **non-monotonic** — a
-/// minimum near `i = 51` (≈ 3,375 kHz), rising steeply at both
-/// ends — so no interpolation across the gap is attempted here.
-pub const LTQ_L1_32K_PARTIAL: [LtqRow; 6] = [
+/// Transcribed from the docs collaborator's text extraction
+/// `docs/audio/mp3/annex-d-table-D1a-threshold-32kHz.csv`, which
+/// captures all four printed columns (1-based index `i`, FFT-line
+/// frequency in Hz, critical-band rate `z` in Bark, and the
+/// absolute-threshold `ltq_db`) cross-checked against the render
+/// `docs/audio/mp3/annex-d-renders/Table-D.1a-threshold-in-quiet-LayerI-32kHz-p116.png`.
+/// The column is **non-monotonic**: it falls to a minimum of
+/// `-4.97 dB` at `i = 51` (≈ 3,375 kHz), then climbs steeply at both
+/// ends (33,44 dB at `i = 1`, 51,04 dB at `i = 108`).
+///
+/// `i = 6..=107` were previously a DOCS-GAP carried as a 6-row
+/// partial anchor; the docs `#129`/Annex-D extraction round filled
+/// them. The companion Layer I tables D.1b (44,1 kHz) / D.1c
+/// (48 kHz) and the Layer II tables D.1d–f are likewise now staged
+/// as CSVs but are not transcribed here (32 kHz Layer I only this
+/// round).
+// The row i = 8 threshold `6.28 dB` is a spec table value, not an
+// approximation of `TAU` (6.283…); silence clippy's approx_constant.
+#[allow(clippy::approx_constant)]
+pub const LTQ_L1_32K: [LtqRow; LTQ_LAYER1_FULL_LEN] = [
     LtqRow {
         index: 1,
         freq_hz: 62.50,
@@ -2165,8 +2177,620 @@ pub const LTQ_L1_32K_PARTIAL: [LtqRow; 6] = [
         ltq_db: 9.20,
     },
     LtqRow {
+        index: 6,
+        freq_hz: 375.00,
+        bark_z: 3.618,
+        ltq_db: 7.94,
+    },
+    LtqRow {
+        index: 7,
+        freq_hz: 437.50,
+        bark_z: 4.185,
+        ltq_db: 7.00,
+    },
+    LtqRow {
+        index: 8,
+        freq_hz: 500.00,
+        bark_z: 4.736,
+        ltq_db: 6.28,
+    },
+    LtqRow {
+        index: 9,
+        freq_hz: 562.50,
+        bark_z: 5.272,
+        ltq_db: 5.70,
+    },
+    LtqRow {
+        index: 10,
+        freq_hz: 625.00,
+        bark_z: 5.789,
+        ltq_db: 5.21,
+    },
+    LtqRow {
+        index: 11,
+        freq_hz: 687.50,
+        bark_z: 6.289,
+        ltq_db: 4.80,
+    },
+    LtqRow {
+        index: 12,
+        freq_hz: 750.00,
+        bark_z: 6.770,
+        ltq_db: 4.45,
+    },
+    LtqRow {
+        index: 13,
+        freq_hz: 812.50,
+        bark_z: 7.233,
+        ltq_db: 4.14,
+    },
+    LtqRow {
+        index: 14,
+        freq_hz: 875.00,
+        bark_z: 7.677,
+        ltq_db: 3.86,
+    },
+    LtqRow {
+        index: 15,
+        freq_hz: 937.50,
+        bark_z: 8.103,
+        ltq_db: 3.61,
+    },
+    LtqRow {
+        index: 16,
+        freq_hz: 1000.00,
+        bark_z: 8.511,
+        ltq_db: 3.37,
+    },
+    LtqRow {
+        index: 17,
+        freq_hz: 1062.50,
+        bark_z: 8.901,
+        ltq_db: 3.15,
+    },
+    LtqRow {
+        index: 18,
+        freq_hz: 1125.00,
+        bark_z: 9.275,
+        ltq_db: 2.93,
+    },
+    LtqRow {
+        index: 19,
+        freq_hz: 1187.50,
+        bark_z: 9.632,
+        ltq_db: 2.73,
+    },
+    LtqRow {
+        index: 20,
+        freq_hz: 1250.00,
+        bark_z: 9.974,
+        ltq_db: 2.53,
+    },
+    LtqRow {
+        index: 21,
+        freq_hz: 1312.50,
+        bark_z: 10.301,
+        ltq_db: 2.32,
+    },
+    LtqRow {
+        index: 22,
+        freq_hz: 1375.00,
+        bark_z: 10.614,
+        ltq_db: 2.12,
+    },
+    LtqRow {
+        index: 23,
+        freq_hz: 1437.50,
+        bark_z: 10.913,
+        ltq_db: 1.92,
+    },
+    LtqRow {
+        index: 24,
+        freq_hz: 1500.00,
+        bark_z: 11.199,
+        ltq_db: 1.71,
+    },
+    LtqRow {
+        index: 25,
+        freq_hz: 1562.50,
+        bark_z: 11.474,
+        ltq_db: 1.49,
+    },
+    LtqRow {
+        index: 26,
+        freq_hz: 1625.00,
+        bark_z: 11.736,
+        ltq_db: 1.27,
+    },
+    LtqRow {
+        index: 27,
+        freq_hz: 1687.50,
+        bark_z: 11.988,
+        ltq_db: 1.04,
+    },
+    LtqRow {
+        index: 28,
+        freq_hz: 1750.00,
+        bark_z: 12.230,
+        ltq_db: 0.80,
+    },
+    LtqRow {
+        index: 29,
+        freq_hz: 1812.50,
+        bark_z: 12.461,
+        ltq_db: 0.55,
+    },
+    LtqRow {
+        index: 30,
+        freq_hz: 1875.00,
+        bark_z: 12.684,
+        ltq_db: 0.29,
+    },
+    LtqRow {
+        index: 31,
+        freq_hz: 1937.50,
+        bark_z: 12.898,
+        ltq_db: 0.02,
+    },
+    LtqRow {
+        index: 32,
+        freq_hz: 2000.00,
+        bark_z: 13.104,
+        ltq_db: -0.25,
+    },
+    LtqRow {
+        index: 33,
+        freq_hz: 2062.50,
+        bark_z: 13.302,
+        ltq_db: -0.54,
+    },
+    LtqRow {
+        index: 34,
+        freq_hz: 2125.00,
+        bark_z: 13.493,
+        ltq_db: -0.83,
+    },
+    LtqRow {
+        index: 35,
+        freq_hz: 2187.50,
+        bark_z: 13.678,
+        ltq_db: -1.12,
+    },
+    LtqRow {
+        index: 36,
+        freq_hz: 2250.00,
+        bark_z: 13.855,
+        ltq_db: -1.43,
+    },
+    LtqRow {
+        index: 37,
+        freq_hz: 2312.50,
+        bark_z: 14.027,
+        ltq_db: -1.73,
+    },
+    LtqRow {
+        index: 38,
+        freq_hz: 2375.00,
+        bark_z: 14.193,
+        ltq_db: -2.04,
+    },
+    LtqRow {
+        index: 39,
+        freq_hz: 2437.50,
+        bark_z: 14.354,
+        ltq_db: -2.34,
+    },
+    LtqRow {
+        index: 40,
+        freq_hz: 2500.00,
+        bark_z: 14.509,
+        ltq_db: -2.64,
+    },
+    LtqRow {
+        index: 41,
+        freq_hz: 2562.50,
+        bark_z: 14.660,
+        ltq_db: -2.93,
+    },
+    LtqRow {
+        index: 42,
+        freq_hz: 2625.00,
+        bark_z: 14.807,
+        ltq_db: -3.22,
+    },
+    LtqRow {
+        index: 43,
+        freq_hz: 2687.50,
+        bark_z: 14.949,
+        ltq_db: -3.49,
+    },
+    LtqRow {
+        index: 44,
+        freq_hz: 2750.00,
+        bark_z: 15.087,
+        ltq_db: -3.74,
+    },
+    LtqRow {
+        index: 45,
+        freq_hz: 2812.50,
+        bark_z: 15.221,
+        ltq_db: -3.98,
+    },
+    LtqRow {
+        index: 46,
+        freq_hz: 2875.00,
+        bark_z: 15.351,
+        ltq_db: -4.20,
+    },
+    LtqRow {
+        index: 47,
+        freq_hz: 2937.50,
+        bark_z: 15.478,
+        ltq_db: -4.40,
+    },
+    LtqRow {
+        index: 48,
+        freq_hz: 3000.00,
+        bark_z: 15.602,
+        ltq_db: -4.57,
+    },
+    LtqRow {
+        index: 49,
+        freq_hz: 3125.00,
+        bark_z: 15.841,
+        ltq_db: -4.82,
+    },
+    LtqRow {
+        index: 50,
+        freq_hz: 3250.00,
+        bark_z: 16.069,
+        ltq_db: -4.96,
+    },
+    LtqRow {
+        index: 51,
+        freq_hz: 3375.00,
+        bark_z: 16.287,
+        ltq_db: -4.97,
+    },
+    LtqRow {
+        index: 52,
+        freq_hz: 3500.00,
+        bark_z: 16.496,
+        ltq_db: -4.86,
+    },
+    LtqRow {
+        index: 53,
+        freq_hz: 3625.00,
+        bark_z: 16.697,
+        ltq_db: -4.63,
+    },
+    LtqRow {
+        index: 54,
+        freq_hz: 3750.00,
+        bark_z: 16.891,
+        ltq_db: -4.29,
+    },
+    LtqRow {
+        index: 55,
+        freq_hz: 3875.00,
+        bark_z: 17.078,
+        ltq_db: -3.87,
+    },
+    LtqRow {
+        index: 56,
+        freq_hz: 4000.00,
+        bark_z: 17.259,
+        ltq_db: -3.39,
+    },
+    LtqRow {
+        index: 57,
+        freq_hz: 4125.00,
+        bark_z: 17.434,
+        ltq_db: -2.86,
+    },
+    LtqRow {
+        index: 58,
+        freq_hz: 4250.00,
+        bark_z: 17.605,
+        ltq_db: -2.31,
+    },
+    LtqRow {
+        index: 59,
+        freq_hz: 4375.00,
+        bark_z: 17.770,
+        ltq_db: -1.77,
+    },
+    LtqRow {
+        index: 60,
+        freq_hz: 4500.00,
+        bark_z: 17.932,
+        ltq_db: -1.24,
+    },
+    LtqRow {
+        index: 61,
+        freq_hz: 4625.00,
+        bark_z: 18.089,
+        ltq_db: -0.74,
+    },
+    LtqRow {
+        index: 62,
+        freq_hz: 4750.00,
+        bark_z: 18.242,
+        ltq_db: -0.29,
+    },
+    LtqRow {
+        index: 63,
+        freq_hz: 4875.00,
+        bark_z: 18.392,
+        ltq_db: 0.12,
+    },
+    LtqRow {
+        index: 64,
+        freq_hz: 5000.00,
+        bark_z: 18.539,
+        ltq_db: 0.48,
+    },
+    LtqRow {
+        index: 65,
+        freq_hz: 5125.00,
+        bark_z: 18.682,
+        ltq_db: 0.79,
+    },
+    LtqRow {
+        index: 66,
+        freq_hz: 5250.00,
+        bark_z: 18.823,
+        ltq_db: 1.06,
+    },
+    LtqRow {
+        index: 67,
+        freq_hz: 5375.00,
+        bark_z: 18.960,
+        ltq_db: 1.29,
+    },
+    LtqRow {
+        index: 68,
+        freq_hz: 5500.00,
+        bark_z: 19.095,
+        ltq_db: 1.49,
+    },
+    LtqRow {
+        index: 69,
+        freq_hz: 5625.00,
+        bark_z: 19.226,
+        ltq_db: 1.66,
+    },
+    LtqRow {
+        index: 70,
+        freq_hz: 5750.00,
+        bark_z: 19.356,
+        ltq_db: 1.81,
+    },
+    LtqRow {
+        index: 71,
+        freq_hz: 5875.00,
+        bark_z: 19.482,
+        ltq_db: 1.95,
+    },
+    LtqRow {
+        index: 72,
+        freq_hz: 6000.00,
+        bark_z: 19.606,
+        ltq_db: 2.08,
+    },
+    LtqRow {
+        index: 73,
+        freq_hz: 6250.00,
+        bark_z: 19.847,
+        ltq_db: 2.33,
+    },
+    LtqRow {
+        index: 74,
+        freq_hz: 6500.00,
+        bark_z: 20.079,
+        ltq_db: 2.59,
+    },
+    LtqRow {
+        index: 75,
+        freq_hz: 6750.00,
+        bark_z: 20.300,
+        ltq_db: 2.86,
+    },
+    LtqRow {
+        index: 76,
+        freq_hz: 7000.00,
+        bark_z: 20.513,
+        ltq_db: 3.17,
+    },
+    LtqRow {
+        index: 77,
+        freq_hz: 7250.00,
+        bark_z: 20.717,
+        ltq_db: 3.51,
+    },
+    LtqRow {
+        index: 78,
+        freq_hz: 7500.00,
+        bark_z: 20.912,
+        ltq_db: 3.89,
+    },
+    LtqRow {
+        index: 79,
+        freq_hz: 7750.00,
+        bark_z: 21.098,
+        ltq_db: 4.31,
+    },
+    LtqRow {
+        index: 80,
+        freq_hz: 8000.00,
+        bark_z: 21.275,
+        ltq_db: 4.79,
+    },
+    LtqRow {
+        index: 81,
+        freq_hz: 8250.00,
+        bark_z: 21.445,
+        ltq_db: 5.31,
+    },
+    LtqRow {
+        index: 82,
+        freq_hz: 8500.00,
+        bark_z: 21.606,
+        ltq_db: 5.88,
+    },
+    LtqRow {
+        index: 83,
+        freq_hz: 8750.00,
+        bark_z: 21.760,
+        ltq_db: 6.50,
+    },
+    LtqRow {
+        index: 84,
+        freq_hz: 9000.00,
+        bark_z: 21.906,
+        ltq_db: 7.19,
+    },
+    LtqRow {
+        index: 85,
+        freq_hz: 9250.00,
+        bark_z: 22.046,
+        ltq_db: 7.93,
+    },
+    LtqRow {
+        index: 86,
+        freq_hz: 9500.00,
+        bark_z: 22.178,
+        ltq_db: 8.75,
+    },
+    LtqRow {
+        index: 87,
+        freq_hz: 9750.00,
+        bark_z: 22.304,
+        ltq_db: 9.63,
+    },
+    LtqRow {
+        index: 88,
+        freq_hz: 10000.00,
+        bark_z: 22.424,
+        ltq_db: 10.58,
+    },
+    LtqRow {
+        index: 89,
+        freq_hz: 10250.00,
+        bark_z: 22.538,
+        ltq_db: 11.60,
+    },
+    LtqRow {
+        index: 90,
+        freq_hz: 10500.00,
+        bark_z: 22.646,
+        ltq_db: 12.71,
+    },
+    LtqRow {
+        index: 91,
+        freq_hz: 10750.00,
+        bark_z: 22.749,
+        ltq_db: 13.90,
+    },
+    LtqRow {
+        index: 92,
+        freq_hz: 11000.00,
+        bark_z: 22.847,
+        ltq_db: 15.18,
+    },
+    LtqRow {
+        index: 93,
+        freq_hz: 11250.00,
+        bark_z: 22.941,
+        ltq_db: 16.54,
+    },
+    LtqRow {
+        index: 94,
+        freq_hz: 11500.00,
+        bark_z: 23.030,
+        ltq_db: 18.01,
+    },
+    LtqRow {
+        index: 95,
+        freq_hz: 11750.00,
+        bark_z: 23.114,
+        ltq_db: 19.57,
+    },
+    LtqRow {
+        index: 96,
+        freq_hz: 12000.00,
+        bark_z: 23.195,
+        ltq_db: 21.23,
+    },
+    LtqRow {
+        index: 97,
+        freq_hz: 12250.00,
+        bark_z: 23.272,
+        ltq_db: 23.01,
+    },
+    LtqRow {
+        index: 98,
+        freq_hz: 12500.00,
+        bark_z: 23.345,
+        ltq_db: 24.90,
+    },
+    LtqRow {
+        index: 99,
+        freq_hz: 12750.00,
+        bark_z: 23.415,
+        ltq_db: 26.90,
+    },
+    LtqRow {
+        index: 100,
+        freq_hz: 13000.00,
+        bark_z: 23.482,
+        ltq_db: 29.03,
+    },
+    LtqRow {
+        index: 101,
+        freq_hz: 13250.00,
+        bark_z: 23.546,
+        ltq_db: 31.28,
+    },
+    LtqRow {
+        index: 102,
+        freq_hz: 13500.00,
+        bark_z: 23.607,
+        ltq_db: 33.67,
+    },
+    LtqRow {
+        index: 103,
+        freq_hz: 13750.00,
+        bark_z: 23.666,
+        ltq_db: 36.19,
+    },
+    LtqRow {
+        index: 104,
+        freq_hz: 14000.00,
+        bark_z: 23.722,
+        ltq_db: 38.86,
+    },
+    LtqRow {
+        index: 105,
+        freq_hz: 14250.00,
+        bark_z: 23.775,
+        ltq_db: 41.67,
+    },
+    LtqRow {
+        index: 106,
+        freq_hz: 14500.00,
+        bark_z: 23.827,
+        ltq_db: 44.63,
+    },
+    LtqRow {
+        index: 107,
+        freq_hz: 14750.00,
+        bark_z: 23.876,
+        ltq_db: 47.76,
+    },
+    LtqRow {
         index: 108,
-        freq_hz: 15_000.00,
+        freq_hz: 15000.00,
         bark_z: 23.923,
         ltq_db: 51.04,
     },
@@ -2175,15 +2799,17 @@ pub const LTQ_L1_32K_PARTIAL: [LtqRow; 6] = [
 /// Look up a row of Annex D **Table D.1a** (Layer I, Fs = 32 kHz)
 /// by its 1-based index number `i`.
 ///
-/// Returns `Some(row)` for the anchored indices (`i ∈ 1..=5` and
-/// `i == 108`) and `None` for `i == 0` (the spec is 1-based), for
-/// the still-DOCS-GAP body `i ∈ 6..=107`, and for `i > 108` (above
-/// the printed table). Consumers wiring the Annex D allocator
-/// should treat `None` on an in-range index as "table not yet
-/// transcribed" and fall back through the energy-driven path,
-/// mirroring the [`calc_partition_32k`] contract.
+/// Returns `Some(row)` for every printed index `i ∈ 1..=108` (the
+/// table is now transcribed in full from
+/// `docs/audio/mp3/annex-d-table-D1a-threshold-32kHz.csv`) and
+/// `None` for `i == 0` (the spec is 1-based) and for `i > 108`
+/// (above the printed table). The lookup indexes directly: row `i`
+/// lives at `LTQ_L1_32K[i - 1]`.
 pub fn ltq_layer1_32k(i: u16) -> Option<LtqRow> {
-    LTQ_L1_32K_PARTIAL.iter().copied().find(|r| r.index == i)
+    if i == 0 {
+        return None;
+    }
+    LTQ_L1_32K.get((i - 1) as usize).copied()
 }
 
 /// Annex D Step 3 — per-line `LTq_used` for **Table D.1a** (Layer I,
@@ -2194,7 +2820,7 @@ pub fn ltq_layer1_32k(i: u16) -> Option<LtqRow> {
 /// `LTq_used(i) = LTq_table(i) + ltq_offset_db(per-channel rate)` —
 /// `−12 dB` for per-channel rates `>= 96` kbit/s, `0 dB` below.
 /// Returns `None` exactly when [`ltq_layer1_32k`] does (1-based
-/// underflow, the DOCS-GAP body, or above the printed table).
+/// underflow `i == 0`, or above the printed table `i > 108`).
 pub fn ltq_layer1_32k_used(i: u16, bit_rate_per_channel_kbps: u32) -> Option<f64> {
     ltq_layer1_32k(i).map(|r| step3_apply_ltq_offset(r.ltq_db, bit_rate_per_channel_kbps))
 }
@@ -3720,17 +4346,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Table D.1a — threshold-in-quiet partial anchor (Layer I,
-    // 32 kHz)
+    // Table D.1a — threshold-in-quiet, complete 108-row table
+    // (Layer I, 32 kHz)
     // -----------------------------------------------------------
 
     #[test]
-    fn d1a_partial_anchor_len_and_full_table_lens() {
-        assert_eq!(LTQ_L1_32K_PARTIAL.len(), 6);
+    fn d1a_full_table_len_and_index_numbering() {
+        assert_eq!(LTQ_L1_32K.len(), LTQ_LAYER1_FULL_LEN);
         assert_eq!(LTQ_LAYER1_FULL_LEN, 108);
         assert_eq!(LTQ_LAYER2_FULL_LEN, 132);
-        // The anchor is a strict subset — the DOCS-GAP body remains.
-        assert!(LTQ_L1_32K_PARTIAL.len() < LTQ_LAYER1_FULL_LEN);
+        // Rows are stored densely in 1-based print order: row at
+        // slot k carries index k + 1.
+        for (k, r) in LTQ_L1_32K.iter().enumerate() {
+            assert_eq!(r.index as usize, k + 1, "slot {k}");
+        }
     }
 
     #[test]
@@ -3744,8 +4373,8 @@ mod tests {
             (4, 250.00, 2.445, 11.01),
             (5, 312.50, 3.037, 9.20),
         ];
-        for (k, &(i, f, z, ltq)) in expect.iter().enumerate() {
-            let r = LTQ_L1_32K_PARTIAL[k];
+        for &(i, f, z, ltq) in &expect {
+            let r = ltq_layer1_32k(i).unwrap();
             assert_eq!(r.index, i);
             assert!((r.freq_hz - f).abs() < 1e-9, "freq at i = {i}");
             assert!((r.bark_z - z).abs() < 1e-9, "bark at i = {i}");
@@ -3755,7 +4384,7 @@ mod tests {
 
     #[test]
     fn d1a_final_row_verbatim() {
-        let r = LTQ_L1_32K_PARTIAL[5];
+        let r = ltq_layer1_32k(108).unwrap();
         assert_eq!(r.index, 108);
         assert!((r.freq_hz - 15_000.00).abs() < 1e-9);
         assert!((r.bark_z - 23.923).abs() < 1e-9);
@@ -3763,87 +4392,92 @@ mod tests {
     }
 
     #[test]
-    fn d1a_anchor_strictly_monotonic_index_freq_bark() {
-        for w in LTQ_L1_32K_PARTIAL.windows(2) {
-            assert!(w[1].index > w[0].index);
-            assert!(w[1].freq_hz > w[0].freq_hz);
-            assert!(w[1].bark_z > w[0].bark_z);
+    fn d1a_freq_and_bark_strictly_monotonic() {
+        // Frequency and Bark rise monotonically across the whole
+        // table; LTq does not (see d1a_ltq_minimum_near_i51).
+        for w in LTQ_L1_32K.windows(2) {
+            assert!(w[1].index == w[0].index + 1);
+            assert!(w[1].freq_hz > w[0].freq_hz, "freq at i = {}", w[1].index);
+            assert!(w[1].bark_z > w[0].bark_z, "bark at i = {}", w[1].index);
         }
     }
 
     #[test]
     fn d1a_head_line_spacing_62_5_hz() {
         // The head rows sit on the raw FFT-line grid: 62,5 Hz per
-        // line at Fs = 32 kHz (the table decimates only at higher
-        // indices — row 108 is at 15 kHz, far above 108 × 62,5 Hz).
-        for r in &LTQ_L1_32K_PARTIAL[..5] {
+        // line at Fs = 32 kHz. The table decimates to a 2-line grid
+        // beyond i = 48 (125 Hz spacing) and a 4-line grid beyond
+        // i = 72 (250 Hz), so only the head sits on the 62,5 Hz grid.
+        for r in &LTQ_L1_32K[..48] {
             assert!(
                 (r.freq_hz - 62.5 * f64::from(r.index)).abs() < 1e-9,
                 "head row i = {} off the 62,5 Hz grid",
                 r.index
             );
         }
-        let last = LTQ_L1_32K_PARTIAL[5];
-        assert!(last.freq_hz > 62.5 * f64::from(last.index));
     }
 
     #[test]
-    fn d1a_ltq_head_descends_tail_rises() {
-        // Per the docs-extract prose the LTq column is
-        // non-monotonic: a minimum near i = 51, rising steeply at
-        // both ends. The anchored head must therefore be strictly
-        // descending, and the final row must sit well above the
-        // head's tail value.
-        for w in LTQ_L1_32K_PARTIAL[..5].windows(2) {
-            assert!(
-                w[1].ltq_db < w[0].ltq_db,
-                "head LTq not descending at i = {}",
-                w[1].index
-            );
+    fn d1a_ltq_minimum_near_i51() {
+        // Per the docs-extract prose the LTq column is non-monotonic
+        // with a minimum near i = 51 (≈ 3,375 kHz) at -4.97 dB,
+        // rising steeply at both ends. Verify the global minimum sits
+        // exactly at i = 51 and the endpoints exceed it.
+        let min = LTQ_L1_32K
+            .iter()
+            .min_by(|a, b| a.ltq_db.partial_cmp(&b.ltq_db).unwrap())
+            .unwrap();
+        assert_eq!(min.index, 51);
+        assert!((min.ltq_db - (-4.97)).abs() < 1e-9);
+        assert!(ltq_layer1_32k(1).unwrap().ltq_db > min.ltq_db);
+        assert!(ltq_layer1_32k(108).unwrap().ltq_db > min.ltq_db);
+        // The descent to i = 51 is strictly monotonic; the ascent
+        // from i = 51 to i = 108 is strictly monotonic.
+        for w in LTQ_L1_32K[..51].windows(2) {
+            assert!(w[1].ltq_db < w[0].ltq_db, "descent at i = {}", w[1].index);
         }
-        assert!(LTQ_L1_32K_PARTIAL[5].ltq_db > LTQ_L1_32K_PARTIAL[4].ltq_db);
+        for w in LTQ_L1_32K[50..].windows(2) {
+            assert!(w[1].ltq_db > w[0].ltq_db, "ascent at i = {}", w[1].index);
+        }
     }
 
     #[test]
     fn d1a_cross_checks_against_d2a_band_boundaries() {
         // Table D.2a's `index F&CB` column points into Table D.1a;
-        // every D.2a boundary whose index is anchored here must
-        // carry the same frequency and Bark values.
+        // every D.2a boundary index must carry the same frequency and
+        // Bark values in the now-complete D.1a table.
         let bands = critical_band_table(Layer::I, 32_000).unwrap();
         let mut checked = 0;
         for b in bands {
-            if let Some(r) = ltq_layer1_32k(b.index_fcb) {
-                assert!(
-                    (r.freq_hz - b.top_freq_hz).abs() < 1e-9,
-                    "freq mismatch at index {}",
-                    b.index_fcb
-                );
-                assert!(
-                    (r.bark_z - b.bark_z).abs() < 1e-9,
-                    "bark mismatch at index {}",
-                    b.index_fcb
-                );
-                checked += 1;
-            }
+            let r = ltq_layer1_32k(b.index_fcb).expect("D.2a index into full D.1a");
+            assert!(
+                (r.freq_hz - b.top_freq_hz).abs() < 1e-9,
+                "freq mismatch at index {}",
+                b.index_fcb
+            );
+            assert!(
+                (r.bark_z - b.bark_z).abs() < 1e-9,
+                "bark mismatch at index {}",
+                b.index_fcb
+            );
+            checked += 1;
         }
-        // D.2a anchors at indices 1, 3, 5 and 108 — all four must
-        // have been cross-checked.
-        assert_eq!(checked, 4);
+        // All 24 D.2a band boundaries cross-check against D.1a.
+        assert_eq!(checked, bands.len());
     }
 
     #[test]
-    fn d1a_lookup_some_for_anchored_indices() {
-        for &i in &[1u16, 2, 3, 4, 5, 108] {
-            let r = ltq_layer1_32k(i).expect("anchored index");
+    fn d1a_lookup_some_for_every_printed_index() {
+        for i in 1u16..=108 {
+            let r = ltq_layer1_32k(i).expect("printed index");
             assert_eq!(r.index, i);
         }
     }
 
     #[test]
-    fn d1a_lookup_none_for_gap_and_out_of_range() {
-        // 1-based underflow, the DOCS-GAP body 6..=107, and indices
-        // above the printed table all miss.
-        for &i in &[0u16, 6, 7, 51, 100, 107, 109, 132, 200] {
+    fn d1a_lookup_none_out_of_range() {
+        // 1-based underflow and indices above the printed table miss.
+        for &i in &[0u16, 109, 132, 200, u16::MAX] {
             assert!(ltq_layer1_32k(i).is_none(), "i = {i}");
         }
     }
@@ -3865,8 +4499,9 @@ mod tests {
                 );
             }
         }
-        // None propagates through the composition.
-        assert!(ltq_layer1_32k_used(6, 192).is_none());
+        // None propagates through the composition for out-of-range
+        // indices.
+        assert!(ltq_layer1_32k_used(109, 192).is_none());
         assert!(ltq_layer1_32k_used(0, 192).is_none());
     }
 

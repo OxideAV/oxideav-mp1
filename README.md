@@ -54,7 +54,12 @@ and MPEG-2 LSF:
 
 The encoder uses a non-psychoacoustic signal-energy SMR proxy; the
 Annex D psychoacoustic models (Model 1 / Model 2) are partially staged
-in the `psy` module but not yet wired into bit allocation.
+in the `psy` module but not yet wired into bit allocation. Staged so
+far: the §D.2 critical-band tables (D.2a–f), the Step 6 masking-index /
+spreading-function closed forms, the Step 7 global-threshold sum, the
+Model 2 partition-domain spreading operator at 32 kHz (Table D.3a), and
+— this round — the **complete 108-row Table D.1a threshold-in-quiet
+table** for Layer I at 32 kHz.
 
 ## API
 
@@ -71,7 +76,11 @@ also selectable via `EncodeParams::with_layer(LayerSelect)`.
 - Psychoacoustic-model-driven encode quality. The §C.1.5.2.7 allocator
   uses a signal-energy SMR proxy; the Annex D psychoacoustic models
   (Model 1 / Model 2) are partially staged in `psy` but not yet wired
-  into bit allocation.
+  into bit allocation. Remaining table gaps before the model can be
+  wired: the 44,1 / 48 kHz threshold-in-quiet tables (D.1b/c) and the
+  Layer II variants (D.1d–f), the Model 2 partition tables at 44,1 /
+  48 kHz (D.3b/c), and the per-line absolute-threshold tables D.4a–c —
+  all now staged as CSVs under `docs/audio/mp3/` awaiting transcription.
 
 ## Robustness
 
