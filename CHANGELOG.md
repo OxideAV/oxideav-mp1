@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Table D.1b — complete 106-row threshold-in-quiet table
+  (Layer I, Fs = 44,1 kHz).** Following the 32 kHz D.1a table, the
+  `psy` module now carries the 44,1 kHz absolute-threshold (LTq)
+  sibling transcribed from
+  `docs/audio/mp3/annex-d-table-D1b-threshold-44k1Hz.csv` into the new
+  `LTQ_L1_44K1` const (106 rows: 1-based index, FFT-line frequency,
+  critical-band rate in Bark, and the absolute-threshold dB). The
+  44,1 kHz FFT-line grid is coarser per Bark than the 32 kHz grid, so
+  the printed table ends two rows short of D.1a's 108. New accessors
+  `ltq_layer1_44k1(i)` (direct slot lookup `LTQ_L1_44K1[i - 1]`,
+  `None` for `i == 0` and `i > 106`) and `ltq_layer1_44k1_used(i,
+  kbps)` (Step 3 LTq offset composition) mirror the 32 kHz pair. Tests
+  verify dense 1-based numbering, strictly-monotonic frequency/Bark,
+  the non-monotonic LTq column's global minimum of `-4.98 dB` at
+  `i = 39`, the 68,00 dB ceiling saturation from `i = 95`, the
+  ≈86,13 Hz head grid through `i = 48`, cross-checks against every
+  Table D.2b band boundary (with the last-digit rounding divergence
+  between the D.1 and D.2 extractions documented), and that the
+  44,1 kHz grid sits above the 32 kHz grid at every shared index. The
+  48 kHz Layer I table (D.1c) and the Layer II tables (D.1d–f) remain
+  staged as CSVs, not yet transcribed.
+
 - **Annex D Table D.1a — complete 108-row threshold-in-quiet table
   (Layer I, Fs = 32 kHz).** The `psy` module previously carried this
   absolute-threshold (LTq) table as a 6-row partial anchor (rows 1–5 +
