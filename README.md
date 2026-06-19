@@ -53,14 +53,19 @@ and MPEG-2 LSF:
   emission.
 
 The encoder uses a non-psychoacoustic signal-energy SMR proxy; the
-Annex D psychoacoustic models (Model 1 / Model 2) are partially staged
+Annex D psychoacoustic models (Model 1 / Model 2) are extensively staged
 in the `psy` module but not yet wired into bit allocation. Staged so
 far: the §D.2 critical-band tables (D.2a–f), the Step 6 masking-index /
 spreading-function closed forms, the Step 7 global-threshold sum, the
-Model 2 partition-domain spreading operator at 32 kHz (Table D.3a), the
-complete 108-row Table D.1a threshold-in-quiet table for Layer I at
-32 kHz, and — this round — the **complete 106-row Table D.1b
-threshold-in-quiet table** for Layer I at 44,1 kHz.
+Model 2 partition-domain spreading operator at **all three rates**
+(32 / 44,1 / 48 kHz, Tables D.3a–c), the **complete Layer I
+threshold-in-quiet tables D.1a–c** (108 / 106 / 102 rows at 32 / 44,1 /
+48 kHz), and — this round — the **complete Model 2 per-FFT-line
+absolute-threshold tables D.4a–c** (32 / 44,1 / 48 kHz) with O(log n)
+per-line lookup. Every Model 2 numeric table in Annex D (D.1a–c /
+D.2a–f / D.3a–c / D.4a–c) is now transcribed in tree; the Layer II
+threshold tables D.1d–f remain the only staged-but-untranscribed
+LTq family.
 
 ## API
 
@@ -76,12 +81,14 @@ also selectable via `EncodeParams::with_layer(LayerSelect)`.
 
 - Psychoacoustic-model-driven encode quality. The §C.1.5.2.7 allocator
   uses a signal-energy SMR proxy; the Annex D psychoacoustic models
-  (Model 1 / Model 2) are partially staged in `psy` but not yet wired
-  into bit allocation. Remaining table gaps before the model can be
-  wired: the 48 kHz Layer I threshold-in-quiet table (D.1c) and the
-  Layer II variants (D.1d–f), the Model 2 partition tables at 44,1 /
-  48 kHz (D.3b/c), and the per-line absolute-threshold tables D.4a–c —
-  all now staged as CSVs under `docs/audio/mp3/` awaiting transcription.
+  (Model 1 / Model 2) are extensively staged in `psy` (all D.1a–c /
+  D.2a–f / D.3a–c / D.4a–c Model 2 tables transcribed, plus the Step 6 /
+  7 closed forms and the per-rate partition spreading operator) but the
+  per-frame Model 2 driver — the FFT, the tonality/SMR estimation
+  combination rule (clause D.2.4), and the wiring of the resulting SMR
+  into the §C.1.5.2.7 allocator — is not yet assembled. The Layer II
+  threshold-in-quiet tables D.1d–f remain staged as CSVs awaiting
+  transcription.
 
 ## Robustness
 

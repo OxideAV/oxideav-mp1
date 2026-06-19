@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Tables D.4a–c — complete Model 2 per-FFT-line
+  absolute-threshold tables (32 / 44,1 / 48 kHz).** The last untranscribed
+  Model 2 Annex D table family is now in tree: the 132 / 130 / 126
+  line-range rows from
+  `docs/audio/mp3/annex-d-table-D4{a,b,c}-absolute-threshold-*.csv` are
+  carried in `ABSTHR_D4A_32K` / `ABSTHR_D4B_44K1` / `ABSTHR_D4C_48K` as
+  `AbsThrRange { line_low, line_high, absthr_db }` rows (each row maps a
+  contiguous range of 1024-point-FFT lines to a single absolute
+  threshold). A binary-search per-line lookup — `absthr_for_line_32k`,
+  `absthr_for_line_44k1`, `absthr_for_line_48k` — resolves the threshold
+  for any covered FFT line in O(log n), `None` outside. The consts carry
+  the **as-printed D.4** values, including the documented divergences
+  from the D.1 Layer II twins: D.4a's 51,03 dB final range, D.4b's
+  distinctive **69,13 dB** ceiling (vs the Model-1 68,00 dB), and D.4c's
+  68,00 dB match. Tests verify row counts, contiguous FFT-line tiling
+  from line 1, verbatim head rows, the documented ceilings/minima, and
+  that the binary-search lookup agrees with a brute-force scan over
+  **every** covered FFT line at all three rates.
+
 - **Annex D Tables D.3b / D.3c — complete Model 2 calculation-partition
   tables + 44,1 / 48 kHz spreading operators.** Following the 32 kHz
   D.3a table the `psy` module now carries the full 57-partition
