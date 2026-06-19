@@ -1696,6 +1696,985 @@ pub fn calc_partition_32k(n: u16) -> Option<CalcPartition> {
     CALC_PARTITION_32K.get(idx).copied()
 }
 
+/// Annex D Table D.3b — **complete** calculation-partition table at
+/// **Fs = 44,1 kHz**, all **57** partitions printed in ISO/IEC
+/// 11172-3 (1993) PDF page 140 (printed 134).
+///
+/// Transcribed from the docs collaborator's text extraction
+/// `docs/audio/mp3/annex-d-table-D3b-calc-partition-44k1Hz.csv`,
+/// cross-checked against the authoritative render
+/// `docs/audio/mp3/annex-d-renders/Table-D.3b-calc-partition-44k1Hz-p134.png`.
+/// Each row carries the partition number, the inclusive lower/upper
+/// FFT-line bounds (`ωlow`, `ωhigh`), the median Bark value `bval`,
+/// the masking-spread floor `minval`, and the tone-masking-noise
+/// offset `TMN`. The partitions tile the FFT lines contiguously
+/// (`ωlow_{n+1} = ωhigh_n + 1`) up to the Nyquist line 513 of the
+/// 1024-point Model 2 analysis FFT. The 44,1 kHz grid packs `bmax = 57`
+/// partitions (eight more than the 32 kHz D.3a `bmax = 49`); `bval`
+/// rises to 25,33 Bark, and the final partition `[470, 513]` drops its
+/// `minval` to 3,5 dB (vs the 4,5 dB the body carries) with `TMN`
+/// climbing to 39,8 dB.
+pub const CALC_PARTITION_44K1: [CalcPartition; 57] = [
+    CalcPartition {
+        index: 1,
+        omega_low: 1,
+        omega_high: 1,
+        bval: 0.00,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 2,
+        omega_low: 2,
+        omega_high: 2,
+        bval: 0.43,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 3,
+        omega_low: 3,
+        omega_high: 3,
+        bval: 0.86,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 4,
+        omega_low: 4,
+        omega_high: 4,
+        bval: 1.29,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 5,
+        omega_low: 5,
+        omega_high: 5,
+        bval: 1.72,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 6,
+        omega_low: 6,
+        omega_high: 6,
+        bval: 2.15,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 7,
+        omega_low: 7,
+        omega_high: 7,
+        bval: 2.58,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 8,
+        omega_low: 8,
+        omega_high: 8,
+        bval: 3.01,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 9,
+        omega_low: 9,
+        omega_high: 9,
+        bval: 3.45,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 10,
+        omega_low: 10,
+        omega_high: 10,
+        bval: 3.88,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 11,
+        omega_low: 11,
+        omega_high: 11,
+        bval: 4.28,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 12,
+        omega_low: 12,
+        omega_high: 12,
+        bval: 4.67,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 13,
+        omega_low: 13,
+        omega_high: 13,
+        bval: 5.06,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 14,
+        omega_low: 14,
+        omega_high: 14,
+        bval: 5.42,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 15,
+        omega_low: 15,
+        omega_high: 15,
+        bval: 5.77,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 16,
+        omega_low: 16,
+        omega_high: 16,
+        bval: 6.11,
+        minval: 17.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 17,
+        omega_low: 17,
+        omega_high: 19,
+        bval: 6.73,
+        minval: 17.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 18,
+        omega_low: 20,
+        omega_high: 22,
+        bval: 7.61,
+        minval: 15.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 19,
+        omega_low: 23,
+        omega_high: 25,
+        bval: 8.44,
+        minval: 10.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 20,
+        omega_low: 26,
+        omega_high: 28,
+        bval: 9.21,
+        minval: 7.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 21,
+        omega_low: 29,
+        omega_high: 31,
+        bval: 9.88,
+        minval: 7.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 22,
+        omega_low: 32,
+        omega_high: 34,
+        bval: 10.51,
+        minval: 4.4,
+        tmn: 25.0,
+    },
+    CalcPartition {
+        index: 23,
+        omega_low: 35,
+        omega_high: 37,
+        bval: 11.11,
+        minval: 4.5,
+        tmn: 25.6,
+    },
+    CalcPartition {
+        index: 24,
+        omega_low: 38,
+        omega_high: 40,
+        bval: 11.65,
+        minval: 4.5,
+        tmn: 26.2,
+    },
+    CalcPartition {
+        index: 25,
+        omega_low: 41,
+        omega_high: 44,
+        bval: 12.24,
+        minval: 4.5,
+        tmn: 26.7,
+    },
+    CalcPartition {
+        index: 26,
+        omega_low: 45,
+        omega_high: 48,
+        bval: 12.85,
+        minval: 4.5,
+        tmn: 27.4,
+    },
+    CalcPartition {
+        index: 27,
+        omega_low: 49,
+        omega_high: 52,
+        bval: 13.41,
+        minval: 4.5,
+        tmn: 27.9,
+    },
+    CalcPartition {
+        index: 28,
+        omega_low: 53,
+        omega_high: 56,
+        bval: 13.94,
+        minval: 4.5,
+        tmn: 28.4,
+    },
+    CalcPartition {
+        index: 29,
+        omega_low: 57,
+        omega_high: 60,
+        bval: 14.42,
+        minval: 4.5,
+        tmn: 28.9,
+    },
+    CalcPartition {
+        index: 30,
+        omega_low: 61,
+        omega_high: 64,
+        bval: 14.86,
+        minval: 4.5,
+        tmn: 29.4,
+    },
+    CalcPartition {
+        index: 31,
+        omega_low: 65,
+        omega_high: 69,
+        bval: 15.32,
+        minval: 4.5,
+        tmn: 29.8,
+    },
+    CalcPartition {
+        index: 32,
+        omega_low: 70,
+        omega_high: 74,
+        bval: 15.79,
+        minval: 4.5,
+        tmn: 30.3,
+    },
+    CalcPartition {
+        index: 33,
+        omega_low: 75,
+        omega_high: 80,
+        bval: 16.26,
+        minval: 4.5,
+        tmn: 30.8,
+    },
+    CalcPartition {
+        index: 34,
+        omega_low: 81,
+        omega_high: 86,
+        bval: 16.73,
+        minval: 4.5,
+        tmn: 31.2,
+    },
+    CalcPartition {
+        index: 35,
+        omega_low: 87,
+        omega_high: 93,
+        bval: 17.19,
+        minval: 4.5,
+        tmn: 31.7,
+    },
+    CalcPartition {
+        index: 36,
+        omega_low: 94,
+        omega_high: 100,
+        bval: 17.62,
+        minval: 4.5,
+        tmn: 32.1,
+    },
+    CalcPartition {
+        index: 37,
+        omega_low: 101,
+        omega_high: 108,
+        bval: 18.05,
+        minval: 4.5,
+        tmn: 32.5,
+    },
+    CalcPartition {
+        index: 38,
+        omega_low: 109,
+        omega_high: 116,
+        bval: 18.45,
+        minval: 4.5,
+        tmn: 32.9,
+    },
+    CalcPartition {
+        index: 39,
+        omega_low: 117,
+        omega_high: 124,
+        bval: 18.83,
+        minval: 4.5,
+        tmn: 33.3,
+    },
+    CalcPartition {
+        index: 40,
+        omega_low: 125,
+        omega_high: 134,
+        bval: 19.21,
+        minval: 4.5,
+        tmn: 33.7,
+    },
+    CalcPartition {
+        index: 41,
+        omega_low: 135,
+        omega_high: 144,
+        bval: 19.60,
+        minval: 4.5,
+        tmn: 34.1,
+    },
+    CalcPartition {
+        index: 42,
+        omega_low: 145,
+        omega_high: 155,
+        bval: 20.00,
+        minval: 4.5,
+        tmn: 34.5,
+    },
+    CalcPartition {
+        index: 43,
+        omega_low: 156,
+        omega_high: 166,
+        bval: 20.38,
+        minval: 4.5,
+        tmn: 34.9,
+    },
+    CalcPartition {
+        index: 44,
+        omega_low: 167,
+        omega_high: 177,
+        bval: 20.74,
+        minval: 4.5,
+        tmn: 35.2,
+    },
+    CalcPartition {
+        index: 45,
+        omega_low: 178,
+        omega_high: 192,
+        bval: 21.12,
+        minval: 4.5,
+        tmn: 35.6,
+    },
+    CalcPartition {
+        index: 46,
+        omega_low: 193,
+        omega_high: 207,
+        bval: 21.48,
+        minval: 4.5,
+        tmn: 36.0,
+    },
+    CalcPartition {
+        index: 47,
+        omega_low: 208,
+        omega_high: 222,
+        bval: 21.84,
+        minval: 4.5,
+        tmn: 36.3,
+    },
+    CalcPartition {
+        index: 48,
+        omega_low: 223,
+        omega_high: 243,
+        bval: 22.20,
+        minval: 4.5,
+        tmn: 36.7,
+    },
+    CalcPartition {
+        index: 49,
+        omega_low: 244,
+        omega_high: 264,
+        bval: 22.56,
+        minval: 4.5,
+        tmn: 37.1,
+    },
+    CalcPartition {
+        index: 50,
+        omega_low: 265,
+        omega_high: 286,
+        bval: 22.91,
+        minval: 4.5,
+        tmn: 37.4,
+    },
+    CalcPartition {
+        index: 51,
+        omega_low: 287,
+        omega_high: 314,
+        bval: 23.26,
+        minval: 4.5,
+        tmn: 37.8,
+    },
+    CalcPartition {
+        index: 52,
+        omega_low: 315,
+        omega_high: 342,
+        bval: 23.60,
+        minval: 4.5,
+        tmn: 38.1,
+    },
+    CalcPartition {
+        index: 53,
+        omega_low: 343,
+        omega_high: 371,
+        bval: 23.95,
+        minval: 4.5,
+        tmn: 38.4,
+    },
+    CalcPartition {
+        index: 54,
+        omega_low: 372,
+        omega_high: 401,
+        bval: 24.30,
+        minval: 4.5,
+        tmn: 38.8,
+    },
+    CalcPartition {
+        index: 55,
+        omega_low: 402,
+        omega_high: 431,
+        bval: 24.65,
+        minval: 4.5,
+        tmn: 39.1,
+    },
+    CalcPartition {
+        index: 56,
+        omega_low: 432,
+        omega_high: 469,
+        bval: 25.00,
+        minval: 4.5,
+        tmn: 39.5,
+    },
+    CalcPartition {
+        index: 57,
+        omega_low: 470,
+        omega_high: 513,
+        bval: 25.33,
+        minval: 3.5,
+        tmn: 39.8,
+    },
+];
+
+/// Annex D Table D.3c — **complete** calculation-partition table at
+/// **Fs = 48 kHz**, all **58** partitions printed in ISO/IEC
+/// 11172-3 (1993) PDF page 141 (printed 135).
+///
+/// Transcribed from the docs collaborator's text extraction
+/// `docs/audio/mp3/annex-d-table-D3c-calc-partition-48kHz.csv`,
+/// cross-checked against the authoritative render
+/// `docs/audio/mp3/annex-d-renders/Table-D.3c-calc-partition-48kHz-p135.png`.
+/// Layout matches D.3a/D.3b. The 48 kHz grid packs `bmax = 58`
+/// partitions (the most of the three rates); the partitions tile the
+/// FFT lines contiguously up to the Nyquist line 513. `bval` rises to
+/// 25,81 Bark, and the last two partitions (`57: [466, 507]`,
+/// `58: [508, 513]`) drop `minval` to 3,5 dB with `TMN` reaching
+/// 40,3 dB.
+pub const CALC_PARTITION_48K: [CalcPartition; 58] = [
+    CalcPartition {
+        index: 1,
+        omega_low: 1,
+        omega_high: 1,
+        bval: 0.00,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 2,
+        omega_low: 2,
+        omega_high: 2,
+        bval: 0.47,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 3,
+        omega_low: 3,
+        omega_high: 3,
+        bval: 0.94,
+        minval: 0.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 4,
+        omega_low: 4,
+        omega_high: 4,
+        bval: 1.41,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 5,
+        omega_low: 5,
+        omega_high: 5,
+        bval: 1.88,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 6,
+        omega_low: 6,
+        omega_high: 6,
+        bval: 2.34,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 7,
+        omega_low: 7,
+        omega_high: 7,
+        bval: 2.81,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 8,
+        omega_low: 8,
+        omega_high: 8,
+        bval: 3.28,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 9,
+        omega_low: 9,
+        omega_high: 9,
+        bval: 3.75,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 10,
+        omega_low: 10,
+        omega_high: 10,
+        bval: 4.20,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 11,
+        omega_low: 11,
+        omega_high: 11,
+        bval: 4.63,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 12,
+        omega_low: 12,
+        omega_high: 12,
+        bval: 5.05,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 13,
+        omega_low: 13,
+        omega_high: 13,
+        bval: 5.44,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 14,
+        omega_low: 14,
+        omega_high: 14,
+        bval: 5.83,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 15,
+        omega_low: 15,
+        omega_high: 15,
+        bval: 6.19,
+        minval: 20.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 16,
+        omega_low: 16,
+        omega_high: 16,
+        bval: 6.52,
+        minval: 17.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 17,
+        omega_low: 17,
+        omega_high: 17,
+        bval: 6.86,
+        minval: 17.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 18,
+        omega_low: 18,
+        omega_high: 20,
+        bval: 7.49,
+        minval: 15.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 19,
+        omega_low: 21,
+        omega_high: 23,
+        bval: 8.40,
+        minval: 10.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 20,
+        omega_low: 24,
+        omega_high: 26,
+        bval: 9.24,
+        minval: 7.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 21,
+        omega_low: 27,
+        omega_high: 29,
+        bval: 9.97,
+        minval: 7.0,
+        tmn: 24.5,
+    },
+    CalcPartition {
+        index: 22,
+        omega_low: 30,
+        omega_high: 32,
+        bval: 10.65,
+        minval: 4.4,
+        tmn: 25.1,
+    },
+    CalcPartition {
+        index: 23,
+        omega_low: 33,
+        omega_high: 35,
+        bval: 11.28,
+        minval: 4.5,
+        tmn: 25.8,
+    },
+    CalcPartition {
+        index: 24,
+        omega_low: 36,
+        omega_high: 38,
+        bval: 11.86,
+        minval: 4.5,
+        tmn: 26.4,
+    },
+    CalcPartition {
+        index: 25,
+        omega_low: 39,
+        omega_high: 41,
+        bval: 12.39,
+        minval: 4.5,
+        tmn: 26.9,
+    },
+    CalcPartition {
+        index: 26,
+        omega_low: 42,
+        omega_high: 45,
+        bval: 12.96,
+        minval: 4.5,
+        tmn: 27.5,
+    },
+    CalcPartition {
+        index: 27,
+        omega_low: 46,
+        omega_high: 49,
+        bval: 13.56,
+        minval: 4.5,
+        tmn: 28.1,
+    },
+    CalcPartition {
+        index: 28,
+        omega_low: 50,
+        omega_high: 53,
+        bval: 14.12,
+        minval: 4.5,
+        tmn: 28.6,
+    },
+    CalcPartition {
+        index: 29,
+        omega_low: 54,
+        omega_high: 57,
+        bval: 14.62,
+        minval: 4.5,
+        tmn: 29.1,
+    },
+    CalcPartition {
+        index: 30,
+        omega_low: 58,
+        omega_high: 62,
+        bval: 15.14,
+        minval: 4.5,
+        tmn: 29.6,
+    },
+    CalcPartition {
+        index: 31,
+        omega_low: 63,
+        omega_high: 67,
+        bval: 15.67,
+        minval: 4.5,
+        tmn: 30.2,
+    },
+    CalcPartition {
+        index: 32,
+        omega_low: 68,
+        omega_high: 72,
+        bval: 16.15,
+        minval: 4.5,
+        tmn: 30.7,
+    },
+    CalcPartition {
+        index: 33,
+        omega_low: 73,
+        omega_high: 77,
+        bval: 16.58,
+        minval: 4.5,
+        tmn: 31.1,
+    },
+    CalcPartition {
+        index: 34,
+        omega_low: 78,
+        omega_high: 83,
+        bval: 17.02,
+        minval: 4.5,
+        tmn: 31.5,
+    },
+    CalcPartition {
+        index: 35,
+        omega_low: 84,
+        omega_high: 89,
+        bval: 17.44,
+        minval: 4.5,
+        tmn: 31.9,
+    },
+    CalcPartition {
+        index: 36,
+        omega_low: 90,
+        omega_high: 95,
+        bval: 17.84,
+        minval: 4.5,
+        tmn: 32.3,
+    },
+    CalcPartition {
+        index: 37,
+        omega_low: 96,
+        omega_high: 103,
+        bval: 18.24,
+        minval: 4.5,
+        tmn: 32.7,
+    },
+    CalcPartition {
+        index: 38,
+        omega_low: 104,
+        omega_high: 111,
+        bval: 18.66,
+        minval: 4.5,
+        tmn: 33.2,
+    },
+    CalcPartition {
+        index: 39,
+        omega_low: 112,
+        omega_high: 120,
+        bval: 19.07,
+        minval: 4.5,
+        tmn: 33.6,
+    },
+    CalcPartition {
+        index: 40,
+        omega_low: 121,
+        omega_high: 129,
+        bval: 19.47,
+        minval: 4.5,
+        tmn: 34.0,
+    },
+    CalcPartition {
+        index: 41,
+        omega_low: 130,
+        omega_high: 138,
+        bval: 19.85,
+        minval: 4.5,
+        tmn: 34.3,
+    },
+    CalcPartition {
+        index: 42,
+        omega_low: 139,
+        omega_high: 149,
+        bval: 20.23,
+        minval: 4.5,
+        tmn: 34.7,
+    },
+    CalcPartition {
+        index: 43,
+        omega_low: 150,
+        omega_high: 160,
+        bval: 20.63,
+        minval: 4.5,
+        tmn: 35.1,
+    },
+    CalcPartition {
+        index: 44,
+        omega_low: 161,
+        omega_high: 173,
+        bval: 21.02,
+        minval: 4.5,
+        tmn: 35.5,
+    },
+    CalcPartition {
+        index: 45,
+        omega_low: 174,
+        omega_high: 187,
+        bval: 21.40,
+        minval: 4.5,
+        tmn: 35.9,
+    },
+    CalcPartition {
+        index: 46,
+        omega_low: 188,
+        omega_high: 201,
+        bval: 21.76,
+        minval: 4.5,
+        tmn: 36.3,
+    },
+    CalcPartition {
+        index: 47,
+        omega_low: 202,
+        omega_high: 219,
+        bval: 22.12,
+        minval: 4.5,
+        tmn: 36.6,
+    },
+    CalcPartition {
+        index: 48,
+        omega_low: 220,
+        omega_high: 238,
+        bval: 22.47,
+        minval: 4.5,
+        tmn: 37.0,
+    },
+    CalcPartition {
+        index: 49,
+        omega_low: 239,
+        omega_high: 257,
+        bval: 22.83,
+        minval: 4.5,
+        tmn: 37.3,
+    },
+    CalcPartition {
+        index: 50,
+        omega_low: 258,
+        omega_high: 283,
+        bval: 23.18,
+        minval: 4.5,
+        tmn: 37.7,
+    },
+    CalcPartition {
+        index: 51,
+        omega_low: 284,
+        omega_high: 309,
+        bval: 23.53,
+        minval: 4.5,
+        tmn: 38.0,
+    },
+    CalcPartition {
+        index: 52,
+        omega_low: 310,
+        omega_high: 335,
+        bval: 23.88,
+        minval: 4.5,
+        tmn: 38.4,
+    },
+    CalcPartition {
+        index: 53,
+        omega_low: 336,
+        omega_high: 363,
+        bval: 24.23,
+        minval: 4.5,
+        tmn: 38.7,
+    },
+    CalcPartition {
+        index: 54,
+        omega_low: 364,
+        omega_high: 391,
+        bval: 24.58,
+        minval: 4.5,
+        tmn: 39.1,
+    },
+    CalcPartition {
+        index: 55,
+        omega_low: 392,
+        omega_high: 423,
+        bval: 24.93,
+        minval: 4.5,
+        tmn: 39.4,
+    },
+    CalcPartition {
+        index: 56,
+        omega_low: 424,
+        omega_high: 465,
+        bval: 25.27,
+        minval: 4.5,
+        tmn: 39.8,
+    },
+    CalcPartition {
+        index: 57,
+        omega_low: 466,
+        omega_high: 507,
+        bval: 25.61,
+        minval: 3.5,
+        tmn: 40.1,
+    },
+    CalcPartition {
+        index: 58,
+        omega_low: 508,
+        omega_high: 513,
+        bval: 25.81,
+        minval: 3.5,
+        tmn: 40.3,
+    },
+];
+
+/// Look up a row of Annex D **Table D.3b** (Fs = 44,1 kHz
+/// calculation-partition table) by its 1-based partition number `n`.
+///
+/// Returns `Some(row)` for `n ∈ 1..=57` and `None` for `n == 0` (the
+/// table is 1-based) and `n > 57` (above the printed table). Mirrors
+/// [`calc_partition_32k`] for the 44,1 kHz rate.
+pub fn calc_partition_44k1(n: u16) -> Option<CalcPartition> {
+    let idx = usize::from(n).checked_sub(1)?;
+    CALC_PARTITION_44K1.get(idx).copied()
+}
+
+/// Look up a row of Annex D **Table D.3c** (Fs = 48 kHz
+/// calculation-partition table) by its 1-based partition number `n`.
+///
+/// Returns `Some(row)` for `n ∈ 1..=58` and `None` for `n == 0` and
+/// `n > 58`. Mirrors [`calc_partition_32k`] for the 48 kHz rate.
+pub fn calc_partition_48k(n: u16) -> Option<CalcPartition> {
+    let idx = usize::from(n).checked_sub(1)?;
+    CALC_PARTITION_48K.get(idx).copied()
+}
+
 // -----------------------------------------------------------------
 // Annex D Step 3 — threshold-in-quiet `LTq` bit-rate-dependent offset
 //
@@ -4339,6 +5318,150 @@ pub fn model2_spread_energy_32k(partition_energy: &[f64]) -> Option<Vec<f64>> {
     Some(eb)
 }
 
+// -----------------------------------------------------------------
+// Annex D clause D.2.3 — Model 2 partition-domain spreading operator
+// at Fs = 44,1 kHz and Fs = 48 kHz.
+//
+// Identical construction to the 32 kHz operator above, parameterised
+// over the calculation-partition table of the target rate (Table D.3b
+// `bmax = 57` at 44,1 kHz, Table D.3c `bmax = 58` at 48 kHz). Each
+// partition `b` carries its representative median Bark value `bval[b]`,
+// the spreading matrix is `sprdngf[d][s] = model2_sprdngf(bval[d],
+// bval[s])`, and the clause D.2.3 `rnorm[s] = 1 / Σ_d sprdngf[d][s]`
+// energy-conservation factor scales each source column before
+// spreading. The `model2_sprdngf` backbone is rate-independent (it is
+// defined purely over Bark differences), so only the per-partition
+// `bval` vector changes between rates.
+// -----------------------------------------------------------------
+
+/// Number of Model 2 calculation partitions at Fs = 44,1 kHz
+/// (`bmax = 57`, the length of Table D.3b / [`CALC_PARTITION_44K1`]).
+pub const MODEL2_PARTITIONS_44K1: usize = CALC_PARTITION_44K1.len();
+
+/// Number of Model 2 calculation partitions at Fs = 48 kHz
+/// (`bmax = 58`, the length of Table D.3c / [`CALC_PARTITION_48K`]).
+pub const MODEL2_PARTITIONS_48K: usize = CALC_PARTITION_48K.len();
+
+/// The complete Model 2 partition-domain spreading matrix for a given
+/// calculation-partition table: `matrix[d][s]` is the spreading weight
+/// from source partition `s` onto destination partition `d`, both
+/// 0-based, dense over `bvals.len() × bvals.len()`.
+///
+/// `matrix[d][s] == model2_sprdngf(bvals[d], bvals[s])`. Shared
+/// machinery behind the per-rate operators; `bvals` is the median-Bark
+/// column of the rate's Table D.3x.
+fn model2_spreading_matrix_from_bvals(bvals: &[f64]) -> Vec<Vec<f64>> {
+    let n = bvals.len();
+    let mut matrix = vec![vec![0.0f64; n]; n];
+    for (d, row) in matrix.iter_mut().enumerate() {
+        for (s, cell) in row.iter_mut().enumerate() {
+            *cell = model2_sprdngf(bvals[d], bvals[s]);
+        }
+    }
+    matrix
+}
+
+/// Apply the clause D.2.3 energy-conserving spreading operator to a
+/// per-partition source-energy vector, for an arbitrary
+/// calculation-partition `bval` column.
+///
+/// Shared implementation behind [`model2_spread_energy_44k1`] and
+/// [`model2_spread_energy_48k`]: pre-scales each source by its
+/// `rnorm[s] = 1 / Σ_d sprdngf[d][s]` factor, then accumulates into
+/// every destination through the asymmetric Bark spreading weights.
+/// Returns `None` if `partition_energy.len() != bvals.len()`.
+fn model2_spread_energy_from_bvals(bvals: &[f64], partition_energy: &[f64]) -> Option<Vec<f64>> {
+    let n = bvals.len();
+    if partition_energy.len() != n {
+        return None;
+    }
+    let matrix = model2_spreading_matrix_from_bvals(bvals);
+    let rnorm: Vec<f64> = (0..n)
+        .map(|s| {
+            let col_sum: f64 = (0..n).map(|d| matrix[d][s]).sum();
+            1.0 / col_sum
+        })
+        .collect();
+    let scaled: Vec<f64> = (0..n).map(|s| partition_energy[s] * rnorm[s]).collect();
+    let eb = (0..n)
+        .map(|d| (0..n).map(|s| scaled[s] * matrix[d][s]).sum())
+        .collect();
+    Some(eb)
+}
+
+/// Model 2 per-pair partition spreading weight at Fs = 44,1 kHz:
+/// `model2_sprdngf(bval[into], bval[from])` over Table D.3b. Both
+/// arguments are 1-based partition indices `1..=57`; `None` outside.
+pub fn model2_spread_weight_44k1(into_partition: u16, from_partition: u16) -> Option<f64> {
+    let into = calc_partition_44k1(into_partition)?;
+    let from = calc_partition_44k1(from_partition)?;
+    Some(model2_sprdngf(into.bval, from.bval))
+}
+
+/// Model 2 per-pair partition spreading weight at Fs = 48 kHz:
+/// `model2_sprdngf(bval[into], bval[from])` over Table D.3c. Both
+/// arguments are 1-based partition indices `1..=58`; `None` outside.
+pub fn model2_spread_weight_48k(into_partition: u16, from_partition: u16) -> Option<f64> {
+    let into = calc_partition_48k(into_partition)?;
+    let from = calc_partition_48k(from_partition)?;
+    Some(model2_sprdngf(into.bval, from.bval))
+}
+
+/// The complete Model 2 partition-domain spreading matrix at
+/// Fs = 44,1 kHz (Table D.3b, `bmax = 57`). See
+/// [`model2_spreading_matrix_32k`] for the matrix semantics.
+pub fn model2_spreading_matrix_44k1() -> Vec<Vec<f64>> {
+    let bvals: Vec<f64> = CALC_PARTITION_44K1.iter().map(|p| p.bval).collect();
+    model2_spreading_matrix_from_bvals(&bvals)
+}
+
+/// The complete Model 2 partition-domain spreading matrix at
+/// Fs = 48 kHz (Table D.3c, `bmax = 58`).
+pub fn model2_spreading_matrix_48k() -> Vec<Vec<f64>> {
+    let bvals: Vec<f64> = CALC_PARTITION_48K.iter().map(|p| p.bval).collect();
+    model2_spreading_matrix_from_bvals(&bvals)
+}
+
+/// Model 2 spreading normalisation factors at Fs = 44,1 kHz
+/// (clause D.2.3 `rnorm`), one per source partition. See
+/// [`model2_spread_normalization_32k`].
+pub fn model2_spread_normalization_44k1() -> Vec<f64> {
+    let matrix = model2_spreading_matrix_44k1();
+    let n = MODEL2_PARTITIONS_44K1;
+    (0..n)
+        .map(|s| 1.0 / (0..n).map(|d| matrix[d][s]).sum::<f64>())
+        .collect()
+}
+
+/// Model 2 spreading normalisation factors at Fs = 48 kHz
+/// (clause D.2.3 `rnorm`), one per source partition.
+pub fn model2_spread_normalization_48k() -> Vec<f64> {
+    let matrix = model2_spreading_matrix_48k();
+    let n = MODEL2_PARTITIONS_48K;
+    (0..n)
+        .map(|s| 1.0 / (0..n).map(|d| matrix[d][s]).sum::<f64>())
+        .collect()
+}
+
+/// Apply the clause D.2.3 energy-conserving spreading operator at
+/// Fs = 44,1 kHz (Table D.3b, `bmax = 57`) to a per-partition
+/// source-energy vector. See [`model2_spread_energy_32k`] for the
+/// operator semantics; `None` if the length is not
+/// [`MODEL2_PARTITIONS_44K1`].
+pub fn model2_spread_energy_44k1(partition_energy: &[f64]) -> Option<Vec<f64>> {
+    let bvals: Vec<f64> = CALC_PARTITION_44K1.iter().map(|p| p.bval).collect();
+    model2_spread_energy_from_bvals(&bvals, partition_energy)
+}
+
+/// Apply the clause D.2.3 energy-conserving spreading operator at
+/// Fs = 48 kHz (Table D.3c, `bmax = 58`) to a per-partition
+/// source-energy vector. `None` if the length is not
+/// [`MODEL2_PARTITIONS_48K`].
+pub fn model2_spread_energy_48k(partition_energy: &[f64]) -> Option<Vec<f64>> {
+    let bvals: Vec<f64> = CALC_PARTITION_48K.iter().map(|p| p.bval).collect();
+    model2_spread_energy_from_bvals(&bvals, partition_energy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6534,6 +7657,203 @@ mod tests {
                 (escaled[d] - 3.5 * ea[d]).abs() <= 1e-12 * (3.5 * ea[d]).abs().max(1.0),
                 "homogeneity failed at {d}"
             );
+        }
+    }
+
+    // --- Tables D.3b / D.3c (calculation partitions, 44,1 / 48 kHz) ---
+
+    #[test]
+    fn d3bc_partition_counts_match_spec() {
+        assert_eq!(CALC_PARTITION_44K1.len(), 57);
+        assert_eq!(CALC_PARTITION_48K.len(), 58);
+        assert_eq!(MODEL2_PARTITIONS_44K1, 57);
+        assert_eq!(MODEL2_PARTITIONS_48K, 58);
+        // Strictly the most partitions at the highest rate, fewest at
+        // 32 kHz: 49 < 57 < 58.
+        assert!(CALC_PARTITION_32K.len() < CALC_PARTITION_44K1.len());
+        assert!(CALC_PARTITION_44K1.len() < CALC_PARTITION_48K.len());
+    }
+
+    #[test]
+    fn d3bc_dense_1based_index_numbering() {
+        for (k, p) in CALC_PARTITION_44K1.iter().enumerate() {
+            assert_eq!(p.index as usize, k + 1, "D.3b slot {k}");
+        }
+        for (k, p) in CALC_PARTITION_48K.iter().enumerate() {
+            assert_eq!(p.index as usize, k + 1, "D.3c slot {k}");
+        }
+    }
+
+    #[test]
+    fn d3bc_partitions_tile_fft_lines_contiguously_to_nyquist() {
+        // ωlow_{n+1} = ωhigh_n + 1, first ωlow = 1, last ωhigh = 513
+        // (the Nyquist line of the 1024-point Model 2 FFT).
+        for table in [&CALC_PARTITION_44K1[..], &CALC_PARTITION_48K[..]] {
+            assert_eq!(table[0].omega_low, 1);
+            assert_eq!(table.last().unwrap().omega_high, 513);
+            for w in table.windows(2) {
+                assert_eq!(
+                    w[1].omega_low,
+                    w[0].omega_high + 1,
+                    "gap/overlap at partition {}",
+                    w[1].index
+                );
+                assert!(
+                    w[1].omega_high >= w[1].omega_low,
+                    "empty partition {}",
+                    w[1].index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn d3bc_bval_strictly_monotonic_and_endpoints() {
+        for table in [&CALC_PARTITION_44K1[..], &CALC_PARTITION_48K[..]] {
+            assert!((table[0].bval - 0.00).abs() < 1e-9);
+            for w in table.windows(2) {
+                assert!(
+                    w[1].bval > w[0].bval,
+                    "bval non-monotone at partition {}",
+                    w[1].index
+                );
+            }
+        }
+        // Last-partition bval per rate (printed): 25,33 / 25,81.
+        assert!((CALC_PARTITION_44K1.last().unwrap().bval - 25.33).abs() < 1e-9);
+        assert!((CALC_PARTITION_48K.last().unwrap().bval - 25.81).abs() < 1e-9);
+    }
+
+    #[test]
+    fn d3bc_head_and_minval_floor_drop_verbatim() {
+        // Head rows verbatim (index 1..=3) from the CSV extracts.
+        let b1 = calc_partition_44k1(1).unwrap();
+        assert_eq!((b1.omega_low, b1.omega_high), (1, 1));
+        assert!((b1.bval - 0.00).abs() < 1e-9 && (b1.tmn - 24.5).abs() < 1e-9);
+        let c1 = calc_partition_48k(1).unwrap();
+        assert_eq!((c1.omega_low, c1.omega_high), (1, 1));
+        assert!((c1.tmn - 24.5).abs() < 1e-9);
+        // The errata-noted minval drop to 3,5 dB on the final
+        // partition(s): D.3b row 57 and D.3c rows 57–58.
+        assert!((calc_partition_44k1(57).unwrap().minval - 3.5).abs() < 1e-9);
+        assert!((calc_partition_44k1(56).unwrap().minval - 4.5).abs() < 1e-9);
+        assert!((calc_partition_48k(57).unwrap().minval - 3.5).abs() < 1e-9);
+        assert!((calc_partition_48k(58).unwrap().minval - 3.5).abs() < 1e-9);
+        assert!((calc_partition_48k(56).unwrap().minval - 4.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn d3bc_lookup_bounds() {
+        assert!(calc_partition_44k1(0).is_none());
+        assert!(calc_partition_44k1(57).is_some());
+        assert!(calc_partition_44k1(58).is_none());
+        assert!(calc_partition_48k(0).is_none());
+        assert!(calc_partition_48k(58).is_some());
+        assert!(calc_partition_48k(59).is_none());
+    }
+
+    // --- Model 2 spreading operator at 44,1 / 48 kHz ---
+
+    #[test]
+    fn model2_spread_weight_higher_rates_diagonal_is_one() {
+        for n in 1..=MODEL2_PARTITIONS_44K1 as u16 {
+            assert!((model2_spread_weight_44k1(n, n).unwrap() - 1.0).abs() < 1e-6);
+        }
+        for n in 1..=MODEL2_PARTITIONS_48K as u16 {
+            assert!((model2_spread_weight_48k(n, n).unwrap() - 1.0).abs() < 1e-6);
+        }
+        assert!(model2_spread_weight_44k1(58, 1).is_none());
+        assert!(model2_spread_weight_48k(59, 1).is_none());
+    }
+
+    #[test]
+    fn model2_spread_weight_higher_rates_match_sprdngf() {
+        for &(into, from) in &[(1u16, 1u16), (10, 8), (8, 10), (57, 1), (30, 35)] {
+            let got = model2_spread_weight_44k1(into, from).unwrap();
+            let want = model2_sprdngf(
+                calc_partition_44k1(into).unwrap().bval,
+                calc_partition_44k1(from).unwrap().bval,
+            );
+            assert!((got - want).abs() < 1e-15);
+        }
+        for &(into, from) in &[(1u16, 1u16), (12, 9), (58, 1), (40, 50)] {
+            let got = model2_spread_weight_48k(into, from).unwrap();
+            let want = model2_sprdngf(
+                calc_partition_48k(into).unwrap().bval,
+                calc_partition_48k(from).unwrap().bval,
+            );
+            assert!((got - want).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn model2_spreading_matrix_higher_rates_shape_and_diagonal() {
+        let m44 = model2_spreading_matrix_44k1();
+        assert_eq!(m44.len(), MODEL2_PARTITIONS_44K1);
+        assert!(m44.iter().all(|r| r.len() == MODEL2_PARTITIONS_44K1));
+        for (d, row) in m44.iter().enumerate() {
+            assert!((row[d] - 1.0).abs() < 1e-6, "44.1k diagonal {d}");
+            assert!(row.iter().all(|&w| (0.0..=1.0 + 1e-9).contains(&w)));
+        }
+        let m48 = model2_spreading_matrix_48k();
+        assert_eq!(m48.len(), MODEL2_PARTITIONS_48K);
+        for (d, row) in m48.iter().enumerate() {
+            assert!((row[d] - 1.0).abs() < 1e-6, "48k diagonal {d}");
+        }
+    }
+
+    #[test]
+    fn model2_spread_energy_higher_rates_reject_wrong_length() {
+        assert!(model2_spread_energy_44k1(&[]).is_none());
+        assert!(model2_spread_energy_44k1(&[1.0; MODEL2_PARTITIONS_44K1 - 1]).is_none());
+        assert!(model2_spread_energy_44k1(&[1.0; MODEL2_PARTITIONS_44K1]).is_some());
+        assert!(model2_spread_energy_48k(&[1.0; MODEL2_PARTITIONS_48K + 1]).is_none());
+        assert!(model2_spread_energy_48k(&[1.0; MODEL2_PARTITIONS_48K]).is_some());
+    }
+
+    #[test]
+    fn model2_spread_energy_higher_rates_conserve_total_energy() {
+        // The rnorm-normalised operator redistributes without creating
+        // or destroying energy: Σ eb == Σ source.
+        for (n, op) in [
+            (
+                MODEL2_PARTITIONS_44K1,
+                model2_spread_energy_44k1 as fn(&[f64]) -> Option<Vec<f64>>,
+            ),
+            (MODEL2_PARTITIONS_48K, model2_spread_energy_48k),
+        ] {
+            let energy: Vec<f64> = (0..n)
+                .map(|s| (s as f64 * 0.7).sin().abs() + 0.05)
+                .collect();
+            let total: f64 = energy.iter().sum();
+            let eb = op(&energy).unwrap();
+            let spread: f64 = eb.iter().sum();
+            assert!(
+                (spread - total).abs() <= 1e-9 * total,
+                "energy not conserved: {spread} vs {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn model2_spread_energy_higher_rates_unit_impulse_normalized() {
+        // A unit impulse at one source spreads to a total of exactly 1
+        // across all destinations (the rnorm energy-conservation
+        // property), at both higher rates.
+        for (n, op) in [
+            (
+                MODEL2_PARTITIONS_44K1,
+                model2_spread_energy_44k1 as fn(&[f64]) -> Option<Vec<f64>>,
+            ),
+            (MODEL2_PARTITIONS_48K, model2_spread_energy_48k),
+        ] {
+            for s in [0usize, n / 2, n - 1] {
+                let mut energy = vec![0.0; n];
+                energy[s] = 1.0;
+                let eb = op(&energy).unwrap();
+                let total: f64 = eb.iter().sum();
+                assert!((total - 1.0).abs() < 1e-9, "impulse at {s}: total {total}");
+            }
         }
     }
 }

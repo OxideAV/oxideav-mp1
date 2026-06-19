@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Tables D.3b / D.3c — complete Model 2 calculation-partition
+  tables + 44,1 / 48 kHz spreading operators.** Following the 32 kHz
+  D.3a table the `psy` module now carries the full 57-partition
+  (44,1 kHz, `CALC_PARTITION_44K1`) and 58-partition (48 kHz,
+  `CALC_PARTITION_48K`) calculation-partition tables transcribed from
+  `docs/audio/mp3/annex-d-table-D3b-calc-partition-44k1Hz.csv` /
+  `…-D3c-…-48kHz.csv` (partition index, inclusive ωlow/ωhigh FFT-line
+  bounds, median Bark `bval`, `minval` floor, `TMN` offset), with
+  `calc_partition_44k1` / `calc_partition_48k` accessors. With the
+  `bval` columns in hand, the clause D.2.3 partition-domain spreading
+  operator is now derivable at both higher rates: new
+  `model2_spread_weight_44k1/48k`, `model2_spreading_matrix_44k1/48k`,
+  `model2_spread_normalization_44k1/48k`, and the energy-conserving
+  `model2_spread_energy_44k1/48k`, all sharing a rate-generic
+  `bval`-parameterised core. Tests verify the 49 < 57 < 58 partition
+  counts, dense 1-based numbering, contiguous FFT-line tiling to the
+  Nyquist line 513, strictly-monotone `bval` with the printed
+  25,33 / 25,81 endpoints, the errata-noted `minval` drop to 3,5 dB on
+  the final partition(s), and that the higher-rate spreading operators
+  reproduce the 32 kHz operator's diagonal-≈1 / energy-conservation /
+  unit-impulse-normalisation properties. This leaves only the per-line
+  absolute-threshold Tables D.4a–c staged-but-untranscribed in the
+  Model 2 Annex D family.
+
 - **Annex D Table D.1c — complete 102-row threshold-in-quiet table
   (Layer I, Fs = 48 kHz).** Completing the Layer I D.1 family
   (D.1a 32 kHz / D.1b 44,1 kHz / D.1c 48 kHz), the `psy` module now
