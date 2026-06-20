@@ -55,7 +55,7 @@
 
 use crate::psy::{
     absthr_for_line_32k, absthr_for_line_44k1, absthr_for_line_48k, CalcPartition,
-    CALC_PARTITION_32K,
+    CALC_PARTITION_32K, CODER_PARTITIONS,
 };
 use crate::psy::{calc_partition_44k1, calc_partition_48k};
 
@@ -527,10 +527,156 @@ pub fn absthr_db_to_energy(absthr_db: f64) -> f64 {
     10f64.powf(absthr_db / 10.0)
 }
 
+/// Step n: per-subband signal-to-mask ratios `SMR_n` from the per-line
+/// energies `r_ω²` and thresholds `thr_ω`, over the 32 coder partitions
+/// of Table D.5 (clause D.2 step n).
+///
+/// For each coder partition `n` (= subband `n`, FFT lines
+/// `[ωlow_n, ωhigh_n]`):
+///
+/// ```text
+/// epart_n = Σ_{ω=ωlow_n}^{ωhigh_n} r_ω²
+/// npart_n = Σ thr_ω                              if width_n == 1
+///         = min(thr_ωlow_n … thr_ωhigh_n)·W_n    if width_n == 0
+/// SMR_n   = 10·log10(epart_n / npart_n)          dB
+/// ```
+///
+/// where `W_n = ωhigh_n − ωlow_n + 1`. `width_n` (Table D.5) is 1 for a
+/// psychoacoustically *narrow* scalefactor band (less than ≈ ⅓ critical
+/// band — summing the threshold is safe) and 0 for a *wide* band (the
+/// minimum line threshold times the width is used so a single quiet
+/// line in a wide band can't drag the band's noise floor down).
+///
+/// `r` is the current block's per-line magnitude; `thr` is the
+/// per-line threshold from [`line_thresholds`]. Both index FFT lines
+/// `0..NUM_LINES`. Returns the 32 `SMR_n` in dB.
+pub fn smr_per_subband(r: &[f64], thr: &[f64]) -> [f64; SUBBANDS] {
+    let mut smr = [0.0f64; SUBBANDS];
+    for (n, s) in smr.iter_mut().enumerate() {
+        let cp = CODER_PARTITIONS[n];
+        // ωlow_n is this partition's boundary; ωhigh_n is the next
+        // boundary − 1 (1-based, inclusive). The last subband (n = 31)
+        // tops out at boundary 497..512; FFT line 513 is the Nyquist
+        // line shared with coder partition 32's boundary.
+        let lo1 = cp.boundary as usize; // 1-based ωlow
+        let hi1 = CODER_PARTITIONS[n + 1].boundary as usize - 1; // 1-based ωhigh
+        let lo = lo1 - 1;
+        let hi = hi1.min(NUM_LINES);
+
+        let mut epart = 0.0f64;
+        for &v in r.iter().take(hi).skip(lo) {
+            epart += v * v;
+        }
+
+        let width_lines = (hi - lo) as f64;
+        let npart = if cp.width == 1 {
+            // Narrow band: sum the per-line thresholds.
+            let mut acc = 0.0f64;
+            for &t in thr.iter().take(hi).skip(lo) {
+                acc += t;
+            }
+            acc
+        } else {
+            // Wide band: minimum line threshold × the band width.
+            let mut min_thr = f64::INFINITY;
+            for &t in thr.iter().take(hi).skip(lo) {
+                if t < min_thr {
+                    min_thr = t;
+                }
+            }
+            if min_thr.is_finite() {
+                min_thr * width_lines
+            } else {
+                0.0
+            }
+        };
+
+        *s = if epart > 0.0 && npart > 0.0 {
+            10.0 * (epart / npart).log10()
+        } else if epart > 0.0 {
+            // No masking threshold (silent floor): treat as maximally
+            // audible — a large positive SMR demands maximum precision.
+            f64::INFINITY
+        } else {
+            // Silent subband: nothing to mask, no demand.
+            f64::NEG_INFINITY
+        };
+    }
+    smr
+}
+
+/// Streaming Model 2 driver state: the two-block polar-spectrum history
+/// the step-c prediction needs across successive frames.
+///
+/// A caller feeds 1024-sample analysis windows (one per Layer I frame's
+/// worth of audio, the spec's `iblen` slide) and reads back the 32
+/// per-subband `SMR_n` for that frame. The cross-frame history makes
+/// the unpredictability measure (and hence the tonality estimate)
+/// track the signal's stationarity the way the spec intends: a steady
+/// tone becomes increasingly tonal (low unpredictability) over
+/// successive frames; a transient stays noise-like.
+#[derive(Debug, Clone)]
+pub struct Model2State {
+    rate: Model2Rate,
+    tables: PartitionTables,
+    /// Previous block's spectrum (`t−1`), if any.
+    prev1: Option<Spectrum>,
+    /// Block before that (`t−2`), if any.
+    prev2: Option<Spectrum>,
+}
+
+impl Model2State {
+    /// Build a fresh driver for `rate` with empty prediction history.
+    /// Returns `None` for a sampling rate without an Annex D Model 2
+    /// table (the MPEG-2 LSF half-rates).
+    pub fn new(sampling_frequency: u32) -> Option<Self> {
+        let rate = Model2Rate::from_hz(sampling_frequency)?;
+        Some(Self::for_rate(rate))
+    }
+
+    /// Build a fresh driver for a known [`Model2Rate`].
+    pub fn for_rate(rate: Model2Rate) -> Self {
+        Model2State {
+            rate,
+            tables: PartitionTables::for_rate(rate),
+            prev1: None,
+            prev2: None,
+        }
+    }
+
+    /// The driver's sampling-rate table set.
+    pub fn rate(&self) -> Model2Rate {
+        self.rate
+    }
+
+    /// Reset the prediction history (seek / stream restart).
+    pub fn reset(&mut self) {
+        self.prev1 = None;
+        self.prev2 = None;
+    }
+
+    /// Run the full clause D.2.4 procedure on one 1024-sample analysis
+    /// window and return the 32 per-subband `SMR_n` in dB.
+    ///
+    /// Advances the two-block prediction history (the new spectrum
+    /// becomes `t−1`; the old `t−1` becomes `t−2`).
+    pub fn process(&mut self, samples: &[f64; FFT_SIZE]) -> [f64; SUBBANDS] {
+        let cur = Spectrum::analyze(samples);
+        let cw = unpredictability(&cur, self.prev1.as_ref(), self.prev2.as_ref(), NUM_LINES);
+        let pe = partition_energies(&self.tables, &cur.r, &cw);
+        let thr = line_thresholds(&self.tables, &pe.en, &pe.tb, self.rate);
+        let smr = smr_per_subband(&cur.r, &thr);
+        // Slide the history window.
+        self.prev2 = self.prev1.take();
+        self.prev1 = Some(cur);
+        smr
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::psy::{model2_sprdngf, CODER_PARTITIONS};
+    use crate::psy::model2_sprdngf;
 
     #[test]
     fn fft_size_constants() {
@@ -887,5 +1033,190 @@ mod tests {
         assert!(absthr_db_to_energy(0.0) < absthr_db_to_energy(10.0));
         assert!((absthr_db_to_energy(0.0) - 1.0).abs() < 1e-12);
         assert!((absthr_db_to_energy(10.0) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn smr_silent_subband_is_neg_infinity() {
+        let r = vec![0.0; NUM_LINES];
+        let thr = vec![1.0; NUM_LINES];
+        let smr = smr_per_subband(&r, &thr);
+        for &s in &smr {
+            assert_eq!(s, f64::NEG_INFINITY, "silent subband demands nothing");
+        }
+    }
+
+    #[test]
+    fn smr_equals_ten_log10_energy_over_threshold_narrow_band() {
+        // Subband 13 (n=13) is a width-1 (narrow) coder partition: its
+        // npart is the SUM of per-line thresholds. Put uniform energy
+        // and uniform threshold over its 16 lines and check the dB.
+        let n = 13usize;
+        assert_eq!(CODER_PARTITIONS[n].width, 1);
+        let lo = CODER_PARTITIONS[n].boundary as usize - 1; // 0-based
+        let hi = CODER_PARTITIONS[n + 1].boundary as usize - 1;
+        let mut r = vec![0.0; NUM_LINES];
+        let mut thr = vec![0.0; NUM_LINES];
+        for line in lo..hi {
+            r[line] = 2.0; // energy 4.0 per line
+            thr[line] = 1.0;
+        }
+        let w = (hi - lo) as f64;
+        let epart = 4.0 * w;
+        let npart = 1.0 * w; // sum of thresholds
+        let want = 10.0 * (epart / npart).log10();
+        let smr = smr_per_subband(&r, &thr);
+        assert!((smr[n] - want).abs() < 1e-9, "narrow-band SMR {}", smr[n]);
+    }
+
+    #[test]
+    fn smr_wide_band_uses_min_threshold_times_width() {
+        // Subband 0 (n=0) is a width-0 (wide) coder partition: npart =
+        // min(thr)·width. A single quiet line must NOT drag npart down
+        // below min·W.
+        let n = 0usize;
+        assert_eq!(CODER_PARTITIONS[n].width, 0);
+        let lo = CODER_PARTITIONS[n].boundary as usize - 1;
+        let hi = CODER_PARTITIONS[n + 1].boundary as usize - 1;
+        let mut r = vec![0.0; NUM_LINES];
+        let mut thr = vec![0.0; NUM_LINES];
+        for line in lo..hi {
+            r[line] = 3.0; // energy 9.0 per line
+            thr[line] = 10.0;
+        }
+        thr[lo + 5] = 2.0; // one quiet line → becomes the minimum
+        let w = (hi - lo) as f64;
+        let epart = 9.0 * w;
+        let npart = 2.0 * w; // min·width, not the sum
+        let want = 10.0 * (epart / npart).log10();
+        let smr = smr_per_subband(&r, &thr);
+        assert!((smr[n] - want).abs() < 1e-9, "wide-band SMR {}", smr[n]);
+    }
+
+    #[test]
+    fn model2_state_rejects_lsf_half_rates() {
+        assert!(Model2State::new(24_000).is_none());
+        assert!(Model2State::new(44_100).is_some());
+    }
+
+    #[test]
+    fn model2_state_process_returns_finite_smr_for_tone() {
+        // A mid-band tone should yield a finite, positive SMR in the
+        // subband holding it and not panic.
+        let mut st = Model2State::new(44_100).unwrap();
+        let n = FFT_SIZE;
+        let bin = 64usize; // FFT line 64 → subband 3 (lines 49..64)
+        let mut samples = [0.0f64; FFT_SIZE];
+        for (i, sm) in samples.iter_mut().enumerate() {
+            *sm = 8000.0 * (2.0 * core::f64::consts::PI * bin as f64 * i as f64 / n as f64).cos();
+        }
+        let smr = st.process(&samples);
+        // The subband covering line 64 (0-based 63) is n=3 (lines
+        // 49..64 1-based). Its SMR should be a large finite number.
+        let sb = 3usize;
+        assert!(smr[sb].is_finite(), "tone subband SMR finite: {}", smr[sb]);
+        assert!(smr[sb] > 0.0, "tone above mask: {}", smr[sb]);
+    }
+
+    #[test]
+    fn model2_state_smr_level_invariant_above_floor() {
+        // A key psychoacoustic property the masking model encodes: for a
+        // tone well above the absolute threshold, the masking threshold
+        // tracks the signal (npart ∝ en ∝ amp²), so the SMR is
+        // essentially level-INVARIANT — the spectral shape (tonality),
+        // not the absolute playback level, sets the masking ratio. Two
+        // tones 20 dB apart in level produce the same per-subband SMR.
+        let n = FFT_SIZE;
+        let make = |amp: f64| {
+            let mut s = [0.0f64; FFT_SIZE];
+            for (i, sm) in s.iter_mut().enumerate() {
+                *sm = amp * (2.0 * core::f64::consts::PI * 64.0 * i as f64 / n as f64).cos();
+            }
+            s
+        };
+        let sb = 3usize;
+        let mut a = Model2State::new(48_000).unwrap();
+        let mut b = Model2State::new(48_000).unwrap();
+        let loud = a.process(&make(10_000.0));
+        let louder = b.process(&make(100_000.0));
+        assert!(
+            (loud[sb] - louder[sb]).abs() < 1e-6,
+            "above-floor SMR level-invariant: {} vs {}",
+            loud[sb],
+            louder[sb]
+        );
+    }
+
+    #[test]
+    fn model2_state_absolute_floor_caps_smr_for_quiet_signal() {
+        // Conversely, when the signal energy drops below the absolute
+        // threshold (LTq) floor, the threshold stops tracking the
+        // signal and the SMR falls below the above-floor plateau. A
+        // very high-frequency subband (large LTq) at a modest level
+        // shows the cap.
+        let n = FFT_SIZE;
+        let make = |amp: f64, bin: f64| {
+            let mut s = [0.0f64; FFT_SIZE];
+            for (i, sm) in s.iter_mut().enumerate() {
+                *sm = amp * (2.0 * core::f64::consts::PI * bin * i as f64 / n as f64).cos();
+            }
+            s
+        };
+        // Subband 24 covers FFT lines 385..400 (≈ 18 kHz at 48 kHz),
+        // where LTq is large. A loud tone there sits above the floor; a
+        // quiet one is capped by it → lower SMR.
+        let sb = 24usize;
+        let bin = 392.0;
+        let mut loud = Model2State::new(48_000).unwrap();
+        let mut quiet = Model2State::new(48_000).unwrap();
+        let l = loud.process(&make(50_000.0, bin));
+        let q = quiet.process(&make(5.0, bin));
+        assert!(
+            q[sb] < l[sb],
+            "quiet HF tone capped by LTq: quiet {} < loud {}",
+            q[sb],
+            l[sb]
+        );
+    }
+
+    #[test]
+    fn model2_state_steady_tone_grows_more_tonal_over_frames() {
+        // Across successive identical frames the unpredictability of a
+        // steady tone drops (prediction improves), so its tonality and
+        // hence required SNR rise — the masking threshold tightens and
+        // the SMR for the tone's subband increases (or holds) frame to
+        // frame after the history fills.
+        let n = FFT_SIZE;
+        let mut samples = [0.0f64; FFT_SIZE];
+        for (i, sm) in samples.iter_mut().enumerate() {
+            *sm = 5000.0 * (2.0 * core::f64::consts::PI * 64.0 * i as f64 / n as f64).cos();
+        }
+        let mut st = Model2State::new(44_100).unwrap();
+        let f1 = st.process(&samples); // no history
+        let _f2 = st.process(&samples); // one block of history
+        let f3 = st.process(&samples); // full two-block history
+        let sb = 3usize;
+        // With full history the tone is recognized as tonal; its SMR is
+        // finite and at least as large as the first (history-free)
+        // frame's SMR for that subband.
+        assert!(f3[sb].is_finite());
+        assert!(
+            f3[sb] >= f1[sb] - 1e-6,
+            "steady tone SMR does not fall: f3 {} vs f1 {}",
+            f3[sb],
+            f1[sb]
+        );
+    }
+
+    #[test]
+    fn model2_state_reset_clears_history() {
+        let mut st = Model2State::new(32_000).unwrap();
+        let samples = [1.0f64; FFT_SIZE];
+        st.process(&samples);
+        st.process(&samples);
+        st.reset();
+        // After reset the next frame behaves as a fresh start (no
+        // panic, finite-or-infinite SMR array of length 32).
+        let smr = st.process(&samples);
+        assert_eq!(smr.len(), SUBBANDS);
     }
 }

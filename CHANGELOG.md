@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Model 2 per-frame driver — SMR computation + streaming
+  state (clause D.2 step n).** `smr_per_subband` maps the per-line
+  energies / thresholds onto the 32 coder partitions of Table D.5 and
+  forms `SMR_n = 10·log10(epart_n / npart_n)`, where the noise term
+  `npart_n` sums the per-line thresholds for a psychoacoustically narrow
+  band (`width_n == 1`) but takes the minimum line threshold × the band
+  width for a wide band (`width_n == 0`) so one quiet line can't drop a
+  wide band's floor. `Model2State` ties the whole clause-D.2.4 chain
+  together with the two-block prediction history the step-c prediction
+  needs across successive frames: `Model2State::process` runs one
+  1024-sample analysis window (FFT → unpredictability → partition
+  energy/tonality → line thresholds → SMR) and slides the history.
+  `Model2State::new` returns `None` for the MPEG-2 LSF half-rates (no
+  Annex D Model 2 table). 9 new tests: silent-subband `-∞` SMR, the
+  narrow-band threshold-sum and wide-band min×width `npart` formulas,
+  LSF-rate rejection, finite positive SMR for a tone, the
+  level-invariance of SMR above the absolute-threshold floor and the LTq
+  cap below it, and that a steady tone's SMR does not fall as the
+  prediction history fills.
+
 - **Annex D Model 2 per-frame driver — spectral-analysis core (clause
   D.2.4 a/b).** New `model2` module assembling the static `psy` tables
   into the iterative per-frame procedure. This step lands the 1024-point
