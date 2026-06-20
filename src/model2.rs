@@ -247,6 +247,286 @@ impl Spectrum {
     }
 }
 
+/// Per-line unpredictability measure `c_ω` (clause D.2.4 c/d).
+///
+/// Step c predicts the magnitude `r̂_ω` and phase `f̂_ω` of the current
+/// block from the previous two blocks:
+///
+/// ```text
+/// r̂_ω = 2.0·r_ω(t−1) − r_ω(t−2)
+/// f̂_ω = 2.0·f_ω(t−1) − f_ω(t−2)
+/// ```
+///
+/// Step d forms the Euclidean distance between the (predicted, actual)
+/// polar vectors, normalized by the sum of the actual and predicted
+/// magnitudes:
+///
+/// ```text
+/// c_ω = √((r·cos f − r̂·cos f̂)² + (r·sin f − r̂·sin f̂)²) / (r + |r̂|)
+/// ```
+///
+/// `cur` is the current block's [`Spectrum`]; `prev1` / `prev2` are the
+/// previous two blocks. When a block is missing (start of stream), the
+/// prediction degenerates and `c_ω` reflects full unpredictability
+/// (≈ 1) for those lines, matching the spec's "white" startup.
+///
+/// The spec notes the measure may be computed on only a lower portion
+/// of the frequency lines (DC..~3 kHz min, ~7 kHz preferred) with the
+/// rest set to a constant 0.3; this driver computes the full band
+/// (`up_to == NUM_LINES`) but accepts an `up_to` cutoff so a caller can
+/// honour the spec's performance shortcut, filling `[up_to, NUM_LINES)`
+/// with 0.3.
+pub fn unpredictability(
+    cur: &Spectrum,
+    prev1: Option<&Spectrum>,
+    prev2: Option<&Spectrum>,
+    up_to: usize,
+) -> Vec<f64> {
+    let mut cw = vec![0.3f64; NUM_LINES];
+    let limit = up_to.min(NUM_LINES);
+    // `line` indexes cur.r/cur.f and the optional prev1/prev2 spectra
+    // in parallel; a range loop keeps the polar-prediction arithmetic
+    // legible against the spec's per-line c/d formulas.
+    #[allow(clippy::needless_range_loop)]
+    for line in 0..limit {
+        let r = cur.r[line];
+        let f = cur.f[line];
+        // Predicted magnitude / phase from the previous two blocks.
+        let (rhat, fhat) = match (prev1, prev2) {
+            (Some(p1), Some(p2)) => (2.0 * p1.r[line] - p2.r[line], 2.0 * p1.f[line] - p2.f[line]),
+            // Without two history blocks the predictor has nothing; a
+            // zero prediction yields c_ω = 1 (fully unpredictable).
+            _ => (0.0, 0.0),
+        };
+        let dx = r * f.cos() - rhat * fhat.cos();
+        let dy = r * f.sin() - rhat * fhat.sin();
+        let denom = r + rhat.abs();
+        cw[line] = if denom > 0.0 {
+            ((dx * dx + dy * dy).sqrt() / denom).clamp(0.0, 1.0)
+        } else {
+            // Silent line: treat as fully predictable (tonal) — the
+            // weighted unpredictability sum will be zero-weighted by
+            // the (also-zero) energy anyway.
+            0.0
+        };
+    }
+    cw
+}
+
+/// Precomputed per-rate Model 2 partition geometry: the calculation
+/// partitions (Table D.3x), the spreading matrix `sprdngf(bval_bb,
+/// bval_b)` and the renormalization coefficients `rnorm_b`
+/// (clause D.2.4 e/f).
+#[derive(Debug, Clone)]
+pub struct PartitionTables {
+    /// Calculation partitions (Table D.3x rows) for this rate.
+    pub partitions: Vec<CalcPartition>,
+    /// `spread[b][bb] = sprdngf(bval_bb, bval_b)` — the contribution of
+    /// source partition `bb` spread into target partition `b`.
+    pub spread: Vec<Vec<f64>>,
+    /// Renormalization coefficient `rnorm_b = 1 / Σ_bb sprdngf(bval_bb,
+    /// bval_b)` (clause D.2.4 f), one per target partition.
+    pub rnorm: Vec<f64>,
+}
+
+impl PartitionTables {
+    /// Build the partition geometry for `rate` from the staged
+    /// `psy` tables. The spreading matrix is `bmax × bmax`.
+    pub fn for_rate(rate: Model2Rate) -> Self {
+        let partitions = rate.calc_partitions();
+        let bmax = partitions.len();
+        let mut spread = vec![vec![0.0f64; bmax]; bmax];
+        for (b, row) in spread.iter_mut().enumerate() {
+            for (bb, cell) in row.iter_mut().enumerate() {
+                // sprdngf(i = source bval, j = target bval): the spec's
+                // i is the Bark of the signal being spread (source bb),
+                // j is the Bark of the band being spread into (target b).
+                *cell = crate::psy::model2_sprdngf(partitions[bb].bval, partitions[b].bval);
+            }
+        }
+        let rnorm = spread
+            .iter()
+            .map(|row| {
+                let s: f64 = row.iter().sum();
+                if s > 0.0 {
+                    1.0 / s
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        PartitionTables {
+            partitions,
+            spread,
+            rnorm,
+        }
+    }
+
+    /// Number of calculation partitions (`bmax`).
+    pub fn bmax(&self) -> usize {
+        self.partitions.len()
+    }
+}
+
+/// Per-partition Model 2 quantities for one frame (clause D.2.4 e–g).
+#[derive(Debug, Clone)]
+pub struct PartitionEnergies {
+    /// Raw partition energy `eb_b = Σ r_ω²` over the partition's lines.
+    pub eb: Vec<f64>,
+    /// Energy-weighted unpredictability `cb_b = Σ r_ω²·c_ω`.
+    pub cb_weighted: Vec<f64>,
+    /// Normalized spread energy `en_b = ecb_b · rnorm_b`.
+    pub en: Vec<f64>,
+    /// Spread weighted unpredictability `ct_b`.
+    pub ct: Vec<f64>,
+    /// Per-partition tonality index `tb_b ∈ (0, 1)`.
+    pub tb: Vec<f64>,
+}
+
+/// Steps e–g: accumulate per-partition energy `eb` and weighted
+/// unpredictability `cb`, convolve both with the spreading function to
+/// get `ecb` / `ct`, renormalize to `en`, and derive the tonality
+/// index `tb` (clause D.2.4 e/f/g).
+///
+/// `r` is the current block's per-line magnitude (`cur.r`); `cw` is the
+/// per-line unpredictability from [`unpredictability`]. Both index FFT
+/// lines `0..NUM_LINES` (DC..Nyquist). The partition `ωlow`/`ωhigh`
+/// columns are 1-based, so a partition spanning printed lines
+/// `[ωlow, ωhigh]` reads `r`/`cw` indices `[ωlow−1, ωhigh−1]`.
+pub fn partition_energies(tables: &PartitionTables, r: &[f64], cw: &[f64]) -> PartitionEnergies {
+    let bmax = tables.bmax();
+    let mut eb = vec![0.0f64; bmax];
+    let mut cb_weighted = vec![0.0f64; bmax];
+    for (b, p) in tables.partitions.iter().enumerate() {
+        let lo = (p.omega_low as usize).saturating_sub(1);
+        let hi = (p.omega_high as usize).min(NUM_LINES);
+        for line in lo..hi {
+            let e = r[line] * r[line];
+            eb[b] += e;
+            cb_weighted[b] += e * cw[line];
+        }
+    }
+
+    // Step f: convolve eb and (cb_weighted) with the spreading matrix.
+    // ecb_b = Σ_bb eb_bb · spread[b][bb]; ct_b = Σ_bb cb_bb · spread[b][bb].
+    let mut ecb = vec![0.0f64; bmax];
+    let mut ct = vec![0.0f64; bmax];
+    for b in 0..bmax {
+        let row = &tables.spread[b];
+        let mut e_acc = 0.0;
+        let mut c_acc = 0.0;
+        for bb in 0..bmax {
+            e_acc += eb[bb] * row[bb];
+            c_acc += cb_weighted[bb] * row[bb];
+        }
+        ecb[b] = e_acc;
+        ct[b] = c_acc;
+    }
+
+    // cb_b = ct_b / ecb_b (the spread, energy-weighted unpredictability
+    // ratio); en_b = ecb_b · rnorm_b (the renormalized spread energy).
+    let mut en = vec![0.0f64; bmax];
+    let mut tb = vec![0.0f64; bmax];
+    for b in 0..bmax {
+        en[b] = ecb[b] * tables.rnorm[b];
+        let cb = if ecb[b] > 0.0 { ct[b] / ecb[b] } else { 0.0 };
+        // Step g: tonality index tb_b = -0.299 - 0.43·ln(cb_b),
+        // limited to 0 < tb_b < 1.
+        let tbb = if cb > 0.0 {
+            -0.299 - 0.43 * cb.ln()
+        } else {
+            // cb → 0 means fully tonal; the formula diverges to +∞, so
+            // clamp to the upper bound 1.
+            1.0
+        };
+        tb[b] = tbb.clamp(0.0, 1.0);
+    }
+
+    PartitionEnergies {
+        eb,
+        cb_weighted,
+        en,
+        ct,
+        tb,
+    }
+}
+
+/// Reference noise-masking-tone offset `NMT_b = 5.5 dB` for all
+/// partitions (clause D.2.4 h).
+pub const NMT_DB: f64 = 5.5;
+
+/// Steps h–l: per-FFT-line audibility threshold `thr_ω` from the
+/// per-partition normalized energy `en`, tonality `tb`, the per-rate
+/// partition table (for `TMN_b` / `minval_b` and the `ωlow`/`ωhigh`
+/// spread-back), and the per-line absolute threshold (Table D.4x).
+///
+/// Per partition `b`:
+///
+/// ```text
+/// SNR_b  = max(minval_b, tb_b·TMN_b + (1−tb_b)·NMT_b)   (step h)
+/// bc_b   = 10^(−SNR_b/10)                                (step i, power ratio)
+/// nb_b   = en_b · bc_b                                   (step j, energy threshold)
+/// nb_ω   = nb_b / (ωhigh_b − ωlow_b + 1)                 (step k, spread over lines)
+/// thr_ω  = max(nb_ω, absthr_ω)                           (step l, fold in LTq)
+/// ```
+///
+/// `absthr_ω` is the Table D.4x absolute threshold converted from dB to
+/// the FFT energy domain via [`absthr_db_to_energy`]. Returns the
+/// per-FFT-line threshold `thr_ω` for `0..NUM_LINES` (DC..Nyquist).
+pub fn line_thresholds(
+    tables: &PartitionTables,
+    en: &[f64],
+    tb: &[f64],
+    rate: Model2Rate,
+) -> Vec<f64> {
+    let mut thr = vec![0.0f64; NUM_LINES];
+    for (b, p) in tables.partitions.iter().enumerate() {
+        // Step h: required SNR.
+        let snr = (tb[b] * p.tmn + (1.0 - tb[b]) * NMT_DB).max(p.minval);
+        // Step i: power ratio.
+        let bc = 10f64.powf(-snr / 10.0);
+        // Step j: partition energy threshold.
+        let nbb = en[b] * bc;
+        // Step k: spread over the partition's FFT lines.
+        let width = (p.omega_high - p.omega_low + 1) as f64;
+        let nb_omega = if width > 0.0 { nbb / width } else { 0.0 };
+        let lo = (p.omega_low as usize).saturating_sub(1);
+        let hi = (p.omega_high as usize).min(NUM_LINES);
+        for (line, t) in thr.iter_mut().enumerate().take(hi).skip(lo) {
+            // Step l: include the absolute threshold.
+            let absthr_e = rate
+                .absthr_db(line as u16 + 1)
+                .map(absthr_db_to_energy)
+                .unwrap_or(0.0);
+            *t = nb_omega.max(absthr_e);
+        }
+    }
+    thr
+}
+
+/// Convert a Table D.4x absolute-threshold dB value to the FFT
+/// energy domain (clause D.2.4 l note).
+///
+/// The spec note states: *"A value of 0 dB represents a level in the
+/// absolute threshold calculation of 96 dB below the energy of a sine
+/// wave of amplitude ±32 760"* and the dB values *"are relative to the
+/// level that a sine wave of ±½ lsb has in the FFT used for threshold
+/// calculation … the dB values must be converted to the energy domain
+/// after considering the FFT normalization actually used."*
+///
+/// This driver's FFT consumes the same `f64` PCM the analysis filter
+/// receives (the caller scales it to whatever full-scale convention it
+/// uses). The conversion below is the plain power-from-dB map
+/// `10^(absthr_db/10)` against a unit reference: it places the
+/// absolute-threshold floor on the same `r_ω²` energy scale as the
+/// per-partition energies `eb`. Because Model 2 is informative (no
+/// bit-exact oracle) and the SMR is a *ratio* `epart/npart`, only the
+/// relative placement of the floor matters, and it is documented here
+/// as the unit-reference convention.
+pub fn absthr_db_to_energy(absthr_db: f64) -> f64 {
+    10f64.powf(absthr_db / 10.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +737,155 @@ mod tests {
         for (n, cp) in CODER_PARTITIONS.iter().enumerate() {
             assert_eq!(cp.boundary as usize, 16 * n + 1);
         }
+    }
+
+    /// Build a polar spectrum directly from per-line (mag, phase) so
+    /// tests can drive the threshold steps without an FFT.
+    fn spectrum_from(mag_phase: &[(f64, f64)]) -> Spectrum {
+        let mut r = vec![0.0; NUM_LINES];
+        let mut f = vec![0.0; NUM_LINES];
+        for (line, &(m, p)) in mag_phase.iter().enumerate().take(NUM_LINES) {
+            r[line] = m;
+            f[line] = p;
+        }
+        Spectrum { r, f }
+    }
+
+    #[test]
+    fn unpredictability_full_when_no_history() {
+        // Without two prior blocks the predictor is zero, so a non-zero
+        // line is fully unpredictable (c_ω = 1).
+        let mut mp = vec![(0.0, 0.0); NUM_LINES];
+        mp[10] = (4.0, 0.5);
+        let cur = spectrum_from(&mp);
+        let cw = unpredictability(&cur, None, None, NUM_LINES);
+        assert!((cw[10] - 1.0).abs() < 1e-9, "no-history line fully unpred");
+    }
+
+    #[test]
+    fn unpredictability_zero_for_perfect_linear_prediction() {
+        // If the current block is exactly the linear extrapolation of
+        // the previous two (r = 2·r1 − r2, f = 2·f1 − f2), c_ω = 0.
+        let mut p2 = vec![(0.0, 0.0); NUM_LINES];
+        let mut p1 = vec![(0.0, 0.0); NUM_LINES];
+        let mut cu = vec![(0.0, 0.0); NUM_LINES];
+        p2[20] = (1.0, 0.1);
+        p1[20] = (2.0, 0.2);
+        cu[20] = (2.0 * 2.0 - 1.0, 2.0 * 0.2 - 0.1); // (3.0, 0.3)
+        let s2 = spectrum_from(&p2);
+        let s1 = spectrum_from(&p1);
+        let cur = spectrum_from(&cu);
+        let cw = unpredictability(&cur, Some(&s1), Some(&s2), NUM_LINES);
+        assert!(cw[20] < 1e-9, "perfectly predicted line unpred ≈ 0");
+    }
+
+    #[test]
+    fn unpredictability_constant_above_cutoff() {
+        let mp = vec![(1.0, 0.0); NUM_LINES];
+        let cur = spectrum_from(&mp);
+        let cw = unpredictability(&cur, None, None, 100);
+        for &v in cw.iter().take(100) {
+            assert!((v - 1.0).abs() < 1e-9);
+        }
+        for &v in cw.iter().skip(100) {
+            assert!((v - 0.3).abs() < 1e-12, "above cutoff held at 0.3");
+        }
+    }
+
+    #[test]
+    fn partition_tables_shapes_and_normalization() {
+        for rate in [
+            Model2Rate::Hz32000,
+            Model2Rate::Hz44100,
+            Model2Rate::Hz48000,
+        ] {
+            let t = PartitionTables::for_rate(rate);
+            let bmax = t.bmax();
+            assert_eq!(t.spread.len(), bmax);
+            assert!(t.spread.iter().all(|row| row.len() == bmax));
+            assert_eq!(t.rnorm.len(), bmax);
+            // Each rnorm conserves the spread row to unit sum.
+            for b in 0..bmax {
+                let s: f64 = t.spread[b].iter().sum();
+                assert!((s * t.rnorm[b] - 1.0).abs() < 1e-9, "rnorm conserves");
+            }
+        }
+    }
+
+    #[test]
+    fn partition_energies_sum_line_power() {
+        let t = PartitionTables::for_rate(Model2Rate::Hz32000);
+        // Put energy 4.0 (mag 2.0) on FFT line 1 (DC, index 0), which
+        // is partition 1 (ωlow=ωhigh=1).
+        let mut r = vec![0.0; NUM_LINES];
+        r[0] = 2.0;
+        let cw = vec![0.5; NUM_LINES];
+        let pe = partition_energies(&t, &r, &cw);
+        assert!((pe.eb[0] - 4.0).abs() < 1e-9, "partition 1 energy = 2²");
+        assert!((pe.cb_weighted[0] - 2.0).abs() < 1e-9, "weighted = 4·0.5");
+    }
+
+    #[test]
+    fn tonality_index_is_bounded_zero_one() {
+        // Drive a realistic spectrum and confirm every tb_b ∈ [0,1].
+        let t = PartitionTables::for_rate(Model2Rate::Hz44100);
+        let mut r = vec![0.0; NUM_LINES];
+        let mut cw = vec![0.0; NUM_LINES];
+        let mut st = 0x9e37_79b9u32;
+        for line in 0..NUM_LINES {
+            st = st.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            r[line] = ((st >> 9) as f64 / (1u32 << 23) as f64) * 5.0;
+            cw[line] = ((st >> 16) & 0xff) as f64 / 255.0;
+        }
+        let pe = partition_energies(&t, &r, &cw);
+        for &tb in &pe.tb {
+            assert!((0.0..=1.0).contains(&tb), "tonality bounded: {tb}");
+        }
+    }
+
+    #[test]
+    fn tonal_partition_gets_higher_snr_than_noisy() {
+        // A fully tonal partition (cb→0, tb→1) demands SNR ≈ TMN; a
+        // fully noisy one (tb→0) demands SNR ≈ NMT = 5.5 dB. TMN ≥ 24.5
+        // everywhere, so tonal SNR exceeds noisy SNR.
+        let t = PartitionTables::for_rate(Model2Rate::Hz32000);
+        let bmax = t.bmax();
+        // Large partition energy so the masking term nb dominates the
+        // absolute-threshold floor at the compared line.
+        let en = vec![1e12; bmax];
+        let tb_tonal = vec![1.0; bmax];
+        let tb_noisy = vec![0.0; bmax];
+        let thr_tonal = line_thresholds(&t, &en, &tb_tonal, Model2Rate::Hz32000);
+        let thr_noisy = line_thresholds(&t, &en, &tb_noisy, Model2Rate::Hz32000);
+        // Higher required SNR (tonal) → lower power ratio → lower noise
+        // threshold. Compare a mid-band line dominated by nb (not LTq).
+        let line = 200usize;
+        assert!(
+            thr_tonal[line] < thr_noisy[line],
+            "tonal {} < noisy {}",
+            thr_tonal[line],
+            thr_noisy[line]
+        );
+    }
+
+    #[test]
+    fn line_threshold_floored_by_absolute_threshold() {
+        // With zero signal energy the per-line threshold collapses to
+        // the Table D.4x absolute threshold (energy domain).
+        let t = PartitionTables::for_rate(Model2Rate::Hz32000);
+        let bmax = t.bmax();
+        let en = vec![0.0; bmax];
+        let tb = vec![0.5; bmax];
+        let thr = line_thresholds(&t, &en, &tb, Model2Rate::Hz32000);
+        // Line 100 (1-based) has a finite absolute threshold.
+        let absthr = absthr_db_to_energy(Model2Rate::Hz32000.absthr_db(100).unwrap());
+        assert!((thr[99] - absthr).abs() < 1e-9, "floored to LTq energy");
+    }
+
+    #[test]
+    fn absthr_db_to_energy_is_monotone() {
+        assert!(absthr_db_to_energy(0.0) < absthr_db_to_energy(10.0));
+        assert!((absthr_db_to_energy(0.0) - 1.0).abs() < 1e-12);
+        assert!((absthr_db_to_energy(10.0) - 10.0).abs() < 1e-9);
     }
 }
