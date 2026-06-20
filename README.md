@@ -52,20 +52,28 @@ and MPEG-2 LSF:
   `Mp1Layer2FrameEncoder`, with optional CRC and §2.4.1.8 ancillary-data
   emission.
 
-The encoder uses a non-psychoacoustic signal-energy SMR proxy; the
-Annex D psychoacoustic models (Model 1 / Model 2) are extensively staged
-in the `psy` module but not yet wired into bit allocation. Staged so
-far: the §D.2 critical-band tables (D.2a–f), the Step 6 masking-index /
-spreading-function closed forms, the Step 7 global-threshold sum, the
-Model 2 partition-domain spreading operator at **all three rates**
-(32 / 44,1 / 48 kHz, Tables D.3a–c), the **complete Layer I
-threshold-in-quiet tables D.1a–c** (108 / 106 / 102 rows at 32 / 44,1 /
-48 kHz), and — this round — the **complete Model 2 per-FFT-line
-absolute-threshold tables D.4a–c** (32 / 44,1 / 48 kHz) with O(log n)
-per-line lookup. Every Model 2 numeric table in Annex D (D.1a–c /
-D.2a–f / D.3a–c / D.4a–c) is now transcribed in tree; the Layer II
-threshold tables D.1d–f remain the only staged-but-untranscribed
-LTq family.
+The Layer I encoder can drive bit allocation from the **Annex D
+Psychoacoustic Model 2** — set `EncodeParams::with_psychoacoustic(true)`
+and the `Mp1FrameEncoder` runs the full clause-D.2.4 per-frame procedure
+each frame (assembled in the `model2` module): a 1024-point Hann-windowed
+FFT, the two-block unpredictability/tonality estimate, per-partition
+energy accumulation, spreading-function convolution and renormalization,
+the required-SNR / power-ratio / energy-threshold chain, and the
+per-FFT-line audibility threshold, collapsed onto the 32 coder
+partitions (Table D.5) to per-subband signal-to-mask ratios `SMR_n`.
+`allocate_bits_psy` then runs the §C.1.5.1.6 iterative allocator on the
+SMR (`MNR = SNR(nb) − SMR`): masked subbands draw no bits and the most
+perceptually exposed subbands are served first. The model is honoured at
+32 / 44,1 / 48 kHz (the rates with Annex D tables); the MPEG-2 LSF
+half-rates fall back to the signal-energy proxy. The default allocator
+(`psychoacoustic = false`) remains the non-psychoacoustic energy proxy
+for byte-for-byte compatibility.
+
+Every Model 2 numeric table in Annex D (D.1a–c / D.2a–f / D.3a–c /
+D.4a–c / D.5) is transcribed in the `psy` module from 400-DPI renders of
+the staged ISO PDF; the Layer II threshold-in-quiet tables D.1d–f remain
+the only staged-but-untranscribed LTq family (not needed for the wired
+Layer I Model 2 path).
 
 ## API
 
@@ -79,16 +87,19 @@ also selectable via `EncodeParams::with_layer(LayerSelect)`.
 
 ## Not yet supported
 
-- Psychoacoustic-model-driven encode quality. The §C.1.5.2.7 allocator
-  uses a signal-energy SMR proxy; the Annex D psychoacoustic models
-  (Model 1 / Model 2) are extensively staged in `psy` (all D.1a–c /
-  D.2a–f / D.3a–c / D.4a–c Model 2 tables transcribed, plus the Step 6 /
-  7 closed forms and the per-rate partition spreading operator) but the
-  per-frame Model 2 driver — the FFT, the tonality/SMR estimation
-  combination rule (clause D.2.4), and the wiring of the resulting SMR
-  into the §C.1.5.2.7 allocator — is not yet assembled. The Layer II
-  threshold-in-quiet tables D.1d–f remain staged as CSVs awaiting
-  transcription.
+- **Layer II Model 2 psychoacoustic allocation.** The per-frame Model 2
+  driver and `allocate_bits_psy` are wired into the **Layer I**
+  encoder; the §C.1.5.2.7 Layer II allocator still uses the
+  signal-energy SMR proxy. Wiring the same `Model2State` SMR into the
+  Layer II allocator (and transcribing the Layer II threshold-in-quiet
+  tables D.1d–f, currently staged as CSVs) is the remaining
+  psychoacoustic work.
+- **Annex D Model 1.** Only Model 2 is assembled into a per-frame
+  driver; the Model 1 masking-index / masking-function closed forms are
+  staged in `psy` but there is no Model 1 frame driver (Model 2 is the
+  more capable of the two example models).
+- **Model 2 pre-echo control** (clause D.2.4 m) is Layer III-only and
+  intentionally omitted for Layers I / II.
 
 ## Robustness
 

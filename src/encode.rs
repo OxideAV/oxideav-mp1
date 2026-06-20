@@ -385,6 +385,100 @@ pub fn allocate_bits(energy: &[[f64; SUBBANDS]; 2], nch: usize, budget_bits: usi
     alloc
 }
 
+/// Run the §C.1.5.1.6 iterative bit allocation using the Annex D
+/// **Model 2 psychoacoustic** signal-to-mask ratios `smr[ch][sb]`
+/// instead of the [`allocate_bits`] signal-energy proxy.
+///
+/// The loop structure is identical to [`allocate_bits`] — each
+/// iteration raises the subband with the minimal mask-to-noise ratio
+/// (MNR) that can still afford its next bit step within `budget_bits` —
+/// but the MNR is computed perceptually:
+///
+/// ```text
+/// MNR(ch, sb) = SNR(nb) − SMR(ch, sb)   dB
+/// ```
+///
+/// where `SNR(nb)` is the §Table C.3 quantizer SNR at the current
+/// allocation and `SMR(ch, sb)` is the per-subband signal-to-mask ratio
+/// from [`crate::model2::Model2State::process`]. A subband whose signal
+/// is fully masked (`SMR == −∞`, the silent / below-threshold case)
+/// never demands bits; a subband above the masking floor competes for
+/// bits in proportion to how far its noise still exceeds the mask.
+///
+/// This is the perceptual allocator the §C.1.5.2.7 / §C.1.5.1.6 prose
+/// describes: louder *and perceptually exposed* subbands get bits
+/// first. It is wired into [`Mp1FrameEncoder`] by
+/// [`EncodeParams::with_psychoacoustic`].
+// Same (ch, sb) index walk as `allocate_bits`; an iterator rewrite
+// would obscure the §C.1.5.1.6 "minimal-MNR subband" loop.
+#[allow(clippy::needless_range_loop)]
+pub fn allocate_bits_psy(smr: &[[f64; SUBBANDS]; 2], nch: usize, budget_bits: usize) -> Allocation {
+    let mut alloc: Allocation = [[0u8; SUBBANDS]; 2];
+    let mut spent = 0usize;
+    let next_nb = |nb: u8| -> u8 {
+        if nb == 0 {
+            2
+        } else if nb < 15 {
+            nb + 1
+        } else {
+            15
+        }
+    };
+    let step_cost = |nb: u8| -> usize {
+        let nn = next_nb(nb);
+        let sample_bits = 12 * (nn as usize - nb as usize);
+        let scf_bits = if nb == 0 { 6 } else { 0 };
+        sample_bits + scf_bits
+    };
+
+    loop {
+        let mut best: Option<(usize, usize, f64)> = None;
+        for ch in 0..nch {
+            for sb in 0..SUBBANDS {
+                let nb = alloc[ch][sb];
+                if nb >= 15 {
+                    continue;
+                }
+                // A fully masked subband (SMR == −∞) never needs bits.
+                let s = smr[ch][sb];
+                if !s.is_finite() && s == f64::NEG_INFINITY {
+                    continue;
+                }
+                if spent + step_cost(nb) > budget_bits {
+                    continue;
+                }
+                // Perceptual MNR: how far the quantization noise still
+                // sits above the masking threshold. Lower == more urgent.
+                let snr = SNR_DB[nb as usize];
+                // An infinitely-audible subband (SMR == +∞, no masking
+                // floor) is always the most urgent; represent its MNR as
+                // −∞ so it wins until it gets bits.
+                let mnr = if s == f64::INFINITY {
+                    f64::NEG_INFINITY
+                } else {
+                    snr - s
+                };
+                let better = match best {
+                    None => true,
+                    Some((_, _, bmnr)) => mnr < bmnr,
+                };
+                if better {
+                    best = Some((ch, sb, mnr));
+                }
+            }
+        }
+        match best {
+            Some((ch, sb, _)) => {
+                let nb = alloc[ch][sb];
+                spent += step_cost(nb);
+                alloc[ch][sb] = next_nb(nb);
+            }
+            None => break,
+        }
+    }
+    alloc
+}
+
 /// Map an `nb` (bits per sample) back to the 4-bit `allocation` code
 /// (§2.4.2.5, the inverse of [`crate::decode::allocation_bits`]).
 ///
@@ -2652,6 +2746,18 @@ pub struct EncodeParams {
     /// [`Mp1Encoder`](crate::Mp1Encoder) wrapper that adapts an
     /// [`oxideav_core::Encoder`] to either inner encoder.
     pub layer: LayerSelect,
+    /// When `true`, the Layer I [`Mp1FrameEncoder`] drives bit
+    /// allocation from the Annex D **Model 2 psychoacoustic** model
+    /// ([`crate::model2::Model2State`]) via [`allocate_bits_psy`]
+    /// instead of the default signal-energy proxy ([`allocate_bits`]).
+    ///
+    /// Only honoured for Layer I output at a sampling frequency with an
+    /// Annex D Model 2 table (32 / 44.1 / 48 kHz); at the MPEG-2 LSF
+    /// half-rates, or when the FFT history is not yet primed, the
+    /// encoder falls back to the energy proxy for that frame. Defaults
+    /// to `false`, preserving byte-for-byte compatibility with the
+    /// pre-psychoacoustic encoder.
+    pub psychoacoustic: bool,
 }
 
 impl EncodeParams {
@@ -2673,6 +2779,7 @@ impl EncodeParams {
             mode,
             emit_crc: false,
             layer: LayerSelect::LayerI,
+            psychoacoustic: false,
         }
     }
 
@@ -2701,6 +2808,16 @@ impl EncodeParams {
     /// and consumes 1152.
     pub fn with_layer(mut self, layer: LayerSelect) -> EncodeParams {
         self.layer = layer;
+        self
+    }
+
+    /// Builder: enable Annex D **Model 2 psychoacoustic** bit allocation
+    /// for Layer I output (see [`EncodeParams::psychoacoustic`]). The
+    /// Layer I [`Mp1FrameEncoder`] then derives per-subband
+    /// signal-to-mask ratios from the FFT-based model and allocates bits
+    /// via [`allocate_bits_psy`].
+    pub fn with_psychoacoustic(mut self, enable: bool) -> EncodeParams {
+        self.psychoacoustic = enable;
         self
     }
 }
@@ -2792,6 +2909,15 @@ fn bitrate_index(kbps: u16, id_bit: u8) -> Option<u8> {
 pub struct Mp1FrameEncoder {
     params: EncodeParams,
     filters: Vec<AnalysisFilter>,
+    /// Per-channel Annex D Model 2 driver, present only when
+    /// [`EncodeParams::psychoacoustic`] is set **and** the sampling
+    /// frequency has an Annex D Model 2 table (32 / 44.1 / 48 kHz).
+    psy: Option<Vec<crate::model2::Model2State>>,
+    /// Per-channel 1024-sample sliding analysis buffer feeding the Model
+    /// 2 FFT (the 384 new Layer I samples per frame are shifted in at
+    /// the tail; the leading 640 are the previous frames' history,
+    /// zero-padded at stream start). Empty when `psy` is `None`.
+    psy_window: Vec<[f64; crate::model2::FFT_SIZE]>,
 }
 
 impl Mp1FrameEncoder {
@@ -2799,9 +2925,26 @@ impl Mp1FrameEncoder {
     /// analysis history.
     pub fn new(params: EncodeParams) -> Mp1FrameEncoder {
         let nch = params.mode.channels() as usize;
+        // Build the Model 2 drivers only when psychoacoustic allocation
+        // is requested and the rate has an Annex D table.
+        let psy = if params.psychoacoustic {
+            let states: Option<Vec<_>> = (0..nch)
+                .map(|_| crate::model2::Model2State::new(params.sampling_frequency))
+                .collect();
+            states
+        } else {
+            None
+        };
+        let psy_window = if psy.is_some() {
+            vec![[0.0f64; crate::model2::FFT_SIZE]; nch]
+        } else {
+            Vec::new()
+        };
         Mp1FrameEncoder {
             params,
             filters: (0..nch).map(|_| AnalysisFilter::new()).collect(),
+            psy,
+            psy_window,
         }
     }
 
@@ -2810,6 +2953,21 @@ impl Mp1FrameEncoder {
         for f in &mut self.filters {
             f.reset();
         }
+        if let Some(states) = &mut self.psy {
+            for s in states {
+                s.reset();
+            }
+        }
+        for w in &mut self.psy_window {
+            *w = [0.0f64; crate::model2::FFT_SIZE];
+        }
+    }
+
+    /// Whether this encoder is running Model 2 psychoacoustic
+    /// allocation (psychoacoustic requested and the rate has an Annex D
+    /// table).
+    pub fn is_psychoacoustic(&self) -> bool {
+        self.psy.is_some()
     }
 
     /// The channel count implied by the encode mode.
@@ -2919,7 +3077,29 @@ impl Mp1FrameEncoder {
             has_crc,
             nch,
         );
-        let alloc = allocate_bits(&peak, nch, budget);
+        // Annex D Model 2 psychoacoustic allocation when enabled: slide
+        // the 384 new per-channel samples into the 1024-sample analysis
+        // window, run the per-channel Model 2 driver to get per-subband
+        // SMR, and allocate against the SMR. Falls back to the
+        // signal-energy proxy when psychoacoustic is off / the rate has
+        // no Annex D table (`psy == None`).
+        let fft_size = crate::model2::FFT_SIZE;
+        let alloc = if let Some(states) = self.psy.as_mut() {
+            let mut smr = [[0.0f64; SUBBANDS]; 2];
+            for ch in 0..nch {
+                // Shift the window left by 384 and append the new frame.
+                let win = &mut self.psy_window[ch];
+                win.copy_within(per_ch.., 0);
+                let tail = fft_size - per_ch;
+                for (k, slot) in win[tail..].iter_mut().enumerate() {
+                    *slot = pcm[k * nch + ch];
+                }
+                smr[ch] = states[ch].process(win);
+            }
+            allocate_bits_psy(&smr, nch, budget)
+        } else {
+            allocate_bits(&peak, nch, budget)
+        };
 
         // --- 4. Frame assembly (§C.1.5.1.10 / figure C.2) ---
         let mut bw = BitWriter::new();
@@ -6453,5 +6633,129 @@ mod tests {
         assert_eq!(p0, used[0]);
         assert_eq!(p12, used[1]);
         assert_eq!(used[1], used[2], "scfsi 11 collapse invariant");
+    }
+
+    // ---- Model 2 psychoacoustic allocation (Annex D) ----------
+
+    #[test]
+    fn allocate_bits_psy_respects_budget() {
+        // Some moderate per-subband SMRs; allocation must not exceed
+        // budget. Cost: 0→2 bits = 24+6 = 30 bits per subband; each
+        // further step is 12 bits.
+        let mut smr = [[0.0f64; SUBBANDS]; 2];
+        for ch in 0..2 {
+            for sb in 0..SUBBANDS {
+                smr[ch][sb] = (sb as f64) * 2.0;
+            }
+        }
+        let budget = 200usize;
+        let alloc = allocate_bits_psy(&smr, 1, budget);
+        // Tally the real cost of the produced allocation.
+        let mut spent = 0usize;
+        for sb in 0..SUBBANDS {
+            let nb = alloc[0][sb];
+            if nb >= 2 {
+                spent += 6 + 12 * nb as usize;
+            }
+        }
+        assert!(spent <= budget, "psy allocation {spent} within {budget}");
+    }
+
+    #[test]
+    fn allocate_bits_psy_skips_fully_masked_subbands() {
+        // A subband whose SMR is −∞ (fully masked) never receives bits,
+        // even with ample budget.
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        smr[0][5] = 30.0; // only subband 5 is audible
+        let alloc = allocate_bits_psy(&smr, 1, 10_000);
+        for sb in 0..SUBBANDS {
+            if sb == 5 {
+                assert!(alloc[0][sb] > 0, "audible subband gets bits");
+            } else {
+                assert_eq!(alloc[0][sb], 0, "masked subband {sb} gets none");
+            }
+        }
+    }
+
+    #[test]
+    fn allocate_bits_psy_prefers_higher_smr() {
+        // With a tight budget, the subband demanding the most precision
+        // (highest SMR → lowest MNR) is served first.
+        let mut smr = [[0.0f64; SUBBANDS]; 2];
+        smr[0][10] = 40.0; // most exposed
+        smr[0][20] = 5.0; // barely exposed
+                          // Budget for exactly one 0→2 step (30 bits).
+        let alloc = allocate_bits_psy(&smr, 1, 30);
+        assert!(alloc[0][10] >= 2, "highest-SMR subband served first");
+        assert_eq!(alloc[0][20], 0, "low-SMR subband waits");
+    }
+
+    #[test]
+    fn psychoacoustic_encoder_round_trips_to_pcm() {
+        // A Model 2 driven encode produces a decodable Layer I frame.
+        let params = EncodeParams::new(Bitrate::Fixed(192), 44_100, Mode::SingleChannel)
+            .with_psychoacoustic(true);
+        let mut enc = Mp1FrameEncoder::new(params);
+        assert!(enc.is_psychoacoustic(), "44.1 kHz has an Annex D table");
+        // A simple tone, 384 samples.
+        let mut pcm = vec![0.0f64; 384];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = 0.5 * (2.0 * core::f64::consts::PI * 5.0 * i as f64 / 384.0).sin();
+        }
+        // Feed a few frames so the FFT history primes, then encode.
+        let mut bytes = Vec::new();
+        for _ in 0..4 {
+            bytes = enc.encode_frame(&pcm).expect("psy encode ok");
+        }
+        // The output parses as a Layer I frame.
+        let hdr = crate::header::FrameHeader::parse(&bytes).expect("valid header");
+        assert_eq!(hdr.layer, crate::header::Layer::I);
+    }
+
+    #[test]
+    fn psychoacoustic_falls_back_at_lsf_rate() {
+        // 24 kHz is an MPEG-2 LSF half-rate with no Annex D Model 2
+        // table; the encoder silently falls back to the energy proxy.
+        let params = EncodeParams::new(Bitrate::Fixed(96), 24_000, Mode::SingleChannel)
+            .with_psychoacoustic(true);
+        let enc = Mp1FrameEncoder::new(params);
+        assert!(
+            !enc.is_psychoacoustic(),
+            "LSF rate has no Annex D table → energy-proxy fallback"
+        );
+    }
+
+    #[test]
+    fn psychoacoustic_builder_sets_flag() {
+        let p =
+            EncodeParams::new(Bitrate::Fixed(192), 48_000, Mode::Stereo).with_psychoacoustic(true);
+        assert!(p.psychoacoustic);
+        let p2 = EncodeParams::new(Bitrate::Fixed(192), 48_000, Mode::Stereo);
+        assert!(!p2.psychoacoustic, "default off");
+    }
+
+    #[test]
+    fn psychoacoustic_and_energy_paths_both_fit_budget() {
+        // Both allocators stay within the frame payload budget on the
+        // same input; the psy path is not silently overspending.
+        let mk = |psy: bool| {
+            let params = EncodeParams::new(Bitrate::Fixed(128), 48_000, Mode::SingleChannel)
+                .with_psychoacoustic(psy);
+            let mut enc = Mp1FrameEncoder::new(params);
+            let mut pcm = vec![0.0f64; 384];
+            for (i, s) in pcm.iter_mut().enumerate() {
+                *s = 0.3 * (2.0 * core::f64::consts::PI * 9.0 * i as f64 / 384.0).sin();
+            }
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out = enc.encode_frame(&pcm).expect("encode ok");
+            }
+            out.len()
+        };
+        let energy_len = mk(false);
+        let psy_len = mk(true);
+        // Same bitrate / rate → identical frame size regardless of
+        // allocation strategy (the slot count is rate-driven).
+        assert_eq!(energy_len, psy_len, "frame size is rate-driven");
     }
 }

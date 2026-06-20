@@ -47,7 +47,8 @@
 //!   FFT lines and folds in the absolute threshold to yield `thr_ω`;
 //! - **n)** maps the FFT-line energies/thresholds onto the 32 coder
 //!   partitions (Table D.5) and forms `SMR_n` per subband
-//!   ([`Model2State::smr_per_subband`]).
+//!   ([`smr_per_subband`], surfaced per-frame by
+//!   [`Model2State::process`]).
 //!
 //! [`Model2State`] holds the two-block prediction history so a caller
 //! that streams successive Layer I frames gets the cross-frame

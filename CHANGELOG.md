@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 2 psychoacoustic bit allocation wired into the Layer I
+  encoder.** `allocate_bits_psy` runs the §C.1.5.1.6 iterative allocator
+  on the Annex D Model 2 signal-to-mask ratios (`MNR = SNR(nb) − SMR`)
+  instead of the signal-energy proxy: fully masked subbands
+  (`SMR == −∞`) never draw bits, and the most perceptually exposed
+  subbands are served first. `EncodeParams::with_psychoacoustic(true)`
+  opts the Layer I `Mp1FrameEncoder` into the model — the encoder
+  maintains a per-channel 1024-sample sliding FFT window, runs the
+  per-channel `Model2State` each frame, and allocates against the
+  resulting SMR. Honoured at 32 / 44.1 / 48 kHz; the MPEG-2 LSF
+  half-rates (no Annex D table) silently fall back to `allocate_bits`.
+  `Mp1FrameEncoder::is_psychoacoustic` reports whether the model is
+  active. 7 new tests: budget compliance, masked-subband skipping,
+  highest-SMR-first preference, an end-to-end psychoacoustic encode that
+  round-trips to a parseable Layer I frame, LSF-rate fallback, the
+  builder flag, and frame-size parity between the two allocators. The
+  stale lib-level "Annex D is a DOCS-GAP" note is replaced — every Model
+  2 table is now in tree and the model is wired.
+
 - **Annex D Model 2 per-frame driver — SMR computation + streaming
   state (clause D.2 step n).** `smr_per_subband` maps the per-line
   energies / thresholds onto the 32 coder partitions of Table D.5 and

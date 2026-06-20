@@ -67,13 +67,21 @@
 //! channel per frame (the §2.4.2.1 Layer II granularity) instead of
 //! the Layer I 384.
 //!
-//! One spec gap remains, not blocking decode to PCM: Annex D's
-//! psychoacoustic models are not implemented (the encoder's allocator
-//! is signal-energy-driven); the staged 11172-3 PDF carries Annex D
-//! §D.1 prose but the essential numeric tables (D.1a/b/c absolute
-//! thresholds, D.2a/b/c critical band boundaries) are only present in
-//! an OCR-corrupted text layer, so the perceptual model is a DOCS-GAP
-//! awaiting clean Annex D renders.
+//! The encoder can drive bit allocation from the Annex D
+//! **Psychoacoustic Model 2** ([`model2`]): set
+//! [`encode::EncodeParams::psychoacoustic`] (or call
+//! [`encode::EncodeParams::with_psychoacoustic`]) and the Layer I
+//! [`encode::Mp1FrameEncoder`] runs the full clause-D.2.4 per-frame
+//! procedure — 1024-point Hann-windowed FFT, two-block unpredictability,
+//! per-partition energy/tonality, spreading-function convolution, and
+//! the per-FFT-line audibility threshold — to produce per-subband
+//! signal-to-mask ratios that feed [`encode::allocate_bits_psy`]. The
+//! model is honoured at 32 / 44.1 / 48 kHz (the rates with Annex D
+//! Model 2 tables); the MPEG-2 LSF half-rates fall back to the
+//! signal-energy proxy ([`encode::allocate_bits`]). The Annex D numeric
+//! tables (D.1a–c / D.2a–f / D.3a–c / D.4a–c / D.5) are fully
+//! transcribed in [`psy`] from 400-DPI renders of the staged 11172-3
+//! PDF.
 
 #![warn(missing_debug_implementations)]
 
@@ -103,10 +111,10 @@ pub use decode_layer2::{
 };
 pub use decoder::make_decoder_with_concealment;
 pub use encode::{
-    allocate_bits, allocate_bits_layer2, bitrate_index_layer2, encode_layer2_frame,
-    encode_layer2_frame_with_ancillary, layer2_frame_payload_bits, layer2_stereo_bound,
-    layer2_subband_peak_per_part, pack_layer2_header, quantize, quantize_layer2_sample,
-    select_layer2_scalefactors, select_scalefactor, sum_nbal_per_channel,
+    allocate_bits, allocate_bits_layer2, allocate_bits_psy, bitrate_index_layer2,
+    encode_layer2_frame, encode_layer2_frame_with_ancillary, layer2_frame_payload_bits,
+    layer2_stereo_bound, layer2_subband_peak_per_part, pack_layer2_header, quantize,
+    quantize_layer2_sample, select_layer2_scalefactors, select_scalefactor, sum_nbal_per_channel,
     write_layer2_allocation_field, write_layer2_header, write_layer2_samples_field,
     write_layer2_scalefactor_field, Allocation, AnalysisFilter, BitWriter, EncodeError,
     EncodeParams, Layer2Allocation, Layer2AllocationFieldError, Layer2EncodeError,
