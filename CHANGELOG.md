@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Model 2 per-frame driver — spectral-analysis core (clause
+  D.2.4 a/b).** New `model2` module assembling the static `psy` tables
+  into the iterative per-frame procedure. This step lands the 1024-point
+  Hann analysis window (`hann_window`, the `√(8/3)` amplitude
+  correction), a textbook radix-2 decimation-in-time FFT
+  (`fft_in_place`), and the polar `(r_ω, f_ω)` spectrum
+  (`Spectrum::analyze`) for the 513 usable FFT lines (DC..Nyquist).
+  `Model2Rate` resolves a sampling frequency to its D.3/D.4 table set
+  (`bmax` 49 / 57 / 58 at 32 / 44,1 / 48 kHz) and exposes the
+  calculation-partition and per-line absolute-threshold accessors the
+  later steps consume. Tests cross-check the FFT against a naïve DFT to
+  1e-9, verify the Hann window energy correction (windowed mean-square
+  gain ≈ 1), the spreading-function self-spread peak, and the
+  contiguous calc-partition tiling to the Nyquist line. Formulas read
+  verbatim from ISO/IEC 11172-3 (1993) Annex D clause D.2.3 / D.2.4
+  (PDF pages 135–138, printed 129–132).
+
 - **Annex D Tables D.4a–c — complete Model 2 per-FFT-line
   absolute-threshold tables (32 / 44,1 / 48 kHz).** The last untranscribed
   Model 2 Annex D table family is now in tree: the 132 / 130 / 126
