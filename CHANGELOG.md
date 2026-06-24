@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Tables D.1d–f — complete Layer II threshold-in-quiet (LTq)
+  tables (32 / 44,1 / 48 kHz).** The last untranscribed Annex D table
+  family is now in tree: the 132 / 130 / 126 absolute-threshold rows
+  from `docs/audio/mp3/annex-d-table-D1{d,e,f}-threshold-*-LayerII.csv`
+  are carried in `LTQ_L2_32K` / `LTQ_L2_44K1` / `LTQ_L2_48K` as the same
+  four-column `LtqRow` (1-based index, FFT-line frequency, critical-band
+  rate in Bark, pre-offset `ltq_db`) the Layer I D.1a–c family uses. The
+  Layer II tables sit on the **finer** 1024-point FFT-line grid: the
+  D.1d head row is 31,25 Hz (half the D.1a 62,50 Hz step), so the printed
+  tables run longer than their Layer I twins (132/130/126 vs 108/106/102).
+  Direct slot accessors `ltq_layer2_32k` / `ltq_layer2_44k1` /
+  `ltq_layer2_48k` (`None` for `i == 0` and above each table's printed
+  end) and the Step 3 composers `ltq_layer2_*_used(i, kbps)` mirror the
+  Layer I pairs. Carries the as-printed values including the documented
+  minima (`-4.97 dB` at i = 75 for D.1d, `-4.98 dB` at i = 63 / 59 for
+  D.1e/D.1f) and the 68,00 dB ceiling saturation (from i = 119 in D.1e,
+  i = 115 in D.1f; D.1d's 16 kHz Nyquist never reaches it). **+12
+  lib-tests** cover row counts and the 132 > 130 > 126 ordering, dense
+  1-based numbering, strictly-monotonic freq/Bark across all three,
+  verbatim head + final rows for each table, the documented minima and
+  ceilings, the 31,25 Hz head-grid spacing, the lookup hit/miss sets,
+  Step 3 offset composition with `None` propagation past each table end,
+  and that the Layer II row 1 sits at half the Layer I row-1 frequency
+  with the row-2/row-1 LTq matching across the families. This closes the
+  last "staged-but-untranscribed LTq family" note — the **entire Annex D
+  table family is now transcribed**. Total `cargo test -p oxideav-mp1
+  --lib` count: **448 → 460**.
+
 - **Model 2 psychoacoustic bit allocation wired into the Layer I
   encoder.** `allocate_bits_psy` runs the §C.1.5.1.6 iterative allocator
   on the Annex D Model 2 signal-to-mask ratios (`MNR = SNR(nb) − SMR`)

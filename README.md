@@ -69,11 +69,14 @@ half-rates fall back to the signal-energy proxy. The default allocator
 (`psychoacoustic = false`) remains the non-psychoacoustic energy proxy
 for byte-for-byte compatibility.
 
-Every Model 2 numeric table in Annex D (D.1a–c / D.2a–f / D.3a–c /
-D.4a–c / D.5) is transcribed in the `psy` module from 400-DPI renders of
-the staged ISO PDF; the Layer II threshold-in-quiet tables D.1d–f remain
-the only staged-but-untranscribed LTq family (not needed for the wired
-Layer I Model 2 path).
+**Every** numeric table in Annex D — the Layer I and Layer II
+threshold-in-quiet families (D.1a–c / D.1d–f), the critical-band tables
+(D.2a–f), the Model 2 calculation-partition tables (D.3a–c), the Model 2
+per-line absolute-threshold tables (D.4a–c) and the coder-partition table
+(D.5) — is now transcribed in the `psy` module from the staged ISO text
+extractions / 400-DPI renders. The Layer II LTq tables D.1d–f sit on the
+finer 1024-point FFT-line grid (132/130/126 rows vs the Layer I
+108/106/102) and feed the Layer II Model 2 path.
 
 ## API
 
@@ -90,10 +93,10 @@ also selectable via `EncodeParams::with_layer(LayerSelect)`.
 - **Layer II Model 2 psychoacoustic allocation.** The per-frame Model 2
   driver and `allocate_bits_psy` are wired into the **Layer I**
   encoder; the §C.1.5.2.7 Layer II allocator still uses the
-  signal-energy SMR proxy. Wiring the same `Model2State` SMR into the
-  Layer II allocator (and transcribing the Layer II threshold-in-quiet
-  tables D.1d–f, currently staged as CSVs) is the remaining
-  psychoacoustic work.
+  signal-energy SMR proxy. The Layer II threshold-in-quiet tables
+  D.1d–f are now transcribed (`LTQ_L2_32K` / `LTQ_L2_44K1` /
+  `LTQ_L2_48K`); wiring the same `Model2State` SMR into the §C.1.5.2.7
+  Layer II allocator is the remaining psychoacoustic work.
 - **Annex D Model 1.** Only Model 2 is assembled into a per-frame
   driver; the Model 1 masking-index / masking-function closed forms are
   staged in `psy` but there is no Model 1 frame driver (Model 2 is the
