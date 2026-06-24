@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Model 2 psychoacoustic bit allocation wired into the
+  Layer II encoder.** `allocate_bits_layer2_psy` runs the §C.1.5.2.7
+  iterative allocator on the Annex D Model 2 signal-to-mask ratios
+  (`MNR = SNR(nlevels) − SMR`) instead of the signal-energy proxy: fully
+  masked subbands (`SMR == −∞`) never draw bits, an infinitely-audible
+  subband (`SMR == +∞`) is always most urgent, and the most perceptually
+  exposed subbands are served first. The new top-level entry point
+  `encode_layer2_frame_psy(&params, &subbands, &smr)` mirrors
+  `encode_layer2_frame` but drives allocation from caller-supplied SMR
+  (the intensity-stereo upper band's SMR is pre-mirrored so the §2.4.1.6
+  shared-allocation invariant holds). `Mp1Layer2FrameEncoder::with_psychoacoustic(true)`
+  opts the stateful Layer II encoder into the model: it maintains a
+  per-channel 1024-sample sliding FFT window, runs the per-channel
+  `Model2State` each 1152-sample frame, and allocates against the
+  resulting SMR via `encode_layer2_frame_psy`. Honoured at 32 / 44.1 /
+  48 kHz; the MPEG-2 LSF half-rates (no Annex D table) silently fall back
+  to the proxy allocator (byte-identical to the default encoder).
+  `Mp1Layer2FrameEncoder::is_psychoacoustic` reports whether the model is
+  active. When an ancillary payload is staged the proxy allocator is used
+  for that frame (the Model 2 history is still advanced). **+9 lib-tests**
+  cover the allocator (budget compliance, masked-subband skipping,
+  highest-SMR-first preference, legal-cell-only selection, zero-budget)
+  plus the wired encoder (psy frame round-trip with masked subbands left
+  unallocated, end-to-end `with_psychoacoustic` encode, LSF-rate
+  byte-identical fallback, frame-envelope parity, and a reset-clears-Model
+  2-history check). Public surface adds `allocate_bits_layer2_psy`,
+  `encode_layer2_frame_psy`, `Mp1Layer2FrameEncoder::with_psychoacoustic`
+  / `is_psychoacoustic`. Closes the README "Not yet supported" Layer II
+  Model 2 frontier item. Total `cargo test -p oxideav-mp1 --lib` count:
+  **460 → 470**.
+
 - **Annex D Tables D.1d–f — complete Layer II threshold-in-quiet (LTq)
   tables (32 / 44,1 / 48 kHz).** The last untranscribed Annex D table
   family is now in tree: the 132 / 130 / 126 absolute-threshold rows

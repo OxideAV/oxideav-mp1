@@ -88,15 +88,17 @@ endpoints: `decoder::make_decoder`, `decoder::make_decoder_with_concealment`,
 `encoder::make_encoder_layer2`. The Layer I vs Layer II encode branch is
 also selectable via `EncodeParams::with_layer(LayerSelect)`.
 
+The Annex D Model 2 psychoacoustic allocator is wired into **both**
+encode layers. For Layer II, `encode_layer2_frame_psy` drives the
+§C.1.5.2.7 allocator from per-subband SMR (`MNR = SNR(nlevels) − SMR`),
+and `Mp1Layer2FrameEncoder::with_psychoacoustic(true)` maintains a
+per-channel 1024-sample sliding FFT window, runs the per-channel
+`Model2State` each 1152-sample frame, and allocates against the resulting
+SMR. As with Layer I, the model is honoured at 32 / 44.1 / 48 kHz and the
+MPEG-2 LSF half-rates fall back to the signal-energy proxy.
+
 ## Not yet supported
 
-- **Layer II Model 2 psychoacoustic allocation.** The per-frame Model 2
-  driver and `allocate_bits_psy` are wired into the **Layer I**
-  encoder; the §C.1.5.2.7 Layer II allocator still uses the
-  signal-energy SMR proxy. The Layer II threshold-in-quiet tables
-  D.1d–f are now transcribed (`LTQ_L2_32K` / `LTQ_L2_44K1` /
-  `LTQ_L2_48K`); wiring the same `Model2State` SMR into the §C.1.5.2.7
-  Layer II allocator is the remaining psychoacoustic work.
 - **Annex D Model 1.** Only Model 2 is assembled into a per-frame
   driver; the Model 1 masking-index / masking-function closed forms are
   staged in `psy` but there is no Model 1 frame driver (Model 2 is the

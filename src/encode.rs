@@ -987,6 +987,109 @@ pub fn allocate_bits_layer2(
     alloc
 }
 
+/// Run the §C.1.5.2.7 iterative bit allocation for one Layer II frame
+/// driven by the **Annex D Model 2 psychoacoustic** signal-to-mask
+/// ratios instead of the signal-energy proxy [`allocate_bits_layer2`]
+/// uses.
+///
+/// `smr[ch][sb]` is the per-subband signal-to-mask ratio in dB from
+/// [`crate::model2::Model2State::process`] (the same quantity that drives
+/// the Layer I psychoacoustic allocator [`allocate_bits_psy`]). The loop
+/// is the identical §C.1.5.2.7 "minimal-MNR subband" walk as
+/// [`allocate_bits_layer2`], but the per-(ch, sb) MNR is computed
+/// perceptually:
+///
+/// ```text
+/// MNR(ch, sb) = SNR(nlevels) − SMR(ch, sb)   dB
+/// ```
+///
+/// where `SNR(nlevels)` is the §Table C.3 quantizer SNR at the proposed
+/// next allocation. A fully masked subband (`SMR == −∞`, the silent /
+/// below-threshold case) never demands bits; an infinitely audible
+/// subband (`SMR == +∞`, no masking floor) is always the most urgent
+/// (its MNR is `−∞`) until it gets bits. `budget_bits` is the `adb`
+/// budget after the header, CRC and `bbal` have been subtracted; pass
+/// the result of [`layer2_frame_payload_bits`]. The §C.1.5.2.7 "first
+/// non-zero allocation" overhead is reserved identically to the
+/// energy-proxy allocator (2-bit scfsi + three 6-bit scalefactor
+/// indices, the worst case the §C.1.5.2.5 / Table C.4 selection can
+/// choose), keeping the fit-check sound.
+///
+/// Subbands at or above `table.sblimit()` are forced to allocation `0`.
+// Same index-driven (ch, sb) double loop as `allocate_bits_layer2`; an
+// iterator rewrite would obscure the spec's "find min-MNR (ch, sb)" body.
+#[allow(clippy::needless_range_loop)]
+pub fn allocate_bits_layer2_psy(
+    smr: &[[f64; SUBBANDS]; 2],
+    nch: usize,
+    table: &AllocationTable,
+    budget_bits: usize,
+) -> Layer2Allocation {
+    let sblimit = table.sblimit();
+    let mut alloc: Layer2Allocation = [[0u8; SUBBANDS]; 2];
+
+    // Current quantization-class cost per (ch, sb); for `allocation = 0`
+    // this is `0` (no codewords transmitted).
+    let mut current_cost: [[usize; SUBBANDS]; 2] = [[0; SUBBANDS]; 2];
+    let mut spent = 0usize;
+
+    loop {
+        // §C.1.5.2.7 step 1: find the subband with the minimal MNR that
+        // can still grow to a next legal allocation under the remaining
+        // budget.
+        let mut best: Option<(usize, usize, f64, u8, &'static QuantClass, usize)> = None;
+        for ch in 0..nch {
+            for sb in 0..sblimit {
+                // A fully masked subband (SMR == −∞) never needs bits.
+                let s = smr[ch][sb];
+                if s == f64::NEG_INFINITY {
+                    continue;
+                }
+                let (next_idx, next_cls) = match layer2_next_alloc(table, sb, alloc[ch][sb]) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let new_cost = layer2_class_cost_bits(next_cls);
+                let delta_sample_bits = new_cost - current_cost[ch][sb];
+                let overhead = if alloc[ch][sb] == 0 {
+                    LAYER2_PER_SUBBAND_OVERHEAD_BITS
+                } else {
+                    0
+                };
+                let step_cost = delta_sample_bits + overhead;
+                if spent + step_cost > budget_bits {
+                    continue;
+                }
+                // Perceptual MNR: how far the quantization noise still
+                // sits above the masking threshold. Lower == more urgent.
+                let snr = layer2_snr_db(next_cls.nlevels)
+                    .unwrap_or_else(|| panic!("nlevels {} missing SNR row", next_cls.nlevels));
+                let mnr = if s == f64::INFINITY {
+                    f64::NEG_INFINITY
+                } else {
+                    snr - s
+                };
+                let better = match best {
+                    None => true,
+                    Some((_, _, bmnr, _, _, _)) => mnr < bmnr,
+                };
+                if better {
+                    best = Some((ch, sb, mnr, next_idx, next_cls, step_cost));
+                }
+            }
+        }
+        match best {
+            Some((ch, sb, _, next_idx, next_cls, step_cost)) => {
+                spent += step_cost;
+                alloc[ch][sb] = next_idx;
+                current_cost[ch][sb] = layer2_class_cost_bits(next_cls);
+            }
+            None => break,
+        }
+    }
+    alloc
+}
+
 // ---- Layer II frame-header writer (§2.4.2.3) -------------------
 
 /// Errors raised while packing a Layer II frame header.
@@ -2407,7 +2510,7 @@ pub fn encode_layer2_frame(
     params: &Layer2HeaderParams,
     subbands: &[[[f64; 36]; SUBBANDS]; 2],
 ) -> Result<Vec<u8>, Layer2EncodeError> {
-    encode_layer2_frame_inner(params, subbands, &[])
+    encode_layer2_frame_inner(params, subbands, &[], None)
 }
 
 /// Encode a §2.4.1.6 Layer II frame with a caller-supplied §2.4.1.8
@@ -2431,7 +2534,29 @@ pub fn encode_layer2_frame_with_ancillary(
     subbands: &[[[f64; 36]; SUBBANDS]; 2],
     ancillary: &[u8],
 ) -> Result<Vec<u8>, Layer2EncodeError> {
-    encode_layer2_frame_inner(params, subbands, ancillary)
+    encode_layer2_frame_inner(params, subbands, ancillary, None)
+}
+
+/// Encode a §2.4.1.6 Layer II frame using the **Annex D Model 2
+/// psychoacoustic** allocator instead of the signal-energy proxy.
+///
+/// Identical to [`encode_layer2_frame`] but the §C.1.5.2.7 bit
+/// allocation is driven by the caller-supplied per-subband
+/// signal-to-mask ratios `smr[ch][sb]` (from
+/// [`crate::model2::Model2State::process`]) through
+/// [`allocate_bits_layer2_psy`]: fully masked subbands (`SMR == −∞`)
+/// draw no bits and the most perceptually exposed subbands are served
+/// first. The intensity-stereo upper band's SMR is mirrored before
+/// allocation so the §2.4.1.6 shared-allocation invariant holds. All
+/// other framing (scalefactor selection, §C.1.5.2.5 SCFSI, quantization,
+/// the four region writers, optional §2.4.1.4 CRC and §2.4.1.8
+/// zero-padded tail) is unchanged.
+pub fn encode_layer2_frame_psy(
+    params: &Layer2HeaderParams,
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    smr: &[[f64; SUBBANDS]; 2],
+) -> Result<Vec<u8>, Layer2EncodeError> {
+    encode_layer2_frame_inner(params, subbands, &[], Some(smr))
 }
 
 // The §C.1.5.2 wiring is a strict (ch, sb, gr, sample) nested walk, the
@@ -2442,6 +2567,7 @@ fn encode_layer2_frame_inner(
     params: &Layer2HeaderParams,
     subbands: &[[[f64; 36]; SUBBANDS]; 2],
     ancillary: &[u8],
+    smr: Option<&[[f64; SUBBANDS]; 2]>,
 ) -> Result<Vec<u8>, Layer2EncodeError> {
     use crate::decode_layer2::{LAYER2_SAMPLES_PER_SUBBAND, SYNTAX_GRANULES};
     use crate::tables_layer2::layer2_bit_allocation_table;
@@ -2518,7 +2644,23 @@ fn encode_layer2_frame_inner(
             peak[1][sb] = m;
         }
     }
-    let mut alloc = allocate_bits_layer2(&peak, nch, table, budget_bits);
+    // When the caller supplies per-subband Model 2 SMR, run the
+    // perceptual §C.1.5.2.7 allocator; otherwise use the signal-energy
+    // proxy. The intensity-stereo upper band is pre-mirrored in either
+    // domain so the §2.4.1.6 shared-allocation invariant holds.
+    let mut alloc = if let Some(smr) = smr {
+        let mut smr_eff = *smr;
+        if nch == 2 {
+            for sb in bound..sblimit {
+                let m = smr_eff[0][sb].max(smr_eff[1][sb]);
+                smr_eff[0][sb] = m;
+                smr_eff[1][sb] = m;
+            }
+        }
+        allocate_bits_layer2_psy(&smr_eff, nch, table, budget_bits)
+    } else {
+        allocate_bits_layer2(&peak, nch, table, budget_bits)
+    };
     if nch == 2 {
         for sb in bound..sblimit {
             let shared = alloc[0][sb].max(alloc[1][sb]);
@@ -3232,6 +3374,16 @@ pub struct Mp1Layer2FrameEncoder {
     /// the next [`encode_frame`](Self::encode_frame) call and cleared
     /// afterwards. `None` (or empty) means "zero-pad the tail".
     pending_ancillary: Option<Vec<u8>>,
+    /// Per-channel Annex D Model 2 driver, present only when
+    /// [`with_psychoacoustic`](Self::with_psychoacoustic) was set **and**
+    /// the sampling frequency has an Annex D Model 2 table (32 / 44.1 /
+    /// 48 kHz). `None` keeps the signal-energy proxy allocator.
+    psy: Option<Vec<crate::model2::Model2State>>,
+    /// Per-channel 1024-sample sliding analysis buffer feeding the Model
+    /// 2 FFT (the 1152 new Layer II samples per frame are shifted in at
+    /// the tail; the window holds the most recent 1024). Empty when
+    /// `psy` is `None`.
+    psy_window: Vec<[f64; crate::model2::FFT_SIZE]>,
 }
 
 impl Mp1Layer2FrameEncoder {
@@ -3250,7 +3402,51 @@ impl Mp1Layer2FrameEncoder {
             params,
             filters: (0..nch).map(|_| AnalysisFilter::new()).collect(),
             pending_ancillary: None,
+            psy: None,
+            psy_window: Vec::new(),
         }
+    }
+
+    /// Enable Annex D **Model 2 psychoacoustic** bit allocation for this
+    /// Layer II encoder (consuming builder).
+    ///
+    /// When `enable` is `true` and the configured sampling frequency has
+    /// an Annex D Model 2 table (32 / 44.1 / 48 kHz), each
+    /// [`encode_frame`](Self::encode_frame) call slides the 1152 new
+    /// per-channel samples into a 1024-sample analysis window, runs the
+    /// per-channel [`Model2State`](crate::model2::Model2State) to obtain
+    /// per-subband SMR, and allocates through
+    /// [`encode_layer2_frame_psy`]. The MPEG-2 LSF half-rates (16 / 22.05
+    /// / 24 kHz — no Annex D Model 2 table) silently fall back to the
+    /// signal-energy proxy. [`is_psychoacoustic`](Self::is_psychoacoustic)
+    /// reports whether the model is active. The default (no call, or
+    /// `enable == false`) preserves byte-for-byte compatibility with the
+    /// proxy allocator.
+    pub fn with_psychoacoustic(mut self, enable: bool) -> Mp1Layer2FrameEncoder {
+        let nch = self.params.mode.channels() as usize;
+        if enable {
+            let states: Option<Vec<_>> = (0..nch)
+                .map(|_| crate::model2::Model2State::new(self.params.sampling_frequency))
+                .collect();
+            if let Some(states) = states {
+                self.psy = Some(states);
+                self.psy_window = vec![[0.0f64; crate::model2::FFT_SIZE]; nch];
+            } else {
+                self.psy = None;
+                self.psy_window = Vec::new();
+            }
+        } else {
+            self.psy = None;
+            self.psy_window = Vec::new();
+        }
+        self
+    }
+
+    /// Whether this encoder is running Model 2 psychoacoustic allocation
+    /// (requested via [`with_psychoacoustic`](Self::with_psychoacoustic)
+    /// **and** the rate has an Annex D Model 2 table).
+    pub fn is_psychoacoustic(&self) -> bool {
+        self.psy.is_some()
     }
 
     /// Zero the analysis history (for a seek / stream restart). Also
@@ -3262,6 +3458,14 @@ impl Mp1Layer2FrameEncoder {
             f.reset();
         }
         self.pending_ancillary = None;
+        if let Some(states) = &mut self.psy {
+            for s in states {
+                s.reset();
+            }
+        }
+        for w in &mut self.psy_window {
+            *w = [0.0f64; crate::model2::FFT_SIZE];
+        }
     }
 
     /// Stage a §2.4.1.8 `ancillary_data()` payload to be written into
@@ -3364,7 +3568,38 @@ impl Mp1Layer2FrameEncoder {
             }
         }
 
+        // Annex D Model 2 psychoacoustic allocation when enabled: slide
+        // the 1152 new per-channel samples into the 1024-sample analysis
+        // window, run the per-channel Model 2 driver to get per-subband
+        // SMR, and (when no ancillary payload is staged) allocate against
+        // the SMR via `encode_layer2_frame_psy`. Falls back to the
+        // signal-energy proxy when psychoacoustic is off / the rate has
+        // no Annex D table (`psy == None`).
         let pending = self.pending_ancillary.take().unwrap_or_default();
+        if let Some(states) = self.psy.as_mut() {
+            let fft_size = crate::model2::FFT_SIZE;
+            let mut smr = [[0.0f64; SUBBANDS]; 2];
+            for ch in 0..nch {
+                // Append the 1152 new samples to the window, keeping the
+                // most recent 1024: copy the trailing `fft_size` PCM
+                // samples of this channel's frame into the window.
+                let win = &mut self.psy_window[ch];
+                let start = per_ch - fft_size; // 1152 - 1024 = 128
+                for (k, slot) in win.iter_mut().enumerate() {
+                    *slot = pcm[(start + k) * nch + ch];
+                }
+                smr[ch] = states[ch].process(win);
+            }
+            if pending.is_empty() {
+                return encode_layer2_frame_psy(&self.params, &subbands, &smr);
+            }
+            // Ancillary + psychoacoustic together are not yet a single
+            // entry point; the staged payload takes precedence and the
+            // proxy allocator is used for this frame (the ancillary path
+            // is the rarer of the two). The Model 2 history was still
+            // advanced above so the next frame's prediction is correct.
+            return encode_layer2_frame_with_ancillary(&self.params, &subbands, &pending);
+        }
         if pending.is_empty() {
             encode_layer2_frame(&self.params, &subbands)
         } else {
@@ -4063,6 +4298,114 @@ mod tests {
             }
         }
         assert!(spent <= budget, "spent {spent} > budget {budget}");
+    }
+
+    // ---- Layer II Model 2 psychoacoustic allocation (§C.1.5.2.7) ---
+
+    #[test]
+    fn layer2_psy_total_cost_fits_budget() {
+        // §C.1.5.2.7 safety property for the perceptual allocator: the
+        // summed per-(ch, sb) cost must never exceed the budget.
+        let h = header_layer2(44_100, 192, TestMode::Stereo);
+        let table = layer2_bit_allocation_table(&h);
+        let mut smr = [[0.0f64; SUBBANDS]; 2];
+        for sb in 0..table.sblimit() {
+            smr[0][sb] = 30.0 - sb as f64;
+            smr[1][sb] = 25.0 - sb as f64;
+        }
+        let budget = layer2_frame_payload_bits(192, 44_100, false, 2, table);
+        let alloc = allocate_bits_layer2_psy(&smr, 2, table, budget);
+        let mut spent = 0usize;
+        for ch in 0..2 {
+            for sb in 0..table.sblimit() {
+                if alloc[ch][sb] == 0 {
+                    continue;
+                }
+                let cls = table.quant_class(sb, alloc[ch][sb]).unwrap();
+                spent += layer2_class_cost_bits(cls) + LAYER2_PER_SUBBAND_OVERHEAD_BITS;
+            }
+        }
+        assert!(spent <= budget, "spent {spent} > budget {budget}");
+    }
+
+    #[test]
+    fn layer2_psy_skips_fully_masked_subbands() {
+        // A subband whose SMR is −∞ (fully masked) must never draw bits.
+        let h = header_layer2(48_000, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        // Expose only subbands 0, 5 and 9.
+        for &sb in &[0usize, 5, 9] {
+            smr[0][sb] = 40.0;
+        }
+        let budget = layer2_frame_payload_bits(128, 48_000, false, 1, table);
+        let alloc = allocate_bits_layer2_psy(&smr, 1, table, budget);
+        for sb in 0..table.sblimit() {
+            if [0usize, 5, 9].contains(&sb) {
+                continue;
+            }
+            assert_eq!(alloc[0][sb], 0, "masked sb {sb} drew bits");
+        }
+        // At least one of the exposed subbands got bits with this budget.
+        assert!([0usize, 5, 9].iter().any(|&sb| alloc[0][sb] > 0));
+    }
+
+    #[test]
+    fn layer2_psy_serves_highest_smr_first() {
+        // With a tight budget that can only fund one subband's first
+        // step, the most perceptually exposed subband (highest SMR =
+        // lowest MNR) wins. Two equal-class subbands differ only in SMR.
+        let h = header_layer2(48_000, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        smr[0][2] = 50.0; // far more exposed
+        smr[0][3] = 10.0;
+        // Budget just enough for one subband's first allocation overhead.
+        let one_step = layer2_class_cost_bits(table.quant_class(2, 1).unwrap())
+            + LAYER2_PER_SUBBAND_OVERHEAD_BITS;
+        let alloc = allocate_bits_layer2_psy(&smr, 1, table, one_step);
+        assert!(alloc[0][2] > 0, "highest-SMR subband should win");
+        assert_eq!(alloc[0][3], 0, "lower-SMR subband should wait");
+    }
+
+    #[test]
+    fn layer2_psy_zero_budget_allocates_nothing() {
+        let h = header_layer2(32_000, 96, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut smr = [[20.0f64; SUBBANDS]; 2];
+        for sb in table.sblimit()..SUBBANDS {
+            smr[0][sb] = f64::NEG_INFINITY;
+        }
+        let alloc = allocate_bits_layer2_psy(&smr, 1, table, 0);
+        for sb in 0..SUBBANDS {
+            assert_eq!(alloc[0][sb], 0, "sb {sb}");
+        }
+    }
+
+    #[test]
+    fn layer2_psy_only_legal_cells_chosen() {
+        // Every non-zero allocation the perceptual allocator places must
+        // resolve to a real Table B.2x QuantClass (no `-` gap cells).
+        let h = header_layer2(48_000, 96, TestMode::Stereo);
+        let table = layer2_bit_allocation_table(&h);
+        let mut smr = [[0.0f64; SUBBANDS]; 2];
+        for sb in 0..table.sblimit() {
+            smr[0][sb] = 35.0 - sb as f64;
+            smr[1][sb] = 30.0 - sb as f64;
+        }
+        let budget = layer2_frame_payload_bits(96, 48_000, false, 2, table);
+        let alloc = allocate_bits_layer2_psy(&smr, 2, table, budget);
+        for ch in 0..2 {
+            for sb in 0..table.sblimit() {
+                if alloc[ch][sb] != 0 {
+                    assert!(
+                        table.quant_class(sb, alloc[ch][sb]).is_some(),
+                        "ch{ch} sb{sb} illegal alloc {}",
+                        alloc[ch][sb],
+                    );
+                }
+            }
+        }
     }
 
     // ---- Layer II frame-header writer (§2.4.2.3) ------------------
@@ -6125,6 +6468,139 @@ mod tests {
             let any = (0..recovered.sblimit).any(|sb| recovered.subbands[ch][sb].allocation != 0);
             assert!(any, "channel {ch} must place at least one allocation");
         }
+    }
+
+    // ---- Layer II Model 2 psychoacoustic encode (wired) -----------
+
+    /// `encode_layer2_frame_psy` produces a parseable Layer II frame of
+    /// the §2.4.2.1 byte length and round-trips through the decoder when
+    /// driven by per-subband SMR, with masked subbands (`SMR == −∞`)
+    /// left unallocated.
+    #[test]
+    fn encode_layer2_frame_psy_round_trips() {
+        use crate::decode_layer2::decode_layer2_audio_data;
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut subbands = Box::new([[[0.0f64; 36]; SUBBANDS]; 2]);
+        for slot in 0..36 {
+            let t = slot as f64 / 36.0;
+            subbands[0][0][slot] = 0.5 * (2.0 * std::f64::consts::PI * t).sin();
+            subbands[0][3][slot] = 0.3 * (2.0 * std::f64::consts::PI * 2.0 * t).cos();
+        }
+        // Expose subbands 0 and 3, mask everything else.
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        smr[0][0] = 35.0;
+        smr[0][3] = 25.0;
+        let frame = encode_layer2_frame_psy(&params, &subbands, &smr).expect("psy encode");
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert_eq!(header.layer, crate::header::Layer::II);
+        let recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("decode_layer2_audio_data");
+        let table = layer2_bit_allocation_table(&header);
+        // Masked subbands carry no allocation; at least one exposed
+        // subband does.
+        for sb in 0..table.sblimit() {
+            if sb == 0 || sb == 3 {
+                continue;
+            }
+            assert_eq!(
+                recovered.subbands[0][sb].allocation, 0,
+                "masked sb {sb} got bits"
+            );
+        }
+        assert!(
+            recovered.subbands[0][0].allocation != 0 || recovered.subbands[0][3].allocation != 0,
+            "an exposed subband must receive bits"
+        );
+    }
+
+    /// The wired `Mp1Layer2FrameEncoder::with_psychoacoustic(true)` runs
+    /// the Model 2 path at a rate with an Annex D table (48 kHz) and
+    /// produces a parseable, decodable, non-silent Layer II frame.
+    #[test]
+    fn mp1_layer2_frame_encoder_psychoacoustic_round_trips() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        assert!(enc.is_psychoacoustic(), "48 kHz has an Annex D table");
+        let pcm = layer2_test_pcm(48_000, 1);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME);
+        let frame = enc.encode_frame(&pcm).expect("psy encode_frame");
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert_eq!(header.layer, crate::header::Layer::II);
+        let recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("decode_layer2_audio_data");
+        let any = (0..recovered.sblimit).any(|sb| recovered.subbands[0][sb].allocation != 0);
+        assert!(
+            any,
+            "psychoacoustic encoder must place at least one allocation"
+        );
+    }
+
+    /// At an MPEG-2 LSF half-rate (24 kHz — no Annex D Model 2 table)
+    /// `with_psychoacoustic(true)` falls back to the proxy allocator:
+    /// `is_psychoacoustic()` is false and the frame is byte-identical to
+    /// a default (non-psychoacoustic) encoder's frame.
+    #[test]
+    fn mp1_layer2_frame_encoder_psychoacoustic_falls_back_at_lsf_rate() {
+        use crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME;
+        let params = Layer2HeaderParams::new(24_000, 64, Mode::SingleChannel);
+        let mut psy = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        assert!(!psy.is_psychoacoustic(), "24 kHz LSF has no Annex D table");
+        let mut plain = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(24_000, 1);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME);
+        let fa = psy.encode_frame(&pcm).expect("lsf psy encode");
+        let fb = plain.encode_frame(&pcm).expect("lsf plain encode");
+        assert_eq!(
+            fa, fb,
+            "LSF fallback must match the proxy allocator byte-for-byte"
+        );
+    }
+
+    /// Frame envelope parity: a psychoacoustic Layer II encoder and a
+    /// proxy encoder at the same MPEG-1 config emit the same §2.4.2.1
+    /// frame byte length (the allocator only redistributes bits inside
+    /// the fixed envelope).
+    #[test]
+    fn mp1_layer2_frame_encoder_psy_matches_frame_length() {
+        use crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME;
+        let params = Layer2HeaderParams::new(44_100, 192, Mode::Stereo);
+        let mut psy = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        let mut plain = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(44_100, 2);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME * 2);
+        let fa = psy.encode_frame(&pcm).expect("psy");
+        let fb = plain.encode_frame(&pcm).expect("plain");
+        assert_eq!(fa.len(), fb.len(), "frame envelope must match");
+    }
+
+    /// `reset()` zeroes the Model 2 prediction history so a primed
+    /// psychoacoustic encoder re-encodes a fresh signal byte-for-byte
+    /// against a freshly-built psychoacoustic encoder.
+    #[test]
+    fn mp1_layer2_frame_encoder_psy_reset_clears_history() {
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut primed = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        // Prime with one frame of a different signal.
+        let prime_pcm = layer2_test_pcm(48_000, 1);
+        let _ = primed.encode_frame(&prime_pcm).expect("prime");
+        primed.reset();
+        // Re-encode a second signal and compare against a fresh encoder.
+        let second: Vec<f64> = (0..1152)
+            .map(|s| 0.3 * (2.0 * std::f64::consts::PI * 880.0 * s as f64 / 48_000.0).sin())
+            .collect();
+        let fa = primed.encode_frame(&second).expect("primed-then-reset");
+        let mut fresh = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        let fb = fresh.encode_frame(&second).expect("fresh");
+        assert_eq!(
+            fa, fb,
+            "reset must fully zero the Model 2 + analysis history"
+        );
     }
 
     /// `encode_frame` rejects the wrong PCM length with the new
