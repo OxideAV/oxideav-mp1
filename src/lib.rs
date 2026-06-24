@@ -67,21 +67,26 @@
 //! channel per frame (the §2.4.2.1 Layer II granularity) instead of
 //! the Layer I 384.
 //!
-//! The encoder can drive bit allocation from the Annex D
-//! **Psychoacoustic Model 2** ([`model2`]): set
+//! **Both** encode layers can drive bit allocation from the Annex D
+//! **Psychoacoustic Model 2** ([`model2`]). For Layer I, set
 //! [`encode::EncodeParams::psychoacoustic`] (or call
-//! [`encode::EncodeParams::with_psychoacoustic`]) and the Layer I
+//! [`encode::EncodeParams::with_psychoacoustic`]) and the
 //! [`encode::Mp1FrameEncoder`] runs the full clause-D.2.4 per-frame
 //! procedure — 1024-point Hann-windowed FFT, two-block unpredictability,
 //! per-partition energy/tonality, spreading-function convolution, and
 //! the per-FFT-line audibility threshold — to produce per-subband
-//! signal-to-mask ratios that feed [`encode::allocate_bits_psy`]. The
-//! model is honoured at 32 / 44.1 / 48 kHz (the rates with Annex D
-//! Model 2 tables); the MPEG-2 LSF half-rates fall back to the
-//! signal-energy proxy ([`encode::allocate_bits`]). The Annex D numeric
-//! tables (D.1a–c / D.2a–f / D.3a–c / D.4a–c / D.5) are fully
-//! transcribed in [`psy`] from 400-DPI renders of the staged 11172-3
-//! PDF.
+//! signal-to-mask ratios that feed [`encode::allocate_bits_psy`]. For
+//! Layer II, [`encode::Mp1Layer2FrameEncoder::with_psychoacoustic`]
+//! drives the §C.1.5.2.7 allocator from the same per-subband SMR via
+//! [`encode::encode_layer2_frame_psy`] /
+//! [`encode::allocate_bits_layer2_psy`]. The model is honoured at
+//! 32 / 44.1 / 48 kHz (the rates with Annex D Model 2 tables); the
+//! MPEG-2 LSF half-rates fall back to the signal-energy proxy
+//! ([`encode::allocate_bits`] / [`encode::allocate_bits_layer2`]). The
+//! Annex D numeric tables — the Layer I & II threshold-in-quiet families
+//! (D.1a–c / D.1d–f), D.2a–f, D.3a–c, D.4a–c and D.5 — are fully
+//! transcribed in [`psy`] from the staged 11172-3 text extractions /
+//! renders.
 
 #![warn(missing_debug_implementations)]
 
