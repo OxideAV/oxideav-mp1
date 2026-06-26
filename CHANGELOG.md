@@ -31,6 +31,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II joint_stereo PCM round-trip integration tests**
+  (`tests/layer2_joint_stereo.rs`). Two distinct per-channel tones are
+  encoded through `Mp1Layer2FrameEncoder` in `Mode::JointStereo` and
+  decoded with `Mp1Decoder`, asserting per-channel energy ratios and
+  Goertzel single-bin spectral discrimination (the left output is
+  dominated by its own tone, the right output by its own). A second
+  test puts the audible content in the **shared upper band** (≈14 / 15
+  kHz tones above the intensity bound) and asserts the right channel's
+  reconstructed energy survives — a guard that fails outright (right
+  energy → 0) under the prior channel-0-only intensity combine.
 - **Annex D Model 2 psychoacoustic bit allocation wired into the
   Layer II encoder.** `allocate_bits_layer2_psy` runs the §C.1.5.2.7
   iterative allocator on the Annex D Model 2 signal-to-mask ratios
