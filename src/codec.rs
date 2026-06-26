@@ -677,7 +677,17 @@ impl Mp1Encoder {
                 let mut hp =
                     Layer2HeaderParams::new(params.sampling_frequency, bitrate_kbps, params.mode);
                 hp.has_crc = params.emit_crc;
-                Mp1InnerEncoder::LayerII(Mp1Layer2FrameEncoder::new(hp))
+                // Forward the psychoacoustic + VBR settings to the Layer
+                // II frame encoder so the registry-facing trait-object
+                // path matches the direct `Mp1Layer2FrameEncoder` API.
+                let mut l2 = Mp1Layer2FrameEncoder::new(hp);
+                if params.psychoacoustic {
+                    l2 = l2.with_psychoacoustic(true);
+                    if let Some(target) = params.vbr_target_mnr_db {
+                        l2 = l2.with_vbr(target);
+                    }
+                }
+                Mp1InnerEncoder::LayerII(l2)
             }
         };
         Mp1Encoder {
@@ -1832,6 +1842,57 @@ mod tests {
         assert!(
             saw_nonzero,
             "Layer II encode -> decode produced only silence"
+        );
+    }
+
+    #[test]
+    fn top_level_layer2_psychoacoustic_vbr_round_trips() {
+        // The registry-facing `Mp1Encoder` Layer II path forwards the
+        // `EncodeParams` psychoacoustic + VBR settings to the inner
+        // `Mp1Layer2FrameEncoder`. Build one directly with Layer II +
+        // psychoacoustic + VBR and confirm a multi-frame encode -> decode
+        // loop produces valid, decodable Layer II frames (each header's
+        // bitrate is a real ladder rung; the decoder reads 1152
+        // samples/channel; signal reaches PCM end-to-end).
+        let enc_params = EncodeParams::new(Bitrate::Fixed(256), 48_000, Mode::Stereo)
+            .with_layer(LayerSelect::LayerII)
+            .with_psychoacoustic(true)
+            .with_vbr(0.0);
+        let mut out = CodecParameters::audio(CodecId::new(CODEC_ID));
+        out.sample_rate = Some(48_000);
+        out.channels = Some(2);
+        out.sample_format = Some(SampleFormat::S16);
+        let mut enc = Mp1Encoder::new(CodecId::new(CODEC_ID), enc_params, out);
+
+        let mut dec_params = CodecParameters::audio(CodecId::new("mp1"));
+        dec_params.sample_rate = Some(48_000);
+        dec_params.channels = Some(2);
+        let mut dec = make_decoder(&dec_params).unwrap();
+
+        let mut saw_nonzero = false;
+        for _ in 0..6 {
+            let frame = build_audio_frame_stereo_n(48_000, 1152);
+            enc.send_frame(&Frame::Audio(frame)).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            let h = FrameHeader::parse(&pkt.data).unwrap();
+            assert_eq!(h.layer, Layer::II);
+            assert_eq!(h.mode, Mode::Stereo);
+            // The per-frame bitrate must be a real §2.4.2.3 ladder rung,
+            // and the emitted frame length must match its header.
+            let len = h.frame_length_bytes().expect("fixed per-frame bitrate") as usize;
+            assert_eq!(pkt.data.len(), len, "frame length matches header bitrate");
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            assert_eq!(a.samples, 1152);
+            if a.data[0].iter().any(|&b| b != 0) {
+                saw_nonzero = true;
+            }
+        }
+        assert!(
+            saw_nonzero,
+            "psychoacoustic VBR Layer II produced only silence"
         );
     }
 

@@ -31,6 +31,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Top-level `Mp1Encoder` Layer II now honours psychoacoustic + VBR.**
+  The registry-facing trait-object encode path previously ignored
+  `EncodeParams::psychoacoustic` for Layer II output (it was documented
+  as Layer-I-only); it now forwards both `psychoacoustic` and the new
+  `EncodeParams::vbr_target_mnr_db` (set via `EncodeParams::with_vbr`) to
+  the inner `Mp1Layer2FrameEncoder`, so `with_layer(LayerSelect::LayerII)
+  .with_psychoacoustic(true).with_vbr(t)` drives Model 2 allocation and
+  per-frame variable bitrate through the same `Mp1Encoder` the registry
+  builds. A new round-trip test exercises the full PCM → encode → decode
+  loop on that path.
 - **Layer II per-frame variable-bitrate (VBR) encoding.**
   `Mp1Layer2FrameEncoder::with_vbr(target_mnr_db)` selects, for every
   frame, the smallest §2.4.2.3 bitrate-ladder rung whose Annex D Model 2

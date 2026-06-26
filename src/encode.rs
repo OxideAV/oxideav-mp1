@@ -3107,7 +3107,21 @@ pub struct EncodeParams {
     /// encoder falls back to the energy proxy for that frame. Defaults
     /// to `false`, preserving byte-for-byte compatibility with the
     /// pre-psychoacoustic encoder.
+    ///
+    /// Honoured for **both** Layer I and Layer II output: for Layer II
+    /// the top-level encoder forwards it to
+    /// [`Mp1Layer2FrameEncoder::with_psychoacoustic`].
     pub psychoacoustic: bool,
+    /// When `Some(target_mnr_db)` **and** `psychoacoustic` is enabled and
+    /// `layer == LayerSelect::LayerII`, the top-level encoder runs
+    /// per-frame **variable-bitrate** Layer II encoding: each frame's
+    /// bitrate is chosen by [`select_layer2_vbr_bitrate`] as the smallest
+    /// §2.4.2.3 ladder rung whose Model 2 allocation clears the target
+    /// mask-to-noise margin (see
+    /// [`Mp1Layer2FrameEncoder::with_vbr`]). `None` (the default) keeps
+    /// the fixed `bitrate`. Inert for Layer I and when psychoacoustic is
+    /// off.
+    pub vbr_target_mnr_db: Option<f64>,
 }
 
 impl EncodeParams {
@@ -3130,6 +3144,7 @@ impl EncodeParams {
             emit_crc: false,
             layer: LayerSelect::LayerI,
             psychoacoustic: false,
+            vbr_target_mnr_db: None,
         }
     }
 
@@ -3168,6 +3183,16 @@ impl EncodeParams {
     /// via [`allocate_bits_psy`].
     pub fn with_psychoacoustic(mut self, enable: bool) -> EncodeParams {
         self.psychoacoustic = enable;
+        self
+    }
+
+    /// Builder: enable per-frame **variable-bitrate** Layer II encoding
+    /// at the given target mask-to-noise margin in dB (see
+    /// [`EncodeParams::vbr_target_mnr_db`]). Effective only with
+    /// `layer == LayerSelect::LayerII` and `psychoacoustic == true`;
+    /// forwards to [`Mp1Layer2FrameEncoder::with_vbr`].
+    pub fn with_vbr(mut self, target_mnr_db: f64) -> EncodeParams {
+        self.vbr_target_mnr_db = Some(target_mnr_db);
         self
     }
 }
