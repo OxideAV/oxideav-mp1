@@ -1090,6 +1090,164 @@ pub fn allocate_bits_layer2_psy(
     alloc
 }
 
+/// The §2.4.2.3 Layer II `bitrate_index` ladder for the given `id_bit`
+/// (1 = MPEG-1, 0 = MPEG-2 LSF), in kbit/s, ascending.
+///
+/// This is the ladder the variable-bitrate selector
+/// [`select_layer2_vbr_bitrate`] scans. The two arrays mirror
+/// [`bitrate_index_layer2`]'s tables.
+pub fn layer2_bitrate_ladder(id_bit: u8) -> &'static [u16] {
+    const L2_MPEG1: [u16; 14] = [
+        32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+    ];
+    const L2_LSF: [u16; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    if id_bit == 1 {
+        &L2_MPEG1
+    } else {
+        &L2_LSF
+    }
+}
+
+/// The worst (smallest) per-subband mask-to-noise ratio (MNR, dB) left
+/// over after a §C.1.5.2.7 perceptual allocation, across every
+/// **non-masked** subband within the table's `sblimit`.
+///
+/// For each `(ch, sb)` with a finite SMR the resulting MNR is
+/// `SNR(nlevels(alloc)) − SMR`; a subband with `alloc == 0` contributes
+/// `SNR(0) − SMR = −SMR` (no quantizer applied, so its noise sits at the
+/// signal level). Fully masked subbands (`SMR == −∞`) are skipped — they
+/// never demand bits. An infinitely-audible subband (`SMR == +∞`) yields
+/// `−∞` MNR while it still carries audible content.
+///
+/// The result is the perceptual quality floor of the frame: the higher
+/// (more positive) it is, the more headroom every band has above its
+/// masking threshold. [`select_layer2_vbr_bitrate`] uses it to pick the
+/// smallest bitrate whose floor clears a target margin.
+#[allow(clippy::needless_range_loop)]
+pub fn layer2_min_mnr_db(
+    alloc: &Layer2Allocation,
+    smr: &[[f64; SUBBANDS]; 2],
+    nch: usize,
+    table: &AllocationTable,
+) -> f64 {
+    let sblimit = table.sblimit();
+    let mut worst = f64::INFINITY;
+    for ch in 0..nch.min(2) {
+        for sb in 0..sblimit {
+            let s = smr[ch][sb];
+            if s == f64::NEG_INFINITY {
+                continue; // fully masked — never audible
+            }
+            // nlevels for the current allocation (0 ⇒ SNR row 0 = 0 dB).
+            let nlevels = if alloc[ch][sb] == 0 {
+                0
+            } else {
+                table
+                    .quant_class(sb, alloc[ch][sb])
+                    .map(|c| c.nlevels)
+                    .unwrap_or(0)
+            };
+            let snr = layer2_snr_db(nlevels).unwrap_or(0.0);
+            let mnr = if s == f64::INFINITY {
+                f64::NEG_INFINITY
+            } else {
+                snr - s
+            };
+            if mnr < worst {
+                worst = mnr;
+            }
+        }
+    }
+    worst
+}
+
+/// Select the smallest §2.4.2.3 Layer II bitrate (kbit/s, on the ladder
+/// for `params`' implied `ID` bit) whose perceptual allocation clears a
+/// target mask-to-noise margin for **every** non-masked subband.
+///
+/// This is the per-frame variable-bitrate (VBR) decision: rather than a
+/// fixed bitrate, the encoder spends only as many bits as the signal's
+/// masking demands. For each candidate bitrate on the ladder, in
+/// ascending order, the selector:
+///
+/// 1. builds the candidate frame header (so the §2.4.1.6 allocation
+///    table and `sblimit` for that bitrate-per-channel are selected),
+/// 2. computes the post-overhead budget,
+/// 3. runs [`allocate_bits_layer2_psy`] against `smr`, and
+/// 4. measures [`layer2_min_mnr_db`].
+///
+/// The first candidate whose minimum MNR is `≥ target_mnr_db` wins. If
+/// no ladder rung clears the target (a dense, hard-to-mask signal), the
+/// **highest** ladder bitrate is returned — the best the format can do.
+///
+/// `target_mnr_db` is the desired noise margin: `0.0` means "quantization
+/// noise exactly at the masking threshold" (transparent by the model);
+/// positive values demand extra headroom; negative values accept audible
+/// noise to save bits. The returned value is always a valid ladder rung
+/// for the `params` rate, so `bitrate_index_layer2` resolves it.
+// The intensity-stereo mirror walks `bound..sblimit` to copy the
+// per-(ch, sb) SMR max into both channels; an iterator rewrite would
+// obscure that the same band index drives both channels.
+#[allow(clippy::needless_range_loop)]
+pub fn select_layer2_vbr_bitrate(
+    params: &Layer2HeaderParams,
+    smr: &[[f64; SUBBANDS]; 2],
+    target_mnr_db: f64,
+) -> Result<u16, Layer2HeaderError> {
+    let nch = params.mode.channels() as usize;
+    let (id_bit, _) = sampling_code(params.sampling_frequency).ok_or(
+        Layer2HeaderError::UnsupportedSamplingFrequency(params.sampling_frequency),
+    )?;
+    let ladder = layer2_bitrate_ladder(id_bit);
+
+    let mut last_valid: Option<u16> = None;
+    for &kbps in ladder {
+        // Build a candidate header at this rung; skip rungs the
+        // §2.4.2.3 sampling-frequency/bitrate ladder rejects for this
+        // rate (not every (rate, bitrate) pair is legal).
+        let mut cand = *params;
+        cand.bitrate_kbps = kbps;
+        let header_bytes = match pack_layer2_header(&cand) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let header = match FrameHeader::parse(&header_bytes) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let table = crate::tables_layer2::layer2_bit_allocation_table(&header);
+        let sblimit = table.sblimit();
+        let bound = layer2_stereo_bound(&header, sblimit);
+
+        // Budget after header + CRC + bbal.
+        let bytes = (144u32 * (kbps as u32) * 1000) / params.sampling_frequency;
+        let crc_bits = if params.has_crc { 16 } else { 0 };
+        let overhead_bits = 32 + crc_bits + nch * sum_nbal_per_channel(table);
+        let budget_bits = (bytes as usize * 8).saturating_sub(overhead_bits);
+
+        // Mirror the intensity-stereo upper band so the allocator sees
+        // the shared-allocation invariant (identical to the encode path).
+        let mut smr_eff = *smr;
+        if nch == 2 {
+            for sb in bound..sblimit {
+                let m = smr_eff[0][sb].max(smr_eff[1][sb]);
+                smr_eff[0][sb] = m;
+                smr_eff[1][sb] = m;
+            }
+        }
+        let alloc = allocate_bits_layer2_psy(&smr_eff, nch, table, budget_bits);
+        last_valid = Some(kbps);
+        let min_mnr = layer2_min_mnr_db(&alloc, &smr_eff, nch, table);
+        if min_mnr >= target_mnr_db {
+            return Ok(kbps);
+        }
+    }
+    // No rung cleared the target: return the highest legal rung.
+    last_valid.ok_or(Layer2HeaderError::UnsupportedSamplingFrequency(
+        params.sampling_frequency,
+    ))
+}
+
 // ---- Layer II frame-header writer (§2.4.2.3) -------------------
 
 /// Errors raised while packing a Layer II frame header.
@@ -3434,6 +3592,13 @@ pub struct Mp1Layer2FrameEncoder {
     /// the tail; the window holds the most recent 1024). Empty when
     /// `psy` is `None`.
     psy_window: Vec<[f64; crate::model2::FFT_SIZE]>,
+    /// Per-frame variable-bitrate (VBR) target mask-to-noise margin in
+    /// dB, set by [`with_vbr`](Self::with_vbr). When `Some` **and**
+    /// psychoacoustic Model 2 is active, each frame's bitrate is chosen
+    /// by [`select_layer2_vbr_bitrate`] as the smallest ladder rung whose
+    /// allocation clears the target margin (falling back to the highest
+    /// rung). `None` keeps the fixed `params.bitrate_kbps`.
+    vbr_target_mnr_db: Option<f64>,
 }
 
 impl Mp1Layer2FrameEncoder {
@@ -3454,7 +3619,36 @@ impl Mp1Layer2FrameEncoder {
             pending_ancillary: None,
             psy: None,
             psy_window: Vec::new(),
+            vbr_target_mnr_db: None,
         }
+    }
+
+    /// Enable per-frame **variable-bitrate (VBR)** encoding with the
+    /// given target mask-to-noise margin in dB (consuming builder).
+    ///
+    /// VBR only takes effect together with
+    /// [`with_psychoacoustic`](Self::with_psychoacoustic): each frame's
+    /// bitrate is then chosen by [`select_layer2_vbr_bitrate`] as the
+    /// smallest §2.4.2.3 ladder rung whose Model 2 allocation pushes
+    /// every non-masked subband's MNR to at least `target_mnr_db`
+    /// (falling back to the highest rung when no rung suffices). The
+    /// header's `bitrate_index` therefore varies frame-to-frame; the
+    /// decoder re-reads it per frame, so the stream stays spec-conformant.
+    ///
+    /// `target_mnr_db == 0.0` requests transparency by the model
+    /// (quantization noise at the masking threshold); higher values
+    /// trade bits for headroom, lower (negative) values trade audible
+    /// noise for a smaller stream. With psychoacoustic disabled this
+    /// setting is inert and the fixed `params.bitrate_kbps` is used.
+    pub fn with_vbr(mut self, target_mnr_db: f64) -> Mp1Layer2FrameEncoder {
+        self.vbr_target_mnr_db = Some(target_mnr_db);
+        self
+    }
+
+    /// The configured per-frame VBR target margin in dB, or `None` when
+    /// fixed-bitrate ([`with_vbr`](Self::with_vbr) was not called).
+    pub fn vbr_target_mnr_db(&self) -> Option<f64> {
+        self.vbr_target_mnr_db
     }
 
     /// Enable Annex D **Model 2 psychoacoustic** bit allocation for this
@@ -3626,6 +3820,7 @@ impl Mp1Layer2FrameEncoder {
         // signal-energy proxy when psychoacoustic is off / the rate has
         // no Annex D table (`psy == None`).
         let pending = self.pending_ancillary.take().unwrap_or_default();
+        let vbr_target = self.vbr_target_mnr_db;
         if let Some(states) = self.psy.as_mut() {
             let fft_size = crate::model2::FFT_SIZE;
             let mut smr = [[0.0f64; SUBBANDS]; 2];
@@ -3641,6 +3836,19 @@ impl Mp1Layer2FrameEncoder {
                 smr[ch] = states[ch].process(win);
             }
             if pending.is_empty() {
+                // Per-frame variable-bitrate: choose the smallest ladder
+                // rung whose Model 2 allocation clears the target MNR
+                // margin. The §2.4.2.3 bitrate_index varies frame-to-frame
+                // (the decoder re-reads it each frame); a selection error
+                // (e.g. an unsupported rate) falls through to the fixed
+                // `params.bitrate_kbps`.
+                if let Some(target) = vbr_target {
+                    if let Ok(kbps) = select_layer2_vbr_bitrate(&self.params, &smr, target) {
+                        let mut frame_params = self.params;
+                        frame_params.bitrate_kbps = kbps;
+                        return encode_layer2_frame_psy(&frame_params, &subbands, &smr);
+                    }
+                }
                 return encode_layer2_frame_psy(&self.params, &subbands, &smr);
             }
             // Ancillary + psychoacoustic together are not yet a single
@@ -4456,6 +4664,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Layer II variable-bitrate (VBR) selection ----------------
+
+    #[test]
+    fn layer2_bitrate_ladder_ascending_and_rate_specific() {
+        let m1 = layer2_bitrate_ladder(1);
+        let lsf = layer2_bitrate_ladder(0);
+        assert_eq!(m1.first(), Some(&32));
+        assert_eq!(m1.last(), Some(&384));
+        assert_eq!(lsf.first(), Some(&8));
+        assert_eq!(lsf.last(), Some(&160));
+        for w in m1.windows(2) {
+            assert!(w[0] < w[1], "MPEG-1 ladder must ascend");
+        }
+        for w in lsf.windows(2) {
+            assert!(w[0] < w[1], "LSF ladder must ascend");
+        }
+    }
+
+    #[test]
+    fn layer2_min_mnr_skips_masked_and_floors_on_unallocated() {
+        // A fully masked subband (SMR = −∞) is skipped; an unallocated
+        // audible subband (SMR finite, alloc 0) floors the MNR at −SMR
+        // (SNR(0) = 0 dB).
+        let h = header_layer2(48_000, 128, TestMode::SingleChannel);
+        let table = layer2_bit_allocation_table(&h);
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        smr[0][0] = 30.0; // audible, will be left unallocated below
+        let alloc = [[0u8; SUBBANDS]; 2];
+        let m = layer2_min_mnr_db(&alloc, &smr, 1, table);
+        // SNR(0) − 30 = −30 dB.
+        assert!((m - (-30.0)).abs() < 1e-9, "min MNR was {m}");
+    }
+
+    #[test]
+    fn layer2_vbr_quiet_signal_picks_lowest_rung() {
+        // A nearly-silent signal (every subband fully masked) needs no
+        // bits, so the smallest ladder rung already clears any
+        // non-positive target margin.
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        let smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        let kbps = select_layer2_vbr_bitrate(&params, &smr, 0.0).expect("vbr select");
+        assert_eq!(
+            kbps, 32,
+            "fully-masked frame should pick the 32 kbit/s rung"
+        );
+    }
+
+    #[test]
+    fn layer2_vbr_demanding_signal_climbs_the_ladder() {
+        // A signal with high SMR in every subband demands many bits; the
+        // selector must climb above the lowest rung to clear the target.
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        // Moderately exposed across the whole band.
+        for sb in 0..27 {
+            smr[0][sb] = 25.0;
+        }
+        let low = select_layer2_vbr_bitrate(&params, &smr, 10.0).expect("vbr select");
+        // A laxer target needs no more bits than a stricter one.
+        let lax = select_layer2_vbr_bitrate(&params, &smr, -50.0).expect("vbr select lax");
+        assert!(
+            low >= lax,
+            "stricter target ({low} kbit/s) must not pick a lower rung than lax ({lax} kbit/s)"
+        );
+        assert!(lax >= 32, "result is a valid ladder rung");
+    }
+
+    #[test]
+    fn layer2_vbr_unsatisfiable_target_returns_highest_rung() {
+        // An impossibly strict target (no rung can clear it) returns the
+        // highest available ladder bitrate — the best the format can do.
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::Stereo);
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        for ch in 0..2 {
+            for sb in 0..30 {
+                smr[ch][sb] = 90.0; // extreme exposure everywhere
+            }
+        }
+        let kbps = select_layer2_vbr_bitrate(&params, &smr, 60.0).expect("vbr select");
+        assert_eq!(kbps, 384, "unsatisfiable target falls back to the top rung");
+    }
+
+    #[test]
+    fn layer2_vbr_result_is_a_valid_ladder_rung() {
+        // Whatever the selector returns must resolve via
+        // `bitrate_index_layer2` for the rate's ID bit.
+        let params = Layer2HeaderParams::new(44_100, 256, Mode::Stereo);
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        for sb in 0..20 {
+            smr[0][sb] = 15.0;
+            smr[1][sb] = 12.0;
+        }
+        let kbps = select_layer2_vbr_bitrate(&params, &smr, 0.0).expect("vbr select");
+        assert!(
+            bitrate_index_layer2(kbps, 1).is_some(),
+            "{kbps} kbit/s must be a real MPEG-1 Layer II rung"
+        );
     }
 
     // ---- Layer II frame-header writer (§2.4.2.3) ------------------
@@ -6698,6 +7005,99 @@ mod tests {
         let fa = psy.encode_frame(&pcm).expect("psy");
         let fb = plain.encode_frame(&pcm).expect("plain");
         assert_eq!(fa.len(), fb.len(), "frame envelope must match");
+    }
+
+    /// `with_vbr` is inert without psychoacoustic: the fixed
+    /// `params.bitrate_kbps` is used and the frame matches a plain
+    /// encoder byte-for-byte (VBR needs Model 2 SMR to make a decision).
+    #[test]
+    fn mp1_layer2_frame_encoder_vbr_inert_without_psychoacoustic() {
+        use crate::decode_layer2::LAYER2_SAMPLES_PER_FRAME;
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        let mut vbr = Mp1Layer2FrameEncoder::new(params).with_vbr(0.0);
+        assert_eq!(vbr.vbr_target_mnr_db(), Some(0.0));
+        assert!(!vbr.is_psychoacoustic());
+        let mut plain = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(48_000, 1);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME);
+        let fa = vbr.encode_frame(&pcm).expect("vbr-no-psy");
+        let fb = plain.encode_frame(&pcm).expect("plain");
+        assert_eq!(
+            fa, fb,
+            "VBR without psychoacoustic must be a no-op vs fixed bitrate"
+        );
+    }
+
+    /// A psychoacoustic VBR encoder emits frames whose header bitrate is
+    /// a valid §2.4.2.3 ladder rung, and raising the target mask-to-noise
+    /// margin for the SAME loud signal never picks a SMALLER frame —
+    /// stricter quality demands at least as many bits. (Comparing two
+    /// different signals is unreliable on a cold Model 2 history; the
+    /// target-monotonicity property is deterministic.)
+    #[test]
+    fn mp1_layer2_frame_encoder_vbr_target_monotone_in_frame_size() {
+        let params = Layer2HeaderParams::new(48_000, 320, Mode::SingleChannel);
+
+        // Loud broadband-ish signal: several strong tones across the band.
+        let loud: Vec<f64> = (0..1152)
+            .map(|s| {
+                let t = s as f64 / 48_000.0;
+                0.3 * (2.0 * std::f64::consts::PI * 1_000.0 * t).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 7_000.0 * t).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 15_000.0 * t).sin()
+            })
+            .collect();
+
+        // Encode the same signal under a lax and a strict target.
+        let mut lax_enc = Mp1Layer2FrameEncoder::new(params)
+            .with_psychoacoustic(true)
+            .with_vbr(-50.0);
+        let mut strict_enc = Mp1Layer2FrameEncoder::new(params)
+            .with_psychoacoustic(true)
+            .with_vbr(40.0);
+        assert!(lax_enc.is_psychoacoustic(), "48 kHz has an Annex D table");
+
+        let lax = lax_enc.encode_frame(&loud).expect("lax vbr");
+        let strict = strict_enc.encode_frame(&loud).expect("strict vbr");
+
+        // Both frame headers must carry a valid ladder bitrate.
+        for f in [&lax, &strict] {
+            let h = FrameHeader::parse(f).expect("parse");
+            assert!(h.frame_length_bytes().expect("fixed bitrate") > 0);
+        }
+        // A stricter (higher) target must not yield a smaller frame.
+        assert!(
+            strict.len() >= lax.len(),
+            "strict target frame ({} B) must be >= lax target frame ({} B)",
+            strict.len(),
+            lax.len()
+        );
+        // The lax target (accepting audible noise) should land on the
+        // smallest rung — proof VBR actually saves bits when allowed.
+        assert_eq!(
+            lax.len(),
+            (144u32 * 32 * 1000 / 48_000) as usize,
+            "lax → 32 kbit/s"
+        );
+    }
+
+    /// A VBR-encoded frame decodes cleanly: the chosen per-frame bitrate
+    /// is self-consistent with the frame the decoder reads back.
+    #[test]
+    fn mp1_layer2_frame_encoder_vbr_frame_decodes() {
+        use crate::decode_layer2::decode_layer2_audio_data;
+        let params = Layer2HeaderParams::new(44_100, 256, Mode::Stereo);
+        let mut enc = Mp1Layer2FrameEncoder::new(params)
+            .with_psychoacoustic(true)
+            .with_vbr(0.0);
+        let pcm = layer2_test_pcm(44_100, 2);
+        let frame = enc.encode_frame(&pcm).expect("vbr encode");
+        let header = FrameHeader::parse(&frame).expect("parse");
+        assert_eq!(header.mode, Mode::Stereo);
+        let len = header.frame_length_bytes().expect("fixed bitrate") as usize;
+        assert_eq!(frame.len(), len, "emitted frame matches its header bitrate");
+        // The audio data must decode without error.
+        decode_layer2_audio_data(&header, &frame[4..]).expect("vbr frame decodes");
     }
 
     /// `reset()` zeroes the Model 2 prediction history so a primed

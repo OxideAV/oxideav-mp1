@@ -97,6 +97,24 @@ per-channel 1024-sample sliding FFT window, runs the per-channel
 SMR. As with Layer I, the model is honoured at 32 / 44.1 / 48 kHz and the
 MPEG-2 LSF half-rates fall back to the signal-energy proxy.
 
+**Layer II intensity_stereo (joint_stereo)** codes one shared sample
+stream in the upper band `[bound, sblimit)` that the decoder rescales
+into both channels with each channel's own Table 3-B.1 scalefactor
+(§2.4.1.6 / Annex B). The encoder forms that stream from the per-slot
+channel average `(L+R)/2`, so both channels' content survives into the
+coded samplecode while the per-channel scalefactors restore each
+channel's loudness; channel 0's upper-band scalefactor is selected from
+the combined peak (`|(L+R)/2| ≤ max(|L|,|R|)`) so the shared samplecode
+never overflows quantization.
+
+**Per-frame variable bitrate (VBR)** is available for Layer II via
+`Mp1Layer2FrameEncoder::with_vbr(target_mnr_db)` (alongside
+`with_psychoacoustic(true)`): each frame's `bitrate_index` is chosen as
+the smallest §2.4.2.3 ladder rung whose Model 2 allocation clears the
+target mask-to-noise margin, falling back to the top rung when none does.
+`select_layer2_vbr_bitrate`, `layer2_min_mnr_db` and
+`layer2_bitrate_ladder` expose the selector's building blocks.
+
 ## Not yet supported
 
 - **Annex D Model 1.** Only Model 2 is assembled into a per-frame

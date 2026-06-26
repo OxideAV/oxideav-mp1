@@ -31,6 +31,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II per-frame variable-bitrate (VBR) encoding.**
+  `Mp1Layer2FrameEncoder::with_vbr(target_mnr_db)` selects, for every
+  frame, the smallest §2.4.2.3 bitrate-ladder rung whose Annex D Model 2
+  allocation pushes every non-masked subband's mask-to-noise ratio to at
+  least `target_mnr_db` dB (falling back to the highest rung when no rung
+  suffices). The header's `bitrate_index` therefore varies frame-to-frame
+  — the decoder re-reads it per frame, so the stream stays
+  spec-conformant. VBR takes effect only together with
+  `with_psychoacoustic(true)` (it needs Model 2 SMR to make a decision);
+  with the model off it is inert and the fixed `params.bitrate_kbps` is
+  used. New public building blocks: `select_layer2_vbr_bitrate` (the
+  per-frame rung selector), `layer2_min_mnr_db` (the post-allocation
+  perceptual quality floor), and `layer2_bitrate_ladder` (the ascending
+  §2.4.2.3 ladder for an `ID` bit). `target_mnr_db == 0.0` targets
+  transparency by the model; positive values trade bits for headroom,
+  negative values trade audible noise for a smaller stream.
 - **Layer II joint_stereo PCM round-trip integration tests**
   (`tests/layer2_joint_stereo.rs`). Two distinct per-channel tones are
   encoded through `Mp1Layer2FrameEncoder` in `Mode::JointStereo` and

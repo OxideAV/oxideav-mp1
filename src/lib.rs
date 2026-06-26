@@ -118,15 +118,16 @@ pub use decoder::make_decoder_with_concealment;
 pub use encode::{
     allocate_bits, allocate_bits_layer2, allocate_bits_layer2_psy, allocate_bits_psy,
     bitrate_index_layer2, encode_layer2_frame, encode_layer2_frame_psy,
-    encode_layer2_frame_with_ancillary, layer2_frame_payload_bits, layer2_stereo_bound,
-    layer2_subband_peak_per_part, pack_layer2_header, quantize, quantize_layer2_sample,
-    select_layer2_scalefactors, select_scalefactor, sum_nbal_per_channel,
-    write_layer2_allocation_field, write_layer2_header, write_layer2_samples_field,
-    write_layer2_scalefactor_field, Allocation, AnalysisFilter, BitWriter, EncodeError,
-    EncodeParams, Layer2Allocation, Layer2AllocationFieldError, Layer2EncodeError,
-    Layer2HeaderError, Layer2HeaderParams, Layer2SamplesFieldError, Layer2SamplesFieldInput,
-    Layer2ScalefactorFieldError, Layer2ScalefactorFieldInput, Layer2ScalefactorIndices,
-    Layer2SubbandPeaks, LayerSelect, Mp1FrameEncoder, Mp1Layer2FrameEncoder,
+    encode_layer2_frame_with_ancillary, layer2_bitrate_ladder, layer2_frame_payload_bits,
+    layer2_min_mnr_db, layer2_stereo_bound, layer2_subband_peak_per_part, pack_layer2_header,
+    quantize, quantize_layer2_sample, select_layer2_scalefactors, select_layer2_vbr_bitrate,
+    select_scalefactor, sum_nbal_per_channel, write_layer2_allocation_field, write_layer2_header,
+    write_layer2_samples_field, write_layer2_scalefactor_field, Allocation, AnalysisFilter,
+    BitWriter, EncodeError, EncodeParams, Layer2Allocation, Layer2AllocationFieldError,
+    Layer2EncodeError, Layer2HeaderError, Layer2HeaderParams, Layer2SamplesFieldError,
+    Layer2SamplesFieldInput, Layer2ScalefactorFieldError, Layer2ScalefactorFieldInput,
+    Layer2ScalefactorIndices, Layer2SubbandPeaks, LayerSelect, Mp1FrameEncoder,
+    Mp1Layer2FrameEncoder,
 };
 pub use encoder::{make_encoder_layer2, make_encoder_with_crc};
 pub use header::{
