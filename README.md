@@ -115,6 +115,14 @@ target mask-to-noise margin, falling back to the top rung when none does.
 `select_layer2_vbr_bitrate`, `layer2_min_mnr_db` and
 `layer2_bitrate_ladder` expose the selector's building blocks.
 
+**Automatic intensity_stereo bound** selection is available via
+`Mp1Layer2FrameEncoder::with_auto_intensity_bound(rel_threshold)`: each
+joint_stereo frame recomputes its `mode_extension` (intensity bound
+`{4, 8, 12, 16}`) from the per-subband channel-difference energy
+(`select_layer2_intensity_bound`), so near-mono frames share aggressively
+while wide-stereo frames keep more subbands in full stereo. It composes
+with the psychoacoustic, VBR, and ancillary paths.
+
 ## Not yet supported
 
 - **Annex D Model 1.** Only Model 2 is assembled into a per-frame

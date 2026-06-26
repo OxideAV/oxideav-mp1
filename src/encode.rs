@@ -2439,6 +2439,70 @@ pub fn layer2_stereo_bound(header: &FrameHeader, sblimit: usize) -> usize {
     raw.min(sblimit)
 }
 
+/// Choose the §2.4.2.3 `mode_extension` (joint_stereo intensity bound)
+/// for a stereo Layer II frame from the per-subband two-channel signal.
+///
+/// In joint_stereo the upper band `[bound, sblimit)` is intensity-coded:
+/// both channels share one sample stream, so any genuine left/right
+/// **difference** in those subbands is lost (only per-channel level is
+/// preserved). Intensity-coding is therefore safe only where the
+/// channels are already similar. The four legal bounds map to
+/// `mode_extension` `{4 → 0b00, 8 → 0b01, 12 → 0b10, 16 → 0b11}`; a
+/// larger bound keeps more subbands in full stereo (higher fidelity,
+/// more bits), a smaller bound shares more (fewer bits, risk of audible
+/// collapse where the channels differ).
+///
+/// This selector finds the highest subband whose normalised
+/// inter-channel difference energy exceeds `rel_threshold` (a fraction of
+/// that subband's total energy) — the deepest subband that must stay in
+/// full stereo — and returns the smallest `mode_extension` whose bound
+/// covers it. A near-mono signal (no subband differs) collapses to the
+/// smallest bound (`0b00`, bound 4); a signal that differs up through the
+/// top of the intensity range picks `0b11` (bound 16). `rel_threshold`
+/// near `0.0` is conservative (favours full stereo); larger values share
+/// more aggressively.
+///
+/// Returns the raw two-bit `mode_extension` value for
+/// [`Layer2HeaderParams::mode_extension`].
+// The per-subband / per-slot difference-energy accumulation walks the
+// (sb, slot) grid in the same order the §C.1.3 analysis fills it; an
+// iterator rewrite would obscure the two-channel index correspondence.
+#[allow(clippy::needless_range_loop)]
+pub fn select_layer2_intensity_bound(
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    sblimit: usize,
+    rel_threshold: f64,
+) -> u8 {
+    // The deepest subband index (1-based count) that must remain stereo.
+    let mut min_stereo_subbands = 0usize;
+    let top = sblimit.min(SUBBANDS);
+    for sb in 0..top {
+        let mut diff_e = 0.0f64;
+        let mut sum_e = 0.0f64;
+        // 36 sub-band samples per Layer II frame subband.
+        for slot in 0..36 {
+            let l = subbands[0][sb][slot];
+            let r = subbands[1][sb][slot];
+            let d = l - r;
+            diff_e += d * d;
+            sum_e += l * l + r * r;
+        }
+        // A subband differs materially when its difference energy is a
+        // non-trivial fraction of its total energy. Silent subbands
+        // (sum_e ≈ 0) never force stereo.
+        if sum_e > 1e-12 && diff_e > rel_threshold * sum_e {
+            min_stereo_subbands = sb + 1;
+        }
+    }
+    // Smallest legal bound (4 / 8 / 12 / 16) covering `min_stereo_subbands`.
+    match min_stereo_subbands {
+        0..=4 => 0b00,
+        5..=8 => 0b01,
+        9..=12 => 0b10,
+        _ => 0b11,
+    }
+}
+
 // ---- Layer II per-sample quantization (§C.1.5.2 / §2.4.3.3.4) ---
 
 /// Quantize one Layer II sub-band sample value into a raw `nlevels`-level
@@ -3644,6 +3708,14 @@ pub struct Mp1Layer2FrameEncoder {
     /// allocation clears the target margin (falling back to the highest
     /// rung). `None` keeps the fixed `params.bitrate_kbps`.
     vbr_target_mnr_db: Option<f64>,
+    /// Per-frame automatic intensity-stereo bound selection, set by
+    /// [`with_auto_intensity_bound`](Self::with_auto_intensity_bound).
+    /// When `Some(rel_threshold)` **and** the mode is `JointStereo`, each
+    /// frame's `mode_extension` is recomputed by
+    /// [`select_layer2_intensity_bound`] from the channel difference
+    /// energy before encoding. `None` keeps the fixed
+    /// `params.mode_extension`.
+    auto_intensity_threshold: Option<f64>,
 }
 
 impl Mp1Layer2FrameEncoder {
@@ -3665,7 +3737,28 @@ impl Mp1Layer2FrameEncoder {
             psy: None,
             psy_window: Vec::new(),
             vbr_target_mnr_db: None,
+            auto_intensity_threshold: None,
         }
+    }
+
+    /// Enable per-frame automatic **intensity_stereo bound** selection
+    /// with the given relative difference-energy threshold (consuming
+    /// builder).
+    ///
+    /// Effective only when the header `mode` is `JointStereo`: each frame
+    /// recomputes its `mode_extension` via
+    /// [`select_layer2_intensity_bound`] from the analysed two-channel
+    /// sub-band signal, so the intensity bound tracks how stereo the
+    /// content actually is. A near-mono frame shares aggressively
+    /// (smallest bound 4), a wide-stereo frame keeps more subbands in
+    /// full stereo (larger bound). `rel_threshold` is the fraction of a
+    /// subband's total energy its inter-channel difference may reach
+    /// before that subband is forced to stay stereo; smaller values are
+    /// more conservative (favour fidelity). With any other `mode` this
+    /// setting is inert.
+    pub fn with_auto_intensity_bound(mut self, rel_threshold: f64) -> Mp1Layer2FrameEncoder {
+        self.auto_intensity_threshold = Some(rel_threshold);
+        self
     }
 
     /// Enable per-frame **variable-bitrate (VBR)** encoding with the
@@ -3864,6 +3957,28 @@ impl Mp1Layer2FrameEncoder {
         // the SMR via `encode_layer2_frame_psy`. Falls back to the
         // signal-energy proxy when psychoacoustic is off / the rate has
         // no Annex D table (`psy == None`).
+        // Per-frame automatic intensity_stereo bound: when enabled and the
+        // mode is JointStereo, recompute `mode_extension` from this frame's
+        // channel difference energy so the bound tracks the actual stereo
+        // width. `base_params` is the per-frame header the encode dispatch
+        // uses (the VBR path layers `bitrate_kbps` on top of it).
+        let mut base_params = self.params;
+        if self.params.mode == Mode::JointStereo {
+            if let Some(thresh) = self.auto_intensity_threshold {
+                let sblimit = {
+                    let header_bytes = pack_layer2_header(&self.params)?;
+                    let header = FrameHeader::parse(&header_bytes).map_err(|_| {
+                        Layer2EncodeError::Header(Layer2HeaderError::UnsupportedSamplingFrequency(
+                            self.params.sampling_frequency,
+                        ))
+                    })?;
+                    crate::tables_layer2::layer2_bit_allocation_table(&header).sblimit()
+                };
+                let me = select_layer2_intensity_bound(&subbands, sblimit, thresh);
+                base_params.mode_extension = crate::header::ModeExtension(me);
+            }
+        }
+
         let pending = self.pending_ancillary.take().unwrap_or_default();
         let vbr_target = self.vbr_target_mnr_db;
         if let Some(states) = self.psy.as_mut() {
@@ -3888,13 +4003,13 @@ impl Mp1Layer2FrameEncoder {
                 // (e.g. an unsupported rate) falls through to the fixed
                 // `params.bitrate_kbps`.
                 if let Some(target) = vbr_target {
-                    if let Ok(kbps) = select_layer2_vbr_bitrate(&self.params, &smr, target) {
-                        let mut frame_params = self.params;
+                    if let Ok(kbps) = select_layer2_vbr_bitrate(&base_params, &smr, target) {
+                        let mut frame_params = base_params;
                         frame_params.bitrate_kbps = kbps;
                         return encode_layer2_frame_psy(&frame_params, &subbands, &smr);
                     }
                 }
-                return encode_layer2_frame_psy(&self.params, &subbands, &smr);
+                return encode_layer2_frame_psy(&base_params, &subbands, &smr);
             }
             // Ancillary + psychoacoustic together: the staged payload and
             // the Model 2 SMR are independent (the SMR drives allocation,
@@ -3902,8 +4017,8 @@ impl Mp1Layer2FrameEncoder {
             // assembly applies both. VBR also composes: pick the per-frame
             // rung from the SMR, then pack the ancillary tail.
             if let Some(target) = vbr_target {
-                if let Ok(kbps) = select_layer2_vbr_bitrate(&self.params, &smr, target) {
-                    let mut frame_params = self.params;
+                if let Ok(kbps) = select_layer2_vbr_bitrate(&base_params, &smr, target) {
+                    let mut frame_params = base_params;
                     frame_params.bitrate_kbps = kbps;
                     return encode_layer2_frame_psy_with_ancillary(
                         &frame_params,
@@ -3913,12 +4028,12 @@ impl Mp1Layer2FrameEncoder {
                     );
                 }
             }
-            return encode_layer2_frame_psy_with_ancillary(&self.params, &subbands, &smr, &pending);
+            return encode_layer2_frame_psy_with_ancillary(&base_params, &subbands, &smr, &pending);
         }
         if pending.is_empty() {
-            encode_layer2_frame(&self.params, &subbands)
+            encode_layer2_frame(&base_params, &subbands)
         } else {
-            encode_layer2_frame_with_ancillary(&self.params, &subbands, &pending)
+            encode_layer2_frame_with_ancillary(&base_params, &subbands, &pending)
         }
     }
 }
@@ -4819,6 +4934,99 @@ mod tests {
         assert!(
             bitrate_index_layer2(kbps, 1).is_some(),
             "{kbps} kbit/s must be a real MPEG-1 Layer II rung"
+        );
+    }
+
+    // ---- Layer II intensity-stereo bound selection ----------------
+
+    #[test]
+    fn intensity_bound_mono_signal_picks_smallest() {
+        // Identical L/R (no inter-channel difference) → no subband must
+        // stay stereo → smallest mode_extension (0b00, bound 4).
+        let mut sub = zero_layer2_subbands();
+        for sb in 0..27 {
+            for slot in 0..36 {
+                let v = 0.2 * ((sb + slot) as f64).sin();
+                sub[0][sb][slot] = v;
+                sub[1][sb][slot] = v; // identical → mono
+            }
+        }
+        assert_eq!(select_layer2_intensity_bound(&sub, 27, 0.05), 0b00);
+    }
+
+    #[test]
+    fn intensity_bound_wide_high_band_picks_larger() {
+        // Channels identical in the low band but very different in a high
+        // subband (sb 14) → the bound must cover sb 14 → 0b11 (bound 16).
+        let mut sub = zero_layer2_subbands();
+        for slot in 0..36 {
+            // Low band identical.
+            for sb in 0..4 {
+                let v = 0.2 * (slot as f64).cos();
+                sub[0][sb][slot] = v;
+                sub[1][sb][slot] = v;
+            }
+            // sb 14: anti-correlated (big difference).
+            sub[0][14][slot] = 0.3 * (slot as f64).sin();
+            sub[1][14][slot] = -0.3 * (slot as f64).sin();
+        }
+        assert_eq!(select_layer2_intensity_bound(&sub, 27, 0.05), 0b11);
+    }
+
+    #[test]
+    fn intensity_bound_threshold_monotone() {
+        // A larger relative threshold (more tolerant of difference) never
+        // selects a LARGER bound than a stricter threshold.
+        let mut sub = zero_layer2_subbands();
+        for slot in 0..36 {
+            // Mild difference in sb 6.
+            sub[0][6][slot] = 0.2 * (slot as f64).sin();
+            sub[1][6][slot] = 0.18 * (slot as f64).sin();
+        }
+        let strict = select_layer2_intensity_bound(&sub, 27, 0.001);
+        let lax = select_layer2_intensity_bound(&sub, 27, 0.5);
+        assert!(lax <= strict, "lax {lax} must be <= strict {strict}");
+    }
+
+    #[test]
+    fn stateful_auto_intensity_bound_tracks_signal() {
+        // The stateful encoder with auto-bound recomputes mode_extension
+        // per frame. A mono-content frame should select bound 4; a frame
+        // with strong high-band stereo difference should select a larger
+        // bound. We read the bound back from each emitted frame header.
+        let mut params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
+        params.mode_extension = crate::header::ModeExtension(0b11); // start wide
+        let mut enc = Mp1Layer2FrameEncoder::new(params).with_auto_intensity_bound(0.05);
+
+        // Mono frame: L == R everywhere.
+        let mut mono = vec![0.0f64; 1152 * 2];
+        for s in 0..1152 {
+            let v = 0.2 * (2.0 * std::f64::consts::PI * 600.0 * s as f64 / 44_100.0).sin();
+            mono[s * 2] = v;
+            mono[s * 2 + 1] = v;
+        }
+        let mono_frame = enc.encode_frame(&mono).expect("mono frame");
+        let mh = FrameHeader::parse(&mono_frame).expect("parse");
+        assert_eq!(
+            mh.mode_extension,
+            crate::header::ModeExtension(0b00),
+            "identical channels collapse to the smallest bound"
+        );
+
+        // Wide-stereo frame: high-frequency tones differ between channels
+        // (different frequencies land in different high subbands).
+        let mut wide = vec![0.0f64; 1152 * 2];
+        for s in 0..1152 {
+            let t = s as f64 / 44_100.0;
+            wide[s * 2] = 0.3 * (2.0 * std::f64::consts::PI * 16_000.0 * t).sin();
+            wide[s * 2 + 1] = 0.3 * (2.0 * std::f64::consts::PI * 18_000.0 * t).cos();
+        }
+        let wide_frame = enc.encode_frame(&wide).expect("wide frame");
+        let wh = FrameHeader::parse(&wide_frame).expect("parse");
+        assert!(
+            wh.mode_extension.0 > 0b00,
+            "wide high-band stereo must select a bound above the minimum (got {:?})",
+            wh.mode_extension
         );
     }
 

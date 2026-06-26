@@ -31,6 +31,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II automatic intensity_stereo bound selection.** New
+  `select_layer2_intensity_bound` chooses the §2.4.2.3 `mode_extension`
+  (intensity bound `{4, 8, 12, 16}`) from a frame's per-subband
+  two-channel signal: it finds the deepest subband whose normalised
+  inter-channel difference energy exceeds a relative threshold (the
+  deepest band that must stay in full stereo) and returns the smallest
+  bound covering it. A near-mono frame collapses to the smallest bound
+  (share aggressively, save bits); a wide-stereo frame keeps more
+  subbands in full stereo (preserve the stereo image). The stateful
+  `Mp1Layer2FrameEncoder::with_auto_intensity_bound(rel_threshold)`
+  recomputes `mode_extension` per frame so the bound tracks the content;
+  it composes with psychoacoustic, VBR, and ancillary. Four tests cover
+  the selector (mono → smallest, wide high-band → largest, threshold
+  monotonicity) and the stateful per-frame tracking.
 - **Layer II psychoacoustic + ancillary-data in one frame.** New
   `encode_layer2_frame_psy_with_ancillary` assembles a frame with BOTH
   the Annex D Model 2 perceptual allocation AND a §2.4.1.8
