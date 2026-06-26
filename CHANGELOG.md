@@ -6,6 +6,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Layer II intensity_stereo encode quality — shared upper-band stream
+  is now the per-slot channel average `(L+R)/2`.** Per §2.4.1.6 / Annex
+  B ("Requantization of subband samples"), the joint_stereo upper band
+  `[bound, sblimit)` codes ONE shared samplecode stream the decoder
+  rescales into both channels with each channel's own Table 3-B.1
+  scalefactor. The encoder previously sourced that shared stream from
+  channel 0 alone, discarding the right channel's signal shape. It now
+  forms the stream from the per-slot channel average `(L+R)/2`, so both
+  channels' contributions survive into the coded samplecode while the
+  per-channel scalefactors restore each channel's loudness (intensity
+  positioning by level). Channel 0's upper-band scalefactor is now
+  selected from the combined signal's per-part peak — a peak the average
+  can never exceed (`|(L+R)/2| ≤ max(|L|,|R|)`), guaranteeing the shared
+  samplecode never overflows quantization; channel 1 keeps the
+  scalefactor selected from its own per-part peak. The new conformance
+  guard `encode_layer2_joint_stereo_shared_stream_is_channel_average`
+  drives two distinct comparable-amplitude waveforms through a shared
+  subband and asserts the decoded shared stream tracks `(L+R)/2` closer
+  than channel 0 alone (the test fails on the prior channel-0-only
+  combine).
+
 ### Added
 
 - **Annex D Model 2 psychoacoustic bit allocation wired into the

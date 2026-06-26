@@ -2610,7 +2610,36 @@ fn encode_layer2_frame_inner(
 
     // §C.1.5.1.4 (per-part) scalefactor selection — populates the
     // §2.4.2.6 SCFSI part-0/1/2 array directly.
-    let scf_indices = select_layer2_scalefactors(subbands, nch, sblimit);
+    let mut scf_indices = select_layer2_scalefactors(subbands, nch, sblimit);
+    // §2.4.1.6 intensity_stereo: the upper band `[bound, sblimit)` codes
+    // ONE shared sample stream the decoder rescales into both channels.
+    // The encoder forms that stream from the per-slot channel average
+    // `(L+R)/2` (see the quantization loop below). Channel 0's
+    // scalefactor normalises the shared stream, so it MUST be selected
+    // from the combined signal's per-part peak — a peak the average can
+    // never exceed (|(L+R)/2| ≤ max(|L|,|R|)), guaranteeing the shared
+    // samplecode never overflows quantization. Channel 1 keeps the
+    // scalefactor selected from its OWN per-part peak; on rescale that
+    // restores the right-channel loudness from the shared stream
+    // (intensity positioning by per-channel level). The low band is
+    // untouched: each channel keeps its own per-channel scalefactors.
+    if nch == 2 {
+        for sb in bound..sblimit {
+            // 36 sub-band samples split into three 12-slot scalefactor
+            // parts (part = slot / 12), matching
+            // `layer2_subband_peak_per_part`.
+            for part in 0..3 {
+                let mut m = 0.0f64;
+                for slot in part * 12..(part + 1) * 12 {
+                    let a = (0.5 * (subbands[0][sb][slot] + subbands[1][sb][slot])).abs();
+                    if a > m {
+                        m = a;
+                    }
+                }
+                scf_indices[0][sb][part] = select_scalefactor(m);
+            }
+        }
+    }
     // §C.1.5.2.7 bit allocation — the per-frame `(ch, sb) → alloc`
     // matrix. The allocator's "peak energy" proxy is the per-subband max
     // absolute sub-band sample over the 36 slots.
@@ -2722,12 +2751,33 @@ fn encode_layer2_frame_inner(
                 "allocate_bits_layer2 only selects legal Table 3-B.2x cells; \
                  quant_class must resolve",
             );
+            // §2.4.1.6 intensity_stereo (Annex B, "Requantization of
+            // subband samples"): in the upper band `[bound, sblimit)` the
+            // decoder reads ONE shared sample stream and rescales it into
+            // both channels with each channel's own Table 3-B.1
+            // scalefactor. Channel 0's scalefactor normalises the shared
+            // stream the encoder quantizes; channel 1's (independently
+            // selected from its own per-part peak) recovers the right-
+            // channel level on rescale. To avoid discarding the right
+            // channel's signal shape entirely (the previous behaviour
+            // sourced the shared stream from channel 0 alone), form the
+            // shared stream from the per-slot channel average `(L+R)/2`
+            // — a level-preserving intensity_stereo combine that keeps
+            // both channels' contributions in the coded samplecode while
+            // the per-channel scalefactors restore each channel's
+            // loudness. The low band `[0, bound)` is unaffected: each
+            // channel encodes its own samples.
+            let upper_band_shared = upper_band && nch == 2;
             for gr in 0..SYNTAX_GRANULES {
                 for s in 0..3 {
                     let slot = gr * 3 + s;
                     let part = slot / 12;
                     let scf = SCALEFACTORS[used_scf_indices[ch][sb][part] as usize];
-                    let value = subbands[ch][sb][slot];
+                    let value = if upper_band_shared {
+                        0.5 * (subbands[0][sb][slot] + subbands[1][sb][slot])
+                    } else {
+                        subbands[ch][sb][slot]
+                    };
                     samples_input.codes[ch][gr][sb][s] = quantize_layer2_sample(value, scf, class);
                 }
             }
@@ -6327,6 +6377,77 @@ mod tests {
         assert!(
             any_shared,
             "joint_stereo expected at least one allocated shared upper-band subband"
+        );
+    }
+
+    /// §2.4.1.6 intensity_stereo combine: the shared upper-band sample
+    /// stream the encoder codes is the per-slot channel average
+    /// `(L+R)/2`, NOT channel 0 alone. With both channels carrying
+    /// distinct, comparable energy in a shared subband, the decoded
+    /// shared (scalefactor-normalised) stream must track the average of
+    /// the two input channels — a property a channel-0-only combine
+    /// would violate (it would track L instead). This is the conformance
+    /// guard for the joint-stereo encode-quality milestone.
+    #[test]
+    fn encode_layer2_joint_stereo_shared_stream_is_channel_average() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_SUBBAND};
+        use crate::tables_layer2::layer2_bit_allocation_table;
+        let mut params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
+        // bound subband index 8; shared upper band [8, 27).
+        params.mode_extension = crate::header::ModeExtension(0b01);
+        let mut subbands = Box::new([[[0.0f64; 36]; SUBBANDS]; 2]);
+        // Drive a single shared subband (sb 12) with two DISTINCT
+        // waveforms of comparable amplitude. Their per-slot average is
+        // materially different from either channel alone, so a decoder
+        // that recovers the average proves the combine — and a ch-0-only
+        // encoder would fail this test.
+        let sb = 12usize;
+        for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+            let t = slot as f64 / LAYER2_SAMPLES_PER_SUBBAND as f64;
+            subbands[0][sb][slot] = 0.45 * (2.0 * std::f64::consts::PI * t).sin();
+            subbands[1][sb][slot] = 0.40 * (2.0 * std::f64::consts::PI * t).cos();
+        }
+        let frame = encode_layer2_frame(&params, &subbands).expect("encode_layer2_frame");
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        let recovered = decode_layer2_audio_data(&header, &frame[4..]).expect("decode");
+        let table = layer2_bit_allocation_table(&header);
+        let bound = layer2_stereo_bound(&header, table.sblimit());
+        assert!(
+            sb >= bound && sb < table.sblimit(),
+            "sb 12 is in shared band"
+        );
+        let a0 = recovered.subbands[0][sb].allocation;
+        assert!(a0 > 0, "shared sb must receive bits for this signal");
+
+        // Reconstruct the shared (normalised) stream from channel 0 and
+        // compare against the intended `(L+R)/2`. The dequantised
+        // ch0 sample divided by ch0's scalefactor is the shared `s_dp`
+        // triplet; multiplied back by the combine scalefactor it is the
+        // average. We compare the *correlation-sign* and the mean of
+        // (ch0_recovered vs avg) and (ch0_recovered vs L-only): the
+        // average must be the closer target.
+        let mut err_avg = 0.0f64;
+        let mut err_l_only = 0.0f64;
+        for slot in 0..LAYER2_SAMPLES_PER_SUBBAND {
+            let part = slot / 12;
+            let scf0 =
+                SCALEFACTORS[recovered.subbands[0][sb].scalefactor_indices[part] as usize & 0x3F];
+            // `s_dp` shared normalised triplet (same for both channels).
+            let s_dp = recovered.subbands[0][sb].samples[slot] / scf0;
+            // The combine scalefactor normalises (L+R)/2; reconstruct the
+            // shared stream's intended pre-normalisation amplitude.
+            let shared = s_dp * scf0;
+            let avg = 0.5 * (subbands[0][sb][slot] + subbands[1][sb][slot]);
+            let l_only = subbands[0][sb][slot];
+            err_avg += (shared - avg).powi(2);
+            err_l_only += (shared - l_only).powi(2);
+        }
+        // The coded shared stream must be far closer to the channel
+        // average than to channel 0 alone.
+        assert!(
+            err_avg < err_l_only,
+            "shared stream must track (L+R)/2 (err_avg={err_avg}) \
+             closer than L alone (err_l_only={err_l_only})"
         );
     }
 
