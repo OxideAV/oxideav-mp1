@@ -2717,6 +2717,26 @@ pub fn encode_layer2_frame_psy(
     encode_layer2_frame_inner(params, subbands, &[], Some(smr))
 }
 
+/// Encode a §2.4.1.6 Layer II frame with **both** the Annex D Model 2
+/// psychoacoustic allocator AND a §2.4.1.8 `ancillary_data()` payload.
+///
+/// This is the union of [`encode_layer2_frame_psy`] (perceptual
+/// allocation from `smr`) and [`encode_layer2_frame_with_ancillary`]
+/// (caller-supplied ancillary bytes packed into the frame tail after the
+/// §2.4.1.6 audio data). The two concerns are independent — the SMR
+/// drives bit allocation, the ancillary bytes fill the leftover tail —
+/// so the frame is assembled exactly once with both applied. Raises
+/// [`Layer2EncodeError::AncillaryTooLarge`] if the ancillary payload does
+/// not fit the frame's leftover space after allocation.
+pub fn encode_layer2_frame_psy_with_ancillary(
+    params: &Layer2HeaderParams,
+    subbands: &[[[f64; 36]; SUBBANDS]; 2],
+    smr: &[[f64; SUBBANDS]; 2],
+    ancillary: &[u8],
+) -> Result<Vec<u8>, Layer2EncodeError> {
+    encode_layer2_frame_inner(params, subbands, ancillary, Some(smr))
+}
+
 // The §C.1.5.2 wiring is a strict (ch, sb, gr, sample) nested walk, the
 // same structure the four writers expose; an iterator rewrite would
 // obscure the spec mapping.
@@ -3876,12 +3896,24 @@ impl Mp1Layer2FrameEncoder {
                 }
                 return encode_layer2_frame_psy(&self.params, &subbands, &smr);
             }
-            // Ancillary + psychoacoustic together are not yet a single
-            // entry point; the staged payload takes precedence and the
-            // proxy allocator is used for this frame (the ancillary path
-            // is the rarer of the two). The Model 2 history was still
-            // advanced above so the next frame's prediction is correct.
-            return encode_layer2_frame_with_ancillary(&self.params, &subbands, &pending);
+            // Ancillary + psychoacoustic together: the staged payload and
+            // the Model 2 SMR are independent (the SMR drives allocation,
+            // the ancillary bytes fill the frame tail), so a single
+            // assembly applies both. VBR also composes: pick the per-frame
+            // rung from the SMR, then pack the ancillary tail.
+            if let Some(target) = vbr_target {
+                if let Ok(kbps) = select_layer2_vbr_bitrate(&self.params, &smr, target) {
+                    let mut frame_params = self.params;
+                    frame_params.bitrate_kbps = kbps;
+                    return encode_layer2_frame_psy_with_ancillary(
+                        &frame_params,
+                        &subbands,
+                        &smr,
+                        &pending,
+                    );
+                }
+            }
+            return encode_layer2_frame_psy_with_ancillary(&self.params, &subbands, &smr, &pending);
         }
         if pending.is_empty() {
             encode_layer2_frame(&self.params, &subbands)
@@ -7482,6 +7514,94 @@ mod tests {
             &frame[tail_start..tail_start + payload.len()],
             &payload,
             "§2.4.1.8 payload must appear at the differing-byte boundary"
+        );
+    }
+
+    #[test]
+    fn encode_layer2_frame_psy_with_ancillary_applies_both() {
+        // The combined entry point packs the §2.4.1.8 ancillary tail AND
+        // allocates from the Model 2 SMR in a single frame: the payload
+        // appears at the tail and the frame decodes cleanly. We compare
+        // against the SMR-only frame (no ancillary) and require the tail
+        // bytes to be the payload.
+        let params = Layer2HeaderParams::new(48_000, 192, Mode::SingleChannel);
+        // Build a moderately exposed SMR so allocation differs from the
+        // silent proxy (drives at least one subband).
+        let mut smr = [[f64::NEG_INFINITY; SUBBANDS]; 2];
+        for sb in 0..10 {
+            smr[0][sb] = 20.0;
+        }
+        let mut sub = zero_layer2_subbands();
+        for sb in 0..10 {
+            for slot in 0..36 {
+                sub[0][sb][slot] = 0.1;
+            }
+        }
+        let payload: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+
+        let psy_only = encode_layer2_frame_psy(&params, &sub, &smr).expect("psy only");
+        let combined = encode_layer2_frame_psy_with_ancillary(&params, &sub, &smr, &payload)
+            .expect("combined");
+
+        assert_eq!(psy_only.len(), combined.len(), "same §2.4.2.1 frame length");
+        // The allocation/scfsi/audio-data region is identical (the SMR is
+        // the same); only the §2.4.1.8 tail differs.
+        let tail_start = combined
+            .iter()
+            .zip(psy_only.iter())
+            .position(|(a, b)| a != b)
+            .expect("combined differs from psy-only in the tail");
+        assert_eq!(
+            &combined[tail_start..tail_start + payload.len()],
+            &payload,
+            "§2.4.1.8 payload must appear in the combined frame's tail"
+        );
+        // The combined frame must decode without error.
+        let header = FrameHeader::parse(&combined).expect("parse");
+        crate::decode_layer2::decode_layer2_audio_data(&header, &combined[4..])
+            .expect("combined frame decodes");
+    }
+
+    #[test]
+    fn stateful_psy_encoder_with_pending_ancillary_uses_smr() {
+        // With psychoacoustic ON and a pending §2.4.1.8 ancillary payload,
+        // the stateful encoder must now route through the combined
+        // psy+ancillary entry point (SMR-driven allocation), NOT the old
+        // proxy fallback. We prove the SMR is honoured by checking the
+        // audio-data region matches a psychoacoustic encode WITHOUT
+        // ancillary (same allocation), while the tail carries the payload.
+        // High bitrate (320 kbit/s) so the §2.4.1.6 allocation for a
+        // single masked tone leaves §2.4.1.8 tail room for the payload.
+        let params = Layer2HeaderParams::new(48_000, 320, Mode::SingleChannel);
+        let tone: Vec<f64> = (0..1152)
+            .map(|s| 0.05 * (2.0 * std::f64::consts::PI * 1_000.0 * s as f64 / 48_000.0).sin())
+            .collect();
+        let payload: [u8; 3] = [0x11, 0x22, 0x33];
+
+        // Prime both encoders with one frame so the Model 2 history is
+        // steady (the cold first frame's unpredictability spreads SMR
+        // across many subbands and can consume the whole budget).
+        let mut psy_no_anc = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        let _ = psy_no_anc.encode_frame(&tone).expect("prime no anc");
+        let no_anc = psy_no_anc.encode_frame(&tone).expect("psy no anc");
+
+        let mut psy_anc = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
+        let _ = psy_anc.encode_frame(&tone).expect("prime anc");
+        psy_anc.set_pending_ancillary(&payload);
+        let with_anc = psy_anc.encode_frame(&tone).expect("psy + anc");
+
+        assert_eq!(no_anc.len(), with_anc.len(), "same frame length");
+        // The two frames share their header + allocation + audio data
+        // (same SMR ⇒ same allocation); they diverge only in the tail.
+        let diff = no_anc
+            .iter()
+            .zip(with_anc.iter())
+            .position(|(a, b)| a != b)
+            .expect("frames must differ in the ancillary tail");
+        assert_eq!(
+            &with_anc[diff..diff + payload.len()],
+            &payload,
+            "ancillary payload present while SMR allocation is preserved"
         );
     }
 

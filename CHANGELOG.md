@@ -31,6 +31,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Layer II psychoacoustic + ancillary-data in one frame.** New
+  `encode_layer2_frame_psy_with_ancillary` assembles a frame with BOTH
+  the Annex D Model 2 perceptual allocation AND a §2.4.1.8
+  `ancillary_data()` tail (the two concerns are independent — SMR drives
+  allocation, ancillary fills the leftover tail). The stateful
+  `Mp1Layer2FrameEncoder` now routes its psychoacoustic + pending-
+  ancillary case through this entry point (and composes with VBR) instead
+  of dropping back to the signal-energy proxy allocator — closing the
+  prior "ancillary + psychoacoustic are not yet a single entry point"
+  limitation. Two new tests: the combined entry point applies both, and
+  the stateful encoder's psy+ancillary path preserves the SMR-driven
+  allocation while emitting the payload.
 - **Top-level `Mp1Encoder` Layer II now honours psychoacoustic + VBR.**
   The registry-facing trait-object encode path previously ignored
   `EncodeParams::psychoacoustic` for Layer II output (it was documented
