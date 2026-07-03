@@ -123,12 +123,25 @@ joint_stereo frame recomputes its `mode_extension` (intensity bound
 while wide-stereo frames keep more subbands in full stereo. It composes
 with the psychoacoustic, VBR, and ancillary paths.
 
+**Annex D Model 1** is now assembled too (`model1` module): the full
+clause D.1 nine-step per-frame procedure — the per-layer Step 1
+Hann-windowed FFT (512-point Layer I / 1024-point Layer II) normalized
+to the 96 dB SPL reference, the Step 2 per-subband SPL
+`Lsb(n) = MAX[X(k), 20·log10(scf_max·32768) − 10]`, the Step 4
+tonal/non-tonal component extraction (local maxima, the per-region
+7 dB neighbour criterion, per-critical-band noise accumulation at the
+geometric mean), the Step 5 decimation (threshold-in-quiet gate +
+0,5-Bark sliding window), the Step 6/7 individual/global masking
+thresholds on the Table D.1x subsampled lines, the Step 8 per-subband
+minimum `LTmin(n)` and the Step 9 `SMR_sb(n)`. Select it with
+`EncodeParams::with_psy_model(PsyModel::Model1)` (Layer I and the
+top-level encoder) or `Mp1Layer2FrameEncoder::with_psy_model` — the
+default remains Model 2 for byte-for-byte compatibility. Model 1
+composes with Layer II VBR and the ancillary path; the LSF half-rates
+fall back to the energy proxy under either model.
+
 ## Not yet supported
 
-- **Annex D Model 1.** Only Model 2 is assembled into a per-frame
-  driver; the Model 1 masking-index / masking-function closed forms are
-  staged in `psy` but there is no Model 1 frame driver (Model 2 is the
-  more capable of the two example models).
 - **Model 2 pre-echo control** (clause D.2.4 m) is Layer III-only and
   intentionally omitted for Layers I / II.
 

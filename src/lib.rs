@@ -87,6 +87,14 @@
 //! (D.1a–c / D.1d–f), D.2a–f, D.3a–c, D.4a–c and D.5 — are fully
 //! transcribed in [`psy`] from the staged 11172-3 text extractions /
 //! renders.
+//!
+//! **Both Annex D example models** are assembled: the clause D.2
+//! Model 2 above, and the clause D.1 **Psychoacoustic Model 1**
+//! ([`model1`]) — the nine-step tonal/non-tonal masker procedure with
+//! its per-layer FFT length (512-point Layer I / 1024-point Layer II).
+//! [`encode::EncodeParams::with_psy_model`] /
+//! [`encode::Mp1Layer2FrameEncoder::with_psy_model`] select the model
+//! ([`encode::PsyModel`]); Model 2 remains the default.
 
 #![warn(missing_debug_implementations)]
 
