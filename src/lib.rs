@@ -99,6 +99,7 @@ pub mod decoder;
 pub mod encode;
 pub mod encoder;
 pub mod header;
+pub mod model1;
 pub mod model2;
 pub mod psy;
 pub mod synthesis;

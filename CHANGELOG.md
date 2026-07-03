@@ -31,6 +31,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Model 1 per-frame driver — Steps 1 + 2 (clause D.1
+  spectral analysis + per-subband SPL).** New `model1` module opening
+  the second Annex D example model: `power_spectrum` runs the printed
+  Step 1 Hann window `h(i) = √(8/3)·0,5·(1 − cos(2πi/N))` and
+  `X(k) = 10·log10 |(1/N)·Σ h(l)s(l)e^(−j2πkl/N)|²` at the per-layer
+  transform length (512-point for Layer I, 1024-point for Layer II —
+  Model 1 is the model whose FFT length differs by layer), normalized
+  to the 96 dB SPL reference via a fixed full-scale calibration
+  (`calibration_offset_db`, documented against the Step 2 absolute
+  scalefactor term and the Table D.4 ±32760-sine anchor).
+  `spl_per_subband` forms the Step 2 sound pressure level
+  `Lsb(n) = MAX[X(k) in subband n, 20·log10(scf_max·32768) − 10]`,
+  and `spl_per_subband_alt` the spec's alternative power-sum variant
+  `X_spl(n)`. **+13 lib-tests**: the per-layer FFT lengths / line
+  counts, full-scale-sine 96 dB peak at both lengths, the −6,02 dB
+  half-amplitude check, Hann-skirt / far-leakage shape, silence → −∞,
+  the calibration closed form, wrong-length rejection, the Step 2
+  MAX semantics (tone vs scalefactor floor), the silence
+  scalefactor-term exactness, the alt-variant ≥ max-variant bound,
+  and the Layer I / Layer II grid correspondence.
 - **Layer II automatic intensity_stereo bound selection.** New
   `select_layer2_intensity_bound` chooses the §2.4.2.3 `mode_extension`
   (intensity bound `{4, 8, 12, 16}`) from a frame's per-subband
