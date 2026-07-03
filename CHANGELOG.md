@@ -31,6 +31,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Model 1 per-frame driver — Steps 5–9 complete + the
+  assembled `Model1` driver.** The clause D.1 chain now runs end to
+  end. `decimate_maskers` performs Step 5: components below the
+  threshold in quiet at their frequency (`X >= LTq(k)`, Table D.1x
+  value + Step 3 bit-rate offset) are removed, components above the
+  Table D.1x coverage (possible for tonal lines between the table top
+  and the Step 4 examinable limit) are removed, and a 0,5-Bark sliding
+  window keeps only the strongest of any run of close tonal
+  components; each survivor is assigned its nearest Table D.1x row
+  (the Step 6 "index i that most closely corresponds to the frequency"
+  rule) as a typed `Masker`. `global_thresholds_db` evaluates Steps
+  6+7 — the individual-threshold forms with the −8…+3 Bark reduction,
+  power-summed with LTq — at every subsampled Table D.1x line (the new
+  `psy::ltq_table(layer, fs)` accessor dispatches all six D.1a–f
+  tables). `min_threshold_per_subband` is Step 8 (`LTmin(n) = MIN
+  LTg(i), f(i) in subband n`; top subbands beyond the table coverage
+  adopt the edge line's threshold), and `smr_per_subband` Step 9
+  (`SMR_sb(n) = Lsb(n) − LTmin(n)`). The **`Model1`** struct ties
+  Steps 1–9 into one `process(window, scf_max, kbps_per_channel)`
+  call — stateless (Model 1 has no inter-frame prediction history,
+  unlike Model 2), `new(layer, fs)` returning `None` for the LSF
+  rates. **+16 lib-tests**: the six-table `ltq_table` dispatch,
+  audible-kept / sub-threshold-dropped decimation, the Step 3 offset
+  moving the decimation gate at the 96 kbit/s boundary, the
+  above-coverage drop (line 245 vs 240 at 32 kHz), the 0,5-Bark
+  window keeping the strongest in both orders plus the sliding-chain
+  collapse, the no-masker LTg == LTq_used floor and its exact −12 dB
+  offset shift, the loud-masker locality (raised within ±0,25 Bark,
+  untouched outside the −3…+8 window), a brute-force Step 8
+  cross-check, LSF/length rejections, silence → all-−∞ SMR,
+  tone-demands-bits-with-self-masking, masking lowering a neighbour
+  probe's SMR by 10+ dB, a Layer II 1024-point end-to-end run, and the
+  wrong-window-length panic contract.
 - **Annex D Model 1 per-frame driver — Step 4 (tonal / non-tonal
   component identification).** `find_tonal_components` labels the
   clause D.1 Step 4 a) local maxima (`X(k) > X(k−1)` and

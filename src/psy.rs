@@ -918,6 +918,25 @@ pub fn critical_band_table(
     }
 }
 
+/// Look up the complete §D.1 Table D.1x threshold-in-quiet table for
+/// the given Layer and sampling frequency: D.1a–c (Layer I, 108 / 106
+/// / 102 rows) or D.1d–f (Layer II, 132 / 130 / 126 rows). Returns
+/// `None` for sampling frequencies outside the {32 000, 44 100,
+/// 48 000} Hz set covered by Annex D (the MPEG-2 LSF rates have no
+/// Table D.1x). The row order is the printed 1-based index `i`
+/// (`table[i - 1].index == i`).
+pub fn ltq_table(layer: Layer, sampling_frequency_hz: u32) -> Option<&'static [LtqRow]> {
+    match (layer, sampling_frequency_hz) {
+        (Layer::I, 32_000) => Some(&LTQ_L1_32K),
+        (Layer::I, 44_100) => Some(&LTQ_L1_44K1),
+        (Layer::I, 48_000) => Some(&LTQ_L1_48K),
+        (Layer::II, 32_000) => Some(&LTQ_L2_32K),
+        (Layer::II, 44_100) => Some(&LTQ_L2_44K1),
+        (Layer::II, 48_000) => Some(&LTQ_L2_48K),
+        _ => None,
+    }
+}
+
 // -----------------------------------------------------------------
 // Annex D Step 6 — Masking-index `av` (closed-form)
 //

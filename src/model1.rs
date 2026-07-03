@@ -408,6 +408,312 @@ pub fn find_non_tonal_components(
     Some(out)
 }
 
+// -----------------------------------------------------------------
+// Clause D.1 Steps 5–9 — decimation, thresholds, SMR
+// -----------------------------------------------------------------
+
+/// A masker that survived Step 5 decimation, carrying the Table D.1x
+/// assignment Steps 6/7 evaluate it with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Masker {
+    /// Original FFT-line index `k` (0-based DC..Nyquist).
+    pub k: usize,
+    /// 1-based Table D.1x row index `i` nearest the component's
+    /// frequency (clause D.1 Step 6: "every tonal and non-tonal
+    /// component is assigned the value of the index i that most
+    /// closely corresponds to the frequency of the original spectral
+    /// line").
+    pub d1_index: u16,
+    /// Critical-band rate `z(j)` in Bark of the assigned row.
+    pub bark_z: f64,
+    /// Sound pressure level `X` in dB.
+    pub spl_db: f64,
+}
+
+/// Clause D.1 Step 6 — the 0-based row of `table` whose frequency is
+/// nearest `freq_hz` (ties resolve to the lower row). `table` rows
+/// are in ascending frequency order (every Table D.1x is).
+fn nearest_d1_row(table: &[crate::psy::LtqRow], freq_hz: f64) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f64::INFINITY;
+    // The tables are at most 132 rows; a linear scan is simplest and
+    // branch-predictable.
+    for (idx, row) in table.iter().enumerate() {
+        let d = (row.freq_hz - freq_hz).abs();
+        if d < best_d {
+            best_d = d;
+            best = idx;
+        }
+    }
+    best
+}
+
+/// Clause D.1 Step 5 — decimation of the tonal and non-tonal masking
+/// components.
+///
+/// - **Step 5 a)**: a component is kept only if its SPL is at or above
+///   the threshold in quiet at its frequency,
+///   `X >= LTq(k)` (Table D.1x value plus the Step 3 bit-rate offset).
+///   A component above the table's last tabulated frequency (possible
+///   for tonal lines between the table top and the Step 4 examinable
+///   limit, e.g. 15,0–15,6 kHz at 32 kHz Layer I) has no defined
+///   threshold and is likewise removed.
+/// - **Step 5 b)**: of two or more *tonal* components within less than
+///   0,5 Bark (sliding window in the critical-band domain), only the
+///   highest-power one is kept.
+///
+/// Each surviving component is assigned its nearest Table D.1x row
+/// (the Step 6 subsampled index `i`). Returns `None` for a
+/// `(layer, rate)` pair without Annex D tables.
+pub fn decimate_maskers(
+    tonal: &[TonalComponent],
+    non_tonal: &[NonTonalComponent],
+    layer: Layer,
+    sampling_frequency_hz: u32,
+    bit_rate_per_channel_kbps: u32,
+) -> Option<(Vec<Masker>, Vec<Masker>)> {
+    let table = crate::psy::ltq_table(layer, sampling_frequency_hz)?;
+    let n = fft_size(layer) as f64;
+    let fs = sampling_frequency_hz as f64;
+    let top_hz = table.last()?.freq_hz;
+    let make = |k: usize, spl_db: f64| -> Option<Masker> {
+        let freq = k as f64 * fs / n;
+        // Beyond the Table D.1x coverage there is no LTq to compare
+        // against (and no Step 6/7 evaluation line): drop. The small
+        // epsilon absorbs the tables' printed-value truncation.
+        if freq > top_hz + 1e-6 {
+            return None;
+        }
+        let row_idx = nearest_d1_row(table, freq);
+        let row = table[row_idx];
+        // Step 5 a): X >= LTq(k) with the Step 3 offset applied.
+        let ltq_used = crate::psy::step3_apply_ltq_offset(row.ltq_db, bit_rate_per_channel_kbps);
+        if spl_db < ltq_used {
+            return None;
+        }
+        Some(Masker {
+            k,
+            d1_index: row.index,
+            bark_z: row.bark_z,
+            spl_db,
+        })
+    };
+
+    let mut kept_tonal: Vec<Masker> = tonal.iter().filter_map(|t| make(t.k, t.spl_db)).collect();
+    let kept_non_tonal: Vec<Masker> = non_tonal
+        .iter()
+        .filter_map(|c| make(c.k, c.spl_db))
+        .collect();
+
+    // Step 5 b): 0,5-Bark sliding window over the (frequency-ordered)
+    // tonal list — keep the highest power of any run of components
+    // closer than 0,5 Bark.
+    let mut i = 0usize;
+    while i + 1 < kept_tonal.len() {
+        if kept_tonal[i + 1].bark_z - kept_tonal[i].bark_z < 0.5 {
+            let remove = if kept_tonal[i].spl_db < kept_tonal[i + 1].spl_db {
+                i
+            } else {
+                i + 1
+            };
+            kept_tonal.remove(remove);
+            // Re-examine around the removal point: the survivor may now
+            // sit within 0,5 Bark of its new neighbour.
+            i = i.saturating_sub(1);
+        } else {
+            i += 1;
+        }
+    }
+    Some((kept_tonal, kept_non_tonal))
+}
+
+/// Clause D.1 Steps 6 + 7 — the global masking threshold `LTg(i)` in
+/// dB at **every** subsampled frequency line of the matching Table
+/// D.1x (one entry per table row, in printed row order).
+///
+/// For each evaluation line `i` the decimated maskers are folded
+/// through the Step 6 individual-threshold forms
+/// (`LT = X + av(z_j) + vf(dz, X)`, with maskers outside the
+/// `-3 <= dz < 8` Bark window ignored per the Step 7 reduction) and
+/// power-summed with the threshold in quiet
+/// ([`crate::psy::global_threshold_db_from_maskers`]). Returns `None`
+/// for a `(layer, rate)` pair without Annex D tables.
+pub fn global_thresholds_db(
+    tonal: &[Masker],
+    non_tonal: &[Masker],
+    layer: Layer,
+    sampling_frequency_hz: u32,
+    bit_rate_per_channel_kbps: u32,
+) -> Option<Vec<f64>> {
+    let table = crate::psy::ltq_table(layer, sampling_frequency_hz)?;
+    let tm: Vec<(f64, f64)> = tonal.iter().map(|m| (m.bark_z, m.spl_db)).collect();
+    let nm: Vec<(f64, f64)> = non_tonal.iter().map(|m| (m.bark_z, m.spl_db)).collect();
+    Some(
+        table
+            .iter()
+            .map(|row| {
+                let ltq_used =
+                    crate::psy::step3_apply_ltq_offset(row.ltq_db, bit_rate_per_channel_kbps);
+                crate::psy::global_threshold_db_from_maskers(row.bark_z, ltq_used, &tm, &nm)
+            })
+            .collect(),
+    )
+}
+
+/// Clause D.1 Step 8 — minimum masking threshold `LTmin(n)` per
+/// subband:
+///
+/// ```text
+/// LTmin(n) = MIN[ LTg(i) ]  dB,   f(i) in subband n
+/// ```
+///
+/// `ltg_db` is one threshold per Table D.1x row
+/// ([`global_thresholds_db`]'s output). Subband `n` spans
+/// `[n, n+1)·Fs/64`. The Table D.1x lines stop below the Nyquist
+/// frequency (15–20 kHz depending on the rate), so the top subbands
+/// contain no tabulated `f(i)`; those adopt the threshold of the
+/// nearest (last) tabulated line — the table's edge value — which
+/// keeps `LTmin(n)` defined "for every subband n" as Step 8 requires
+/// without inventing sub-threshold masking above the table's
+/// coverage. Returns `None` for a `(layer, rate)` pair without Annex
+/// D tables or on a length mismatch.
+pub fn min_threshold_per_subband(
+    ltg_db: &[f64],
+    layer: Layer,
+    sampling_frequency_hz: u32,
+) -> Option<[f64; SUBBANDS]> {
+    let table = crate::psy::ltq_table(layer, sampling_frequency_hz)?;
+    if ltg_db.len() != table.len() {
+        return None;
+    }
+    let sb_width_hz = sampling_frequency_hz as f64 / 64.0;
+    let mut out = [f64::INFINITY; SUBBANDS];
+    let mut assigned = [false; SUBBANDS];
+    for (row, &lt) in table.iter().zip(ltg_db.iter()) {
+        let sb = ((row.freq_hz / sb_width_hz) as usize).min(SUBBANDS - 1);
+        if lt < out[sb] {
+            out[sb] = lt;
+        }
+        assigned[sb] = true;
+    }
+    // Top subbands beyond the table coverage: adopt the last
+    // tabulated line's LTg.
+    let edge = *ltg_db.last()?;
+    for (o, a) in out.iter_mut().zip(assigned.iter()) {
+        if !*a {
+            *o = edge;
+        }
+    }
+    Some(out)
+}
+
+/// Clause D.1 Step 9 — the per-subband signal-to-mask ratio
+/// `SMR_sb(n) = Lsb(n) − LTmin(n)` in dB.
+pub fn smr_per_subband(lsb_db: &[f64; SUBBANDS], ltmin_db: &[f64; SUBBANDS]) -> [f64; SUBBANDS] {
+    let mut out = [0.0f64; SUBBANDS];
+    for ((o, &l), &t) in out.iter_mut().zip(lsb_db.iter()).zip(ltmin_db.iter()) {
+        *o = l - t;
+    }
+    out
+}
+
+/// The assembled Annex D **Psychoacoustic Model 1** per-frame driver
+/// (clause D.1 Steps 1–9).
+///
+/// Unlike Model 2 ([`crate::model2::Model2State`], which carries a
+/// two-block prediction history), Model 1 is **stateless** — each
+/// frame's SMR depends only on that frame's analysis window — so the
+/// driver is a plain configuration value.
+///
+/// ```
+/// use oxideav_mp1::header::Layer;
+/// use oxideav_mp1::model1::Model1;
+///
+/// let m = Model1::new(Layer::I, 32_000).unwrap();
+/// let window = vec![0.0f64; m.fft_size()];
+/// let scf_max = [0.0f64; 32];
+/// let smr = m.process(&window, &scf_max, 64);
+/// assert!(smr.iter().all(|&v| v == f64::NEG_INFINITY)); // silence
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Model1 {
+    layer: Layer,
+    sampling_frequency_hz: u32,
+}
+
+impl Model1 {
+    /// Build a Model 1 driver for `layer` at `sampling_frequency_hz`,
+    /// or `None` for a rate without Annex D tables (the MPEG-2 LSF
+    /// half-rates 16 / 22,05 / 24 kHz).
+    pub fn new(layer: Layer, sampling_frequency_hz: u32) -> Option<Model1> {
+        crate::psy::ltq_table(layer, sampling_frequency_hz)?;
+        Some(Model1 {
+            layer,
+            sampling_frequency_hz,
+        })
+    }
+
+    /// The layer this driver analyses for.
+    pub fn layer(&self) -> Layer {
+        self.layer
+    }
+
+    /// The driver's analysis-window length in samples (512 for
+    /// Layer I, 1 024 for Layer II).
+    pub fn fft_size(&self) -> usize {
+        fft_size(self.layer)
+    }
+
+    /// Run the full clause D.1 Steps 1–9 chain on one analysis window
+    /// and return the 32 per-subband `SMR_sb(n)` in dB.
+    ///
+    /// `samples` is PCM in `[-1, 1)`, exactly [`Self::fft_size`] long
+    /// (panics otherwise — the window length is a construction-time
+    /// constant, not a data-dependent condition). `scf_max[n]` is the
+    /// Step 2 per-subband scalefactor multiplier (in Layer II the
+    /// maximum of the frame's three). `bit_rate_per_channel_kbps`
+    /// selects the Step 3 LTq offset (−12 dB at ≥ 96 kbit/s per
+    /// channel).
+    pub fn process(
+        &self,
+        samples: &[f64],
+        scf_max: &[f64; SUBBANDS],
+        bit_rate_per_channel_kbps: u32,
+    ) -> [f64; SUBBANDS] {
+        assert_eq!(
+            samples.len(),
+            self.fft_size(),
+            "Model 1 window must be exactly fft_size() samples"
+        );
+        let fs = self.sampling_frequency_hz;
+        let x = power_spectrum(samples, self.layer).expect("length asserted above");
+        let lsb = spl_per_subband(&x, scf_max, self.layer).expect("spectrum length matches");
+        let (tonal_raw, residual) =
+            find_tonal_components(&x, self.layer).expect("spectrum length matches");
+        let non_tonal_raw = find_non_tonal_components(&residual, self.layer, fs)
+            .expect("rate validated at construction");
+        let (tonal, non_tonal) = decimate_maskers(
+            &tonal_raw,
+            &non_tonal_raw,
+            self.layer,
+            fs,
+            bit_rate_per_channel_kbps,
+        )
+        .expect("rate validated at construction");
+        let ltg = global_thresholds_db(
+            &tonal,
+            &non_tonal,
+            self.layer,
+            fs,
+            bit_rate_per_channel_kbps,
+        )
+        .expect("rate validated at construction");
+        let ltmin = min_threshold_per_subband(&ltg, self.layer, fs)
+            .expect("rate validated at construction");
+        smr_per_subband(&lsb, &ltmin)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,5 +1072,303 @@ mod tests {
         assert!(find_non_tonal_components(&x, Layer::I, 22_050).is_none());
         assert!(find_non_tonal_components(&x, Layer::I, 16_000).is_none());
         assert!(find_non_tonal_components(&x, Layer::II, 32_000).is_none());
+    }
+
+    // ----------------------- Steps 5–9 ------------------------
+
+    #[test]
+    fn ltq_table_dispatch_row_counts() {
+        use crate::psy::ltq_table;
+        assert_eq!(ltq_table(Layer::I, 32_000).unwrap().len(), 108);
+        assert_eq!(ltq_table(Layer::I, 44_100).unwrap().len(), 106);
+        assert_eq!(ltq_table(Layer::I, 48_000).unwrap().len(), 102);
+        assert_eq!(ltq_table(Layer::II, 32_000).unwrap().len(), 132);
+        assert_eq!(ltq_table(Layer::II, 44_100).unwrap().len(), 130);
+        assert_eq!(ltq_table(Layer::II, 48_000).unwrap().len(), 126);
+        assert!(ltq_table(Layer::I, 24_000).is_none());
+        assert!(ltq_table(Layer::II, 22_050).is_none());
+        // Dense printed 1-based numbering.
+        for (i, row) in ltq_table(Layer::I, 32_000).unwrap().iter().enumerate() {
+            assert_eq!(row.index as usize, i + 1);
+        }
+    }
+
+    #[test]
+    fn decimation_keeps_audible_drops_subthreshold() {
+        // At 32 kHz Layer I, line 44 = 2750 Hz sits where LTq ≈ −5 dB;
+        // a 40 dB tonal component survives. Line 236 = 14750 Hz has
+        // LTq ≈ 45–51 dB; the same 40 dB component is below threshold
+        // and is decimated (Step 5 a).
+        let audible = TonalComponent {
+            k: 44,
+            spl_db: 40.0,
+        };
+        let quiet_high = TonalComponent {
+            k: 236,
+            spl_db: 40.0,
+        };
+        let (tonal, non_tonal) =
+            decimate_maskers(&[audible, quiet_high], &[], Layer::I, 32_000, 64).unwrap();
+        assert!(non_tonal.is_empty());
+        assert_eq!(tonal.len(), 1);
+        assert_eq!(tonal[0].k, 44);
+        // The Step 6 index assignment: line 44 = 2750 Hz = Table D.1a
+        // row i = 44 exactly (62,5 Hz grid through i = 48).
+        assert_eq!(tonal[0].d1_index, 44);
+    }
+
+    #[test]
+    fn decimation_step3_offset_shifts_the_gate() {
+        // LTq at D.1a i = 44 (2750 Hz) is −4,18 dB pre-offset. A
+        // −10 dB component fails at low rate (offset 0) but passes at
+        // ≥ 96 kbit/s/ch where the −12 dB offset drops the gate.
+        let c = TonalComponent {
+            k: 44,
+            spl_db: -10.0,
+        };
+        let low = decimate_maskers(&[c], &[], Layer::I, 32_000, 64).unwrap();
+        assert!(low.0.is_empty());
+        let high = decimate_maskers(&[c], &[], Layer::I, 32_000, 96).unwrap();
+        assert_eq!(high.0.len(), 1);
+    }
+
+    #[test]
+    fn decimation_drops_lines_beyond_table_coverage() {
+        // Line 245 at 32 kHz Layer I = 15312,5 Hz — above the Table
+        // D.1a top (15 000 Hz, i = 108): no LTq exists, dropped even
+        // at enormous SPL.
+        let c = TonalComponent {
+            k: 245,
+            spl_db: 90.0,
+        };
+        let (tonal, _) = decimate_maskers(&[c], &[], Layer::I, 32_000, 64).unwrap();
+        assert!(tonal.is_empty());
+        // The last covered line (240 = 15 000 Hz) is kept.
+        let c = TonalComponent {
+            k: 240,
+            spl_db: 90.0,
+        };
+        let (tonal, _) = decimate_maskers(&[c], &[], Layer::I, 32_000, 64).unwrap();
+        assert_eq!(tonal.len(), 1);
+        assert_eq!(tonal[0].d1_index, 108);
+    }
+
+    #[test]
+    fn decimation_half_bark_window_keeps_strongest() {
+        // Lines 130 (8125 Hz) and 137 (8562,5 Hz) at 32 kHz Layer I
+        // are ≈ 0,25 Bark apart — within the 0,5 Bark window; only the
+        // stronger survives. Line 100 (6250 Hz) is > 1 Bark away and
+        // coexists.
+        let a = TonalComponent {
+            k: 130,
+            spl_db: 70.0,
+        };
+        let b = TonalComponent {
+            k: 137,
+            spl_db: 75.0,
+        };
+        let far = TonalComponent {
+            k: 100,
+            spl_db: 60.0,
+        };
+        let (tonal, _) = decimate_maskers(&[far, a, b], &[], Layer::I, 32_000, 64).unwrap();
+        let lines: Vec<usize> = tonal.iter().map(|m| m.k).collect();
+        assert_eq!(lines, vec![100, 137]);
+        // Order of strength reversed: the earlier component wins.
+        let a_loud = TonalComponent {
+            k: 130,
+            spl_db: 80.0,
+        };
+        let (tonal, _) = decimate_maskers(&[far, a_loud, b], &[], Layer::I, 32_000, 64).unwrap();
+        let lines: Vec<usize> = tonal.iter().map(|m| m.k).collect();
+        assert_eq!(lines, vec![100, 130]);
+    }
+
+    #[test]
+    fn half_bark_window_is_a_sliding_chain() {
+        // Three components each < 0,5 Bark from the next: the chain
+        // collapses to the single strongest.
+        let c1 = TonalComponent {
+            k: 128,
+            spl_db: 60.0,
+        };
+        let c2 = TonalComponent {
+            k: 133,
+            spl_db: 72.0,
+        };
+        let c3 = TonalComponent {
+            k: 138,
+            spl_db: 66.0,
+        };
+        let (tonal, _) = decimate_maskers(&[c1, c2, c3], &[], Layer::I, 32_000, 64).unwrap();
+        assert_eq!(tonal.len(), 1);
+        assert_eq!(tonal[0].k, 133);
+    }
+
+    #[test]
+    fn global_threshold_floors_at_ltq_without_maskers() {
+        let ltg = global_thresholds_db(&[], &[], Layer::I, 32_000, 64).unwrap();
+        let table = crate::psy::ltq_table(Layer::I, 32_000).unwrap();
+        assert_eq!(ltg.len(), table.len());
+        for (row, &lt) in table.iter().zip(ltg.iter()) {
+            assert!((lt - row.ltq_db).abs() < 1e-12, "i = {}", row.index);
+        }
+        // The ≥ 96 kbit/s offset lowers every line by exactly 12 dB.
+        let ltg96 = global_thresholds_db(&[], &[], Layer::I, 32_000, 96).unwrap();
+        for (&a, &b) in ltg.iter().zip(ltg96.iter()) {
+            assert!((a - b - 12.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn loud_masker_raises_global_threshold_nearby_only() {
+        // A 90 dB tonal masker at D.1a i = 44 (z = 15,087 Bark) raises
+        // LTg massively near itself but not 10+ Bark away.
+        let masker = Masker {
+            k: 44,
+            d1_index: 44,
+            bark_z: 15.087,
+            spl_db: 90.0,
+        };
+        let quiet = global_thresholds_db(&[], &[], Layer::I, 32_000, 64).unwrap();
+        let with = global_thresholds_db(&[masker], &[], Layer::I, 32_000, 64).unwrap();
+        let table = crate::psy::ltq_table(Layer::I, 32_000).unwrap();
+        for ((row, &q), &w) in table.iter().zip(quiet.iter()).zip(with.iter()) {
+            let dz = row.bark_z - masker.bark_z;
+            if dz.abs() < 0.25 {
+                assert!(w > q + 30.0, "i = {} not raised: {} vs {}", row.index, w, q);
+            }
+            if !(-3.0..8.0).contains(&dz) {
+                assert!(
+                    (w - q).abs() < 1e-9,
+                    "i = {} moved outside window",
+                    row.index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn min_threshold_takes_subband_minimum() {
+        // With no maskers LTmin(n) is the minimum LTq_used over the
+        // subband's tabulated lines — cross-check by brute force.
+        let ltg = global_thresholds_db(&[], &[], Layer::I, 32_000, 64).unwrap();
+        let ltmin = min_threshold_per_subband(&ltg, Layer::I, 32_000).unwrap();
+        let table = crate::psy::ltq_table(Layer::I, 32_000).unwrap();
+        let width = 32_000.0 / 64.0;
+        for (sb, &got) in ltmin.iter().enumerate() {
+            let want = table
+                .iter()
+                .zip(ltg.iter())
+                .filter(|(row, _)| {
+                    row.freq_hz >= sb as f64 * width && row.freq_hz < (sb + 1) as f64 * width
+                })
+                .map(|(_, &lt)| lt)
+                .fold(f64::INFINITY, f64::min);
+            if want.is_finite() {
+                assert!((got - want).abs() < 1e-12, "sb {sb}");
+            } else {
+                // Above table coverage: the edge value.
+                assert!((got - *ltg.last().unwrap()).abs() < 1e-12, "sb {sb}");
+            }
+        }
+    }
+
+    #[test]
+    fn min_threshold_rejects_bad_input() {
+        assert!(min_threshold_per_subband(&[0.0; 10], Layer::I, 32_000).is_none());
+        assert!(min_threshold_per_subband(&[0.0; 108], Layer::I, 24_000).is_none());
+    }
+
+    #[test]
+    fn model1_new_rejects_lsf_rates() {
+        for fs in [16_000, 22_050, 24_000, 8_000] {
+            assert!(Model1::new(Layer::I, fs).is_none(), "{fs}");
+            assert!(Model1::new(Layer::II, fs).is_none(), "{fs}");
+        }
+        for fs in [32_000, 44_100, 48_000] {
+            assert_eq!(Model1::new(Layer::I, fs).unwrap().fft_size(), 512);
+            assert_eq!(Model1::new(Layer::II, fs).unwrap().fft_size(), 1024);
+        }
+    }
+
+    #[test]
+    fn model1_silence_is_fully_masked() {
+        let m = Model1::new(Layer::I, 32_000).unwrap();
+        let smr = m.process(&vec![0.0; 512], &[0.0; SUBBANDS], 64);
+        assert!(smr.iter().all(|&v| v == f64::NEG_INFINITY), "{smr:?}");
+    }
+
+    #[test]
+    fn model1_tone_demands_bits_in_its_own_subband() {
+        // A full-scale 2750 Hz tone (line 44 → subband 5) at 32 kHz:
+        // its own subband's SMR is large and positive; distant silent
+        // subbands stay fully masked.
+        let m = Model1::new(Layer::I, 32_000).unwrap();
+        let s = sine(512, 44, 1.0);
+        let mut scf = [0.0f64; SUBBANDS];
+        scf[5] = 1.0;
+        let smr = m.process(&s, &scf, 64);
+        // The tone partially masks itself (its own skirt raises the
+        // subband's threshold to ≈ 60 dB), leaving a solidly positive
+        // but bounded SMR.
+        assert!(smr[5] > 25.0, "SMR(5) = {}", smr[5]);
+        assert!(smr[5] < 50.0, "SMR(5) = {}", smr[5]);
+        assert!(
+            smr[5] >= smr.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 1e-9,
+            "tone subband must be the most demanding: {smr:?}"
+        );
+        assert_eq!(smr[20], f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn model1_masking_lowers_neighbor_smr() {
+        // The tone's masking skirt raises its neighbours' thresholds:
+        // a −40 dB probe tone next to a 0 dB masker gets a *lower* SMR
+        // than the same probe alone (comparing the probe's subband).
+        let m = Model1::new(Layer::I, 32_000).unwrap();
+        let probe_line = 52; // 3250 Hz, subband 6
+        let probe: Vec<f64> = sine(512, probe_line, 0.01);
+        let mut both = probe.clone();
+        for (a, b) in both.iter_mut().zip(sine(512, 44, 1.0)) {
+            *a += b;
+        }
+        let mut scf = [0.0f64; SUBBANDS];
+        scf[5] = 1.0;
+        scf[6] = 0.02;
+        let alone = m.process(&probe, &scf, 64);
+        let masked = m.process(&both, &scf, 64);
+        assert!(
+            masked[6] < alone[6] - 10.0,
+            "masked {} vs alone {}",
+            masked[6],
+            alone[6]
+        );
+    }
+
+    #[test]
+    fn model1_layer2_grid_works_end_to_end() {
+        let m = Model1::new(Layer::II, 48_000).unwrap();
+        let s = sine(1024, 100, 0.8); // 4687,5 Hz → subband 6
+        let mut scf = [0.0f64; SUBBANDS];
+        scf[6] = 1.0;
+        let smr = m.process(&s, &scf, 96);
+        // Positive (audible, demands bits) but self-masked below the
+        // raw 90+ dB signal level.
+        assert!(smr[6] > 10.0, "SMR(6) = {}", smr[6]);
+        let argmax = smr
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(argmax, 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "Model 1 window")]
+    fn model1_panics_on_wrong_window_length() {
+        let m = Model1::new(Layer::I, 32_000).unwrap();
+        let _ = m.process(&vec![0.0; 1024], &[0.0; SUBBANDS], 64);
     }
 }
