@@ -682,7 +682,9 @@ impl Mp1Encoder {
                 // path matches the direct `Mp1Layer2FrameEncoder` API.
                 let mut l2 = Mp1Layer2FrameEncoder::new(hp);
                 if params.psychoacoustic {
-                    l2 = l2.with_psychoacoustic(true);
+                    l2 = l2
+                        .with_psy_model(params.psy_model)
+                        .with_psychoacoustic(true);
                     if let Some(target) = params.vbr_target_mnr_db {
                         l2 = l2.with_vbr(target);
                     }
@@ -1894,6 +1896,46 @@ mod tests {
             saw_nonzero,
             "psychoacoustic VBR Layer II produced only silence"
         );
+    }
+
+    #[test]
+    fn top_level_layer2_model1_round_trips() {
+        // `EncodeParams::with_psy_model(Model1)` reaches the inner
+        // `Mp1Layer2FrameEncoder` through the registry-facing wrapper:
+        // frames encode under the clause D.1 model and decode to
+        // non-silent PCM.
+        let enc_params = EncodeParams::new(Bitrate::Fixed(192), 44_100, Mode::Stereo)
+            .with_layer(LayerSelect::LayerII)
+            .with_psychoacoustic(true)
+            .with_psy_model(crate::encode::PsyModel::Model1);
+        let mut out = CodecParameters::audio(CodecId::new(CODEC_ID));
+        out.sample_rate = Some(44_100);
+        out.channels = Some(2);
+        out.sample_format = Some(SampleFormat::S16);
+        let mut enc = Mp1Encoder::new(CodecId::new(CODEC_ID), enc_params, out);
+
+        let mut dec_params = CodecParameters::audio(CodecId::new("mp1"));
+        dec_params.sample_rate = Some(44_100);
+        dec_params.channels = Some(2);
+        let mut dec = make_decoder(&dec_params).unwrap();
+
+        let mut saw_nonzero = false;
+        for _ in 0..4 {
+            let frame = build_audio_frame_stereo_n(44_100, 1152);
+            enc.send_frame(&Frame::Audio(frame)).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            let h = FrameHeader::parse(&pkt.data).unwrap();
+            assert_eq!(h.layer, Layer::II);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                panic!("audio");
+            };
+            assert_eq!(a.samples, 1152);
+            if a.data[0].iter().any(|&b| b != 0) {
+                saw_nonzero = true;
+            }
+        }
+        assert!(saw_nonzero, "Model 1 Layer II produced only silence");
     }
 
     #[test]

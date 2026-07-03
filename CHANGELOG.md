@@ -31,6 +31,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 1 psychoacoustic allocation wired into the Layer II
+  encoder (+ VBR / top-level composition).**
+  `Mp1Layer2FrameEncoder::with_psy_model(PsyModel)` selects the Annex
+  D model behind `with_psychoacoustic(true)` — order-independent
+  (selecting after enabling rebuilds the driver) — and
+  `active_psy_model()` reports the running model. Under Model 1 the
+  Layer II encoder feeds the shared 1024-sample sliding window through
+  `model1::Model1` (Layer II's Model 1 FFT length equals Model 2's),
+  derives the Step 2 `scf_max(n)` from the maximum of the three
+  Table 3-B.1 multipliers the frame will be coded with, and keys the
+  Step 3 offset on the per-channel bitrate. Composes with per-frame
+  VBR (the rung selection reuses the Model 1 SMR) and with the
+  §2.4.1.8 ancillary path unchanged. The top-level `Mp1Encoder`
+  forwards `EncodeParams::psy_model` to the inner Layer II encoder, so
+  the registry-facing trait object honours the model switch for both
+  layers. LSF half-rates fall back to the proxy allocator
+  byte-identically. **+4 lib-tests**: a Model 1 Layer II
+  encode → decode round-trip (exact §2.4.2.1 length, ≥ 1 allocation,
+  builder order-independence), the byte-identical LSF fallback, the
+  VBR composition (near-silence never selects a higher rung than loud
+  wide-band content; every header a real ladder rung), and a top-level
+  `Mp1Encoder` Model 1 Layer II PCM round-trip.
 - **Model 1 psychoacoustic allocation wired into the Layer I
   encoder — selectable Annex D model (`PsyModel`).** New
   `EncodeParams::psy_model` field / `with_psy_model(PsyModel)` builder

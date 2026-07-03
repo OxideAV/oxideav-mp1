@@ -3805,16 +3805,22 @@ pub struct Mp1Layer2FrameEncoder {
     /// the next [`encode_frame`](Self::encode_frame) call and cleared
     /// afterwards. `None` (or empty) means "zero-pad the tail".
     pending_ancillary: Option<Vec<u8>>,
-    /// Per-channel Annex D Model 2 driver, present only when
+    /// The Annex D psychoacoustic driver, present only when
     /// [`with_psychoacoustic`](Self::with_psychoacoustic) was set **and**
-    /// the sampling frequency has an Annex D Model 2 table (32 / 44.1 /
+    /// the sampling frequency has Annex D tables (32 / 44.1 /
     /// 48 kHz). `None` keeps the signal-energy proxy allocator.
-    psy: Option<Vec<crate::model2::Model2State>>,
-    /// Per-channel 1024-sample sliding analysis buffer feeding the Model
-    /// 2 FFT (the 1152 new Layer II samples per frame are shifted in at
-    /// the tail; the window holds the most recent 1024). Empty when
-    /// `psy` is `None`.
-    psy_window: Vec<[f64; crate::model2::FFT_SIZE]>,
+    /// [`with_psy_model`](Self::with_psy_model) selects which of the
+    /// two example models is built.
+    psy: Option<PsyDriver>,
+    /// Which Annex D model [`with_psychoacoustic`](Self::with_psychoacoustic)
+    /// builds (both Model 1 and Model 2 use a 1024-point FFT for
+    /// Layer II).
+    psy_model: PsyModel,
+    /// Per-channel 1024-sample sliding analysis buffer feeding the
+    /// model's FFT (the 1152 new Layer II samples per frame are shifted
+    /// in at the tail; the window holds the most recent 1024). Empty
+    /// when `psy` is `None`.
+    psy_window: Vec<Vec<f64>>,
     /// Per-frame variable-bitrate (VBR) target mask-to-noise margin in
     /// dB, set by [`with_vbr`](Self::with_vbr). When `Some` **and**
     /// psychoacoustic Model 2 is active, each frame's bitrate is chosen
@@ -3849,9 +3855,36 @@ impl Mp1Layer2FrameEncoder {
             filters: (0..nch).map(|_| AnalysisFilter::new()).collect(),
             pending_ancillary: None,
             psy: None,
+            psy_model: PsyModel::default(),
             psy_window: Vec::new(),
             vbr_target_mnr_db: None,
             auto_intensity_threshold: None,
+        }
+    }
+
+    /// Select which Annex D example model
+    /// [`with_psychoacoustic`](Self::with_psychoacoustic) runs
+    /// (consuming builder): clause D.1 [`PsyModel::Model1`] or the
+    /// default clause D.2 [`PsyModel::Model2`]. May be called before
+    /// or after `with_psychoacoustic` — if the model is already
+    /// enabled it is rebuilt with the new selection (both models are
+    /// freshly primed at stream start anyway).
+    pub fn with_psy_model(mut self, model: PsyModel) -> Mp1Layer2FrameEncoder {
+        self.psy_model = model;
+        if self.psy.is_some() {
+            self = self.with_psychoacoustic(true);
+        }
+        self
+    }
+
+    /// The Annex D model actually running: `Some(PsyModel::…)` when
+    /// [`is_psychoacoustic`](Self::is_psychoacoustic), `None` when the
+    /// energy-proxy allocator is in use.
+    pub fn active_psy_model(&self) -> Option<PsyModel> {
+        match &self.psy {
+            Some(PsyDriver::Model1(_)) => Some(PsyModel::Model1),
+            Some(PsyDriver::Model2(_)) => Some(PsyModel::Model2),
+            None => None,
         }
     }
 
@@ -3920,20 +3953,31 @@ impl Mp1Layer2FrameEncoder {
     /// proxy allocator.
     pub fn with_psychoacoustic(mut self, enable: bool) -> Mp1Layer2FrameEncoder {
         let nch = self.params.mode.channels() as usize;
-        if enable {
-            let states: Option<Vec<_>> = (0..nch)
-                .map(|_| crate::model2::Model2State::new(self.params.sampling_frequency))
-                .collect();
-            if let Some(states) = states {
-                self.psy = Some(states);
-                self.psy_window = vec![[0.0f64; crate::model2::FFT_SIZE]; nch];
-            } else {
+        let driver = if enable {
+            match self.psy_model {
+                PsyModel::Model1 => crate::model1::Model1::new(
+                    crate::header::Layer::II,
+                    self.params.sampling_frequency,
+                )
+                .map(PsyDriver::Model1),
+                PsyModel::Model2 => (0..nch)
+                    .map(|_| crate::model2::Model2State::new(self.params.sampling_frequency))
+                    .collect::<Option<Vec<_>>>()
+                    .map(PsyDriver::Model2),
+            }
+        } else {
+            None
+        };
+        match driver {
+            Some(d) => {
+                let len = d.window_len();
+                self.psy = Some(d);
+                self.psy_window = vec![vec![0.0f64; len]; nch];
+            }
+            None => {
                 self.psy = None;
                 self.psy_window = Vec::new();
             }
-        } else {
-            self.psy = None;
-            self.psy_window = Vec::new();
         }
         self
     }
@@ -3954,13 +3998,13 @@ impl Mp1Layer2FrameEncoder {
             f.reset();
         }
         self.pending_ancillary = None;
-        if let Some(states) = &mut self.psy {
+        if let Some(PsyDriver::Model2(states)) = &mut self.psy {
             for s in states {
                 s.reset();
             }
         }
         for w in &mut self.psy_window {
-            *w = [0.0f64; crate::model2::FFT_SIZE];
+            w.fill(0.0);
         }
     }
 
@@ -4095,19 +4139,58 @@ impl Mp1Layer2FrameEncoder {
 
         let pending = self.pending_ancillary.take().unwrap_or_default();
         let vbr_target = self.vbr_target_mnr_db;
-        if let Some(states) = self.psy.as_mut() {
-            let fft_size = crate::model2::FFT_SIZE;
+        if let Some(driver) = self.psy.as_mut() {
+            // Both models use a 1024-point FFT for Layer II.
+            let fft_size = driver.window_len();
             let mut smr = [[0.0f64; SUBBANDS]; 2];
-            for ch in 0..nch {
-                // Append the 1152 new samples to the window, keeping the
-                // most recent 1024: copy the trailing `fft_size` PCM
-                // samples of this channel's frame into the window.
-                let win = &mut self.psy_window[ch];
-                let start = per_ch - fft_size; // 1152 - 1024 = 128
-                for (k, slot) in win.iter_mut().enumerate() {
-                    *slot = pcm[(start + k) * nch + ch];
+            match driver {
+                PsyDriver::Model2(states) => {
+                    for ch in 0..nch {
+                        // Append the 1152 new samples to the window,
+                        // keeping the most recent 1024: copy the trailing
+                        // `fft_size` PCM samples of this channel's frame
+                        // into the window.
+                        let win = &mut self.psy_window[ch];
+                        let start = per_ch - fft_size; // 1152 - 1024 = 128
+                        for (k, slot) in win.iter_mut().enumerate() {
+                            *slot = pcm[(start + k) * nch + ch];
+                        }
+                        let arr: &[f64; crate::model2::FFT_SIZE] = win
+                            .as_slice()
+                            .try_into()
+                            .expect("Model 2 window is FFT_SIZE by construction");
+                        smr[ch] = states[ch].process(arr);
+                    }
                 }
-                smr[ch] = states[ch].process(win);
+                PsyDriver::Model1(model) => {
+                    // Clause D.1 Step 2 needs the per-subband scf_max —
+                    // the maximum of the three Table 3-B.1 scalefactor
+                    // multipliers this frame will be coded with — and
+                    // Step 3 keys its LTq offset on the bit rate per
+                    // channel. VBR note: the SMR is computed against the
+                    // configured (fixed) rate's offset; the per-frame
+                    // rung selection then reuses that SMR.
+                    let kbps_per_ch = u32::from(base_params.bitrate_kbps) / nch as u32;
+                    let scf_idx = select_layer2_scalefactors(&subbands, nch, SUBBANDS);
+                    for ch in 0..nch {
+                        let win = &mut self.psy_window[ch];
+                        let start = per_ch - fft_size; // 1152 - 1024 = 128
+                        for (k, slot) in win.iter_mut().enumerate() {
+                            *slot = pcm[(start + k) * nch + ch];
+                        }
+                        let mut scfm = [0.0f64; SUBBANDS];
+                        for (sb, m) in scfm.iter_mut().enumerate() {
+                            let has_signal = subbands[ch][sb].iter().any(|&v| v != 0.0);
+                            if has_signal {
+                                *m = scf_idx[ch][sb]
+                                    .iter()
+                                    .map(|&i| SCALEFACTORS[i as usize])
+                                    .fold(0.0f64, f64::max);
+                            }
+                        }
+                        smr[ch] = model.process(win, &scfm, kbps_per_ch);
+                    }
+                }
             }
             if pending.is_empty() {
                 // Per-frame variable-bitrate: choose the smallest ladder
@@ -7366,6 +7449,79 @@ mod tests {
         assert_eq!(
             fa, fb,
             "LSF fallback must match the proxy allocator byte-for-byte"
+        );
+    }
+
+    /// A Model 1 driven Layer II encode produces a decodable frame with
+    /// at least one allocation, at the exact §2.4.2.1 byte length, and
+    /// the builder is order-independent.
+    #[test]
+    fn mp1_layer2_frame_encoder_model1_round_trips() {
+        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+        let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params)
+            .with_psy_model(PsyModel::Model1)
+            .with_psychoacoustic(true);
+        assert_eq!(enc.active_psy_model(), Some(PsyModel::Model1));
+        // Builder order must not matter (model-after-enable rebuilds).
+        let enc2 = Mp1Layer2FrameEncoder::new(params)
+            .with_psychoacoustic(true)
+            .with_psy_model(PsyModel::Model1);
+        assert_eq!(enc2.active_psy_model(), Some(PsyModel::Model1));
+        let pcm = layer2_test_pcm(48_000, 1);
+        assert_eq!(pcm.len(), LAYER2_SAMPLES_PER_FRAME);
+        let frame = enc.encode_frame(&pcm).expect("Model 1 encode_frame");
+        let expected_len = (144u32 * 128 * 1000) / 48_000;
+        assert_eq!(frame.len(), expected_len as usize);
+        let header = FrameHeader::parse(&frame).expect("parse header");
+        assert_eq!(header.layer, crate::header::Layer::II);
+        let recovered =
+            decode_layer2_audio_data(&header, &frame[4..]).expect("decode_layer2_audio_data");
+        let any = (0..recovered.sblimit).any(|sb| recovered.subbands[0][sb].allocation != 0);
+        assert!(any, "Model 1 encoder must place at least one allocation");
+    }
+
+    /// Model 1 at an LSF half-rate falls back to the proxy allocator
+    /// byte-identically (no Annex D tables at 16 / 22,05 / 24 kHz).
+    #[test]
+    fn mp1_layer2_frame_encoder_model1_falls_back_at_lsf_rate() {
+        let params = Layer2HeaderParams::new(24_000, 64, Mode::SingleChannel);
+        let mut psy = Mp1Layer2FrameEncoder::new(params)
+            .with_psy_model(PsyModel::Model1)
+            .with_psychoacoustic(true);
+        assert!(!psy.is_psychoacoustic());
+        assert_eq!(psy.active_psy_model(), None);
+        let mut plain = Mp1Layer2FrameEncoder::new(params);
+        let pcm = layer2_test_pcm(24_000, 1);
+        let fa = psy.encode_frame(&pcm).expect("lsf Model 1 encode");
+        let fb = plain.encode_frame(&pcm).expect("lsf plain encode");
+        assert_eq!(fa, fb, "LSF fallback must be byte-identical");
+    }
+
+    /// Model 1 composes with per-frame VBR: a loud wide-band frame
+    /// selects a rung at least as high as near-silence does, and every
+    /// emitted header carries a real ladder rung.
+    #[test]
+    fn mp1_layer2_frame_encoder_model1_vbr_composes() {
+        let params = Layer2HeaderParams::new(48_000, 384, Mode::SingleChannel);
+        let mut enc = Mp1Layer2FrameEncoder::new(params)
+            .with_psy_model(PsyModel::Model1)
+            .with_psychoacoustic(true)
+            .with_vbr(0.0);
+        let loud = layer2_test_pcm(48_000, 1);
+        let quiet: Vec<f64> = loud.iter().map(|&v| v * 1e-4).collect();
+        let f_loud = enc.encode_frame(&loud).expect("loud encode");
+        let f_quiet = enc.encode_frame(&quiet).expect("quiet encode");
+        let h_loud = FrameHeader::parse(&f_loud).unwrap();
+        let h_quiet = FrameHeader::parse(&f_quiet).unwrap();
+        // Both are on the ladder (frame_length_bytes resolves).
+        let l_loud = h_loud.frame_length_bytes().expect("ladder rung") as usize;
+        let l_quiet = h_quiet.frame_length_bytes().expect("ladder rung") as usize;
+        assert_eq!(f_loud.len(), l_loud);
+        assert_eq!(f_quiet.len(), l_quiet);
+        assert!(
+            l_quiet <= l_loud,
+            "near-silence must not demand a higher rung ({l_quiet} > {l_loud})"
         );
     }
 
