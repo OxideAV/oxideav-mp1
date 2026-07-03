@@ -639,6 +639,7 @@ pub fn smr_per_subband(lsb_db: &[f64; SUBBANDS], ltmin_db: &[f64; SUBBANDS]) -> 
 pub struct Model1 {
     layer: Layer,
     sampling_frequency_hz: u32,
+    alt_spl: bool,
 }
 
 impl Model1 {
@@ -650,7 +651,25 @@ impl Model1 {
         Some(Model1 {
             layer,
             sampling_frequency_hz,
+            alt_spl: false,
         })
+    }
+
+    /// Select the spec's **alternative** Step 2 sound-pressure-level
+    /// method (consuming builder): the per-subband spectral term
+    /// becomes the power sum `X_spl(n)` ([`spl_per_subband_alt`])
+    /// instead of the per-line maximum. The spec offers this variant
+    /// as "a potential for better encoder performance" while noting it
+    /// has not been subjected to a formal audio quality test; the
+    /// default (`false`) is the primary MAX form.
+    pub fn with_alternative_spl(mut self, enable: bool) -> Model1 {
+        self.alt_spl = enable;
+        self
+    }
+
+    /// Whether the Step 2 alternative power-sum SPL is selected.
+    pub fn uses_alternative_spl(&self) -> bool {
+        self.alt_spl
     }
 
     /// The layer this driver analyses for.
@@ -687,7 +706,12 @@ impl Model1 {
         );
         let fs = self.sampling_frequency_hz;
         let x = power_spectrum(samples, self.layer).expect("length asserted above");
-        let lsb = spl_per_subband(&x, scf_max, self.layer).expect("spectrum length matches");
+        let lsb = if self.alt_spl {
+            spl_per_subband_alt(&x, scf_max, self.layer)
+        } else {
+            spl_per_subband(&x, scf_max, self.layer)
+        }
+        .expect("spectrum length matches");
         let (tonal_raw, residual) =
             find_tonal_components(&x, self.layer).expect("spectrum length matches");
         let non_tonal_raw = find_non_tonal_components(&residual, self.layer, fs)
@@ -1370,5 +1394,50 @@ mod tests {
     fn model1_panics_on_wrong_window_length() {
         let m = Model1::new(Layer::I, 32_000).unwrap();
         let _ = m.process(&vec![0.0; 1024], &[0.0; SUBBANDS], 64);
+    }
+
+    #[test]
+    fn model1_alternative_spl_never_lowers_smr() {
+        // The power-sum X_spl(n) is >= the per-line maximum, so with
+        // identical thresholds the alternative Step 2 can only raise
+        // (or keep) each subband's SMR.
+        let base = Model1::new(Layer::I, 32_000).unwrap();
+        assert!(!base.uses_alternative_spl());
+        let alt = base.with_alternative_spl(true);
+        assert!(alt.uses_alternative_spl());
+        // A two-partial signal in one subband plus a lone tone in
+        // another exercises both the sum > max and sum == max cases.
+        let mut s = sine(512, 44, 0.4);
+        for (a, b) in s.iter_mut().zip(sine(512, 46, 0.4)) {
+            *a += b;
+        }
+        for (a, b) in s.iter_mut().zip(sine(512, 100, 0.3)) {
+            *a += b;
+        }
+        let mut scf = [0.0f64; SUBBANDS];
+        scf[5] = 1.0;
+        scf[12] = 0.5;
+        let smr_max = base.process(&s, &scf, 64);
+        let smr_alt = alt.process(&s, &scf, 64);
+        for sb in 0..SUBBANDS {
+            if smr_max[sb].is_finite() {
+                assert!(
+                    smr_alt[sb] >= smr_max[sb] - 1e-9,
+                    "sb {sb}: alt {} < max {}",
+                    smr_alt[sb],
+                    smr_max[sb]
+                );
+            } else {
+                assert_eq!(smr_alt[sb], smr_max[sb], "sb {sb}");
+            }
+        }
+        // The two-partial subband strictly gains (the sum beats the max
+        // by ≈ 3 dB there); thresholds are identical so the SMR rises.
+        assert!(
+            smr_alt[5] > smr_max[5] + 2.0,
+            "alt {} vs max {}",
+            smr_alt[5],
+            smr_max[5]
+        );
     }
 }

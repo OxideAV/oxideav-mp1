@@ -31,6 +31,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 1 alternative Step 2 SPL selectable on the driver.**
+  `Model1::with_alternative_spl(true)` switches the Step 2 spectral
+  term from the per-line maximum to the spec's alternative power sum
+  `X_spl(n) = 10·log10(Σ 10^(X(k)/10))` (offered in clause D.1 as "a
+  potential for better encoder performance", untested formally per the
+  spec's own note); `uses_alternative_spl()` reports the selection and
+  the default remains the primary MAX form. **+1 lib-test**: with
+  identical thresholds the alternative never lowers any subband's SMR
+  (power sum ≥ max) and strictly raises a two-partial subband's by the
+  expected ≈ 3 dB.
 - **Model 1 end-to-end conformance integration tests**
   (`tests/model1_psychoacoustic.rs`). Four public-surface contracts
   for the clause D.1 encode paths: (1) a Model 1 Layer I **stereo**
