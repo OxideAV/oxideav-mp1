@@ -3196,6 +3196,16 @@ pub struct EncodeParams {
     /// the top-level encoder forwards it to
     /// [`Mp1Layer2FrameEncoder::with_psychoacoustic`].
     pub psychoacoustic: bool,
+    /// Which Annex D example psychoacoustic model drives the
+    /// allocation when [`EncodeParams::psychoacoustic`] is enabled:
+    /// clause D.1 **Model 1** ([`crate::model1::Model1`], the
+    /// tonal/non-tonal masker model) or clause D.2 **Model 2**
+    /// ([`crate::model2::Model2State`], the unpredictability/tonality
+    /// model). Defaults to [`PsyModel::Model2`], preserving
+    /// byte-for-byte compatibility with the encoder's behaviour before
+    /// the model switch existed. Inert while `psychoacoustic` is
+    /// `false`.
+    pub psy_model: PsyModel,
     /// When `Some(target_mnr_db)` **and** `psychoacoustic` is enabled and
     /// `layer == LayerSelect::LayerII`, the top-level encoder runs
     /// per-frame **variable-bitrate** Layer II encoding: each frame's
@@ -3206,6 +3216,25 @@ pub struct EncodeParams {
     /// the fixed `bitrate`. Inert for Layer I and when psychoacoustic is
     /// off.
     pub vbr_target_mnr_db: Option<f64>,
+}
+
+/// Which Annex D example psychoacoustic model an encoder runs when
+/// psychoacoustic allocation is enabled.
+///
+/// ISO/IEC 11172-3 Annex D gives **two** example models, both valid
+/// for Layers I and II: clause D.1 Model 1 (FFT → tonal/non-tonal
+/// masker extraction → per-masker spreading → minimum threshold per
+/// subband) and clause D.2 Model 2 (FFT → unpredictability →
+/// partition tonality → convolved threshold). Model 2 is the crate's
+/// historical default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PsyModel {
+    /// Clause D.1 Psychoacoustic Model 1 ([`crate::model1::Model1`]).
+    Model1,
+    /// Clause D.2 Psychoacoustic Model 2
+    /// ([`crate::model2::Model2State`]) — the default.
+    #[default]
+    Model2,
 }
 
 impl EncodeParams {
@@ -3228,6 +3257,7 @@ impl EncodeParams {
             emit_crc: false,
             layer: LayerSelect::LayerI,
             psychoacoustic: false,
+            psy_model: PsyModel::default(),
             vbr_target_mnr_db: None,
         }
     }
@@ -3267,6 +3297,15 @@ impl EncodeParams {
     /// via [`allocate_bits_psy`].
     pub fn with_psychoacoustic(mut self, enable: bool) -> EncodeParams {
         self.psychoacoustic = enable;
+        self
+    }
+
+    /// Builder: select which Annex D example model drives
+    /// psychoacoustic allocation (see [`EncodeParams::psy_model`]).
+    /// Only meaningful together with
+    /// [`with_psychoacoustic`](Self::with_psychoacoustic)`(true)`.
+    pub fn with_psy_model(mut self, model: PsyModel) -> EncodeParams {
+        self.psy_model = model;
         self
     }
 
@@ -3368,15 +3407,39 @@ fn bitrate_index(kbps: u16, id_bit: u8) -> Option<u8> {
 pub struct Mp1FrameEncoder {
     params: EncodeParams,
     filters: Vec<AnalysisFilter>,
-    /// Per-channel Annex D Model 2 driver, present only when
+    /// The Annex D psychoacoustic driver, present only when
     /// [`EncodeParams::psychoacoustic`] is set **and** the sampling
-    /// frequency has an Annex D Model 2 table (32 / 44.1 / 48 kHz).
-    psy: Option<Vec<crate::model2::Model2State>>,
-    /// Per-channel 1024-sample sliding analysis buffer feeding the Model
-    /// 2 FFT (the 384 new Layer I samples per frame are shifted in at
-    /// the tail; the leading 640 are the previous frames' history,
-    /// zero-padded at stream start). Empty when `psy` is `None`.
-    psy_window: Vec<[f64; crate::model2::FFT_SIZE]>,
+    /// frequency has Annex D tables (32 / 44.1 / 48 kHz). The
+    /// [`EncodeParams::psy_model`] field selects which of the two
+    /// example models is built.
+    psy: Option<PsyDriver>,
+    /// Per-channel sliding analysis buffer feeding the model's FFT —
+    /// 1024 samples for Model 2, 512 for the Layer I Model 1. The 384
+    /// new Layer I samples per frame are shifted in at the tail; the
+    /// leading remainder is the previous frames' history, zero-padded
+    /// at stream start. Empty when `psy` is `None`.
+    psy_window: Vec<Vec<f64>>,
+}
+
+/// The per-encoder Annex D model instance behind
+/// [`EncodeParams::psy_model`].
+#[derive(Debug)]
+enum PsyDriver {
+    /// Clause D.1 Model 1 — stateless, one shared driver for all
+    /// channels (per-channel state lives only in the sliding window).
+    Model1(crate::model1::Model1),
+    /// Clause D.2 Model 2 — one prediction-history state per channel.
+    Model2(Vec<crate::model2::Model2State>),
+}
+
+impl PsyDriver {
+    /// The analysis-window length this driver consumes.
+    fn window_len(&self) -> usize {
+        match self {
+            PsyDriver::Model1(m) => m.fft_size(),
+            PsyDriver::Model2(_) => crate::model2::FFT_SIZE,
+        }
+    }
 }
 
 impl Mp1FrameEncoder {
@@ -3384,20 +3447,26 @@ impl Mp1FrameEncoder {
     /// analysis history.
     pub fn new(params: EncodeParams) -> Mp1FrameEncoder {
         let nch = params.mode.channels() as usize;
-        // Build the Model 2 drivers only when psychoacoustic allocation
-        // is requested and the rate has an Annex D table.
+        // Build the psychoacoustic driver only when requested and the
+        // rate has Annex D tables; `psy_model` picks which of the two
+        // example models runs.
         let psy = if params.psychoacoustic {
-            let states: Option<Vec<_>> = (0..nch)
-                .map(|_| crate::model2::Model2State::new(params.sampling_frequency))
-                .collect();
-            states
+            match params.psy_model {
+                PsyModel::Model1 => {
+                    crate::model1::Model1::new(crate::header::Layer::I, params.sampling_frequency)
+                        .map(PsyDriver::Model1)
+                }
+                PsyModel::Model2 => (0..nch)
+                    .map(|_| crate::model2::Model2State::new(params.sampling_frequency))
+                    .collect::<Option<Vec<_>>>()
+                    .map(PsyDriver::Model2),
+            }
         } else {
             None
         };
-        let psy_window = if psy.is_some() {
-            vec![[0.0f64; crate::model2::FFT_SIZE]; nch]
-        } else {
-            Vec::new()
+        let psy_window = match &psy {
+            Some(driver) => vec![vec![0.0f64; driver.window_len()]; nch],
+            None => Vec::new(),
         };
         Mp1FrameEncoder {
             params,
@@ -3412,21 +3481,32 @@ impl Mp1FrameEncoder {
         for f in &mut self.filters {
             f.reset();
         }
-        if let Some(states) = &mut self.psy {
+        if let Some(PsyDriver::Model2(states)) = &mut self.psy {
             for s in states {
                 s.reset();
             }
         }
         for w in &mut self.psy_window {
-            *w = [0.0f64; crate::model2::FFT_SIZE];
+            w.fill(0.0);
         }
     }
 
-    /// Whether this encoder is running Model 2 psychoacoustic
+    /// Whether this encoder is running Annex D psychoacoustic
     /// allocation (psychoacoustic requested and the rate has an Annex D
     /// table).
     pub fn is_psychoacoustic(&self) -> bool {
         self.psy.is_some()
+    }
+
+    /// The Annex D model actually running: `Some(PsyModel::…)` when
+    /// [`is_psychoacoustic`](Self::is_psychoacoustic), `None` when the
+    /// energy-proxy allocator is in use.
+    pub fn active_psy_model(&self) -> Option<PsyModel> {
+        match &self.psy {
+            Some(PsyDriver::Model1(_)) => Some(PsyModel::Model1),
+            Some(PsyDriver::Model2(_)) => Some(PsyModel::Model2),
+            None => None,
+        }
     }
 
     /// The channel count implied by the encode mode.
@@ -3536,28 +3616,62 @@ impl Mp1FrameEncoder {
             has_crc,
             nch,
         );
-        // Annex D Model 2 psychoacoustic allocation when enabled: slide
-        // the 384 new per-channel samples into the 1024-sample analysis
-        // window, run the per-channel Model 2 driver to get per-subband
-        // SMR, and allocate against the SMR. Falls back to the
-        // signal-energy proxy when psychoacoustic is off / the rate has
-        // no Annex D table (`psy == None`).
-        let fft_size = crate::model2::FFT_SIZE;
-        let alloc = if let Some(states) = self.psy.as_mut() {
-            let mut smr = [[0.0f64; SUBBANDS]; 2];
-            for ch in 0..nch {
-                // Shift the window left by 384 and append the new frame.
-                let win = &mut self.psy_window[ch];
-                win.copy_within(per_ch.., 0);
-                let tail = fft_size - per_ch;
-                for (k, slot) in win[tail..].iter_mut().enumerate() {
-                    *slot = pcm[k * nch + ch];
+        // Annex D psychoacoustic allocation when enabled: slide the 384
+        // new per-channel samples into the model's analysis window
+        // (1024 samples for Model 2, 512 for Model 1), run the driver
+        // to get per-subband SMR, and allocate against the SMR. Falls
+        // back to the signal-energy proxy when psychoacoustic is off /
+        // the rate has no Annex D table (`psy == None`).
+        let alloc = match self.psy.as_mut() {
+            Some(PsyDriver::Model2(states)) => {
+                let fft_size = crate::model2::FFT_SIZE;
+                let mut smr = [[0.0f64; SUBBANDS]; 2];
+                for ch in 0..nch {
+                    // Shift the window left by 384 and append the new frame.
+                    let win = &mut self.psy_window[ch];
+                    win.copy_within(per_ch.., 0);
+                    let tail = fft_size - per_ch;
+                    for (k, slot) in win[tail..].iter_mut().enumerate() {
+                        *slot = pcm[k * nch + ch];
+                    }
+                    let arr: &[f64; crate::model2::FFT_SIZE] = win
+                        .as_slice()
+                        .try_into()
+                        .expect("Model 2 window is FFT_SIZE by construction");
+                    smr[ch] = states[ch].process(arr);
                 }
-                smr[ch] = states[ch].process(win);
+                allocate_bits_psy(&smr, nch, budget)
             }
-            allocate_bits_psy(&smr, nch, budget)
-        } else {
-            allocate_bits(&peak, nch, budget)
+            Some(PsyDriver::Model1(model)) => {
+                let fft_size = model.fft_size(); // 512 for Layer I
+                                                 // The clause D.1 Step 3 LTq offset keys on the bit rate
+                                                 // *per channel*.
+                let kbps_per_ch = bitrate_kbps as u32 / nch as u32;
+                let mut smr = [[0.0f64; SUBBANDS]; 2];
+                for ch in 0..nch {
+                    // Shift the window left by 384 and append the new
+                    // frame (128 samples of history + the 384 new).
+                    let win = &mut self.psy_window[ch];
+                    win.copy_within(per_ch.., 0);
+                    let tail = fft_size - per_ch;
+                    for (k, slot) in win[tail..].iter_mut().enumerate() {
+                        *slot = pcm[k * nch + ch];
+                    }
+                    // Step 2 scf_max(n): the scalefactor multipliers the
+                    // frame will actually be coded with (selected above
+                    // from the per-subband peaks). A silent subband gets
+                    // a zero multiplier so its Step 2 floor is -inf.
+                    let mut scfm = [0.0f64; SUBBANDS];
+                    for (sb, m) in scfm.iter_mut().enumerate() {
+                        if peak[ch][sb] > 0.0 {
+                            *m = SCALEFACTORS[scf_index[ch][sb] as usize];
+                        }
+                    }
+                    smr[ch] = model.process(win, &scfm, kbps_per_ch);
+                }
+                allocate_bits_psy(&smr, nch, budget)
+            }
+            None => allocate_bits(&peak, nch, budget),
         };
 
         // --- 4. Frame assembly (§C.1.5.1.10 / figure C.2) ---
@@ -8107,5 +8221,139 @@ mod tests {
         // Same bitrate / rate → identical frame size regardless of
         // allocation strategy (the slot count is rate-driven).
         assert_eq!(energy_len, psy_len, "frame size is rate-driven");
+    }
+
+    #[test]
+    fn psy_model_selection_and_default() {
+        // Default: Model 2 (byte-compatibility with the pre-switch
+        // encoder). `with_psy_model(Model1)` selects the D.1 model.
+        let base = EncodeParams::new(Bitrate::Fixed(192), 44_100, Mode::SingleChannel);
+        assert_eq!(base.psy_model, PsyModel::Model2);
+        let m2 = Mp1FrameEncoder::new(base.with_psychoacoustic(true));
+        assert_eq!(m2.active_psy_model(), Some(PsyModel::Model2));
+        let m1 = Mp1FrameEncoder::new(
+            base.with_psychoacoustic(true)
+                .with_psy_model(PsyModel::Model1),
+        );
+        assert_eq!(m1.active_psy_model(), Some(PsyModel::Model1));
+        // Model selection is inert while psychoacoustic is off.
+        let off = Mp1FrameEncoder::new(base.with_psy_model(PsyModel::Model1));
+        assert_eq!(off.active_psy_model(), None);
+        assert!(!off.is_psychoacoustic());
+    }
+
+    #[test]
+    fn model1_encoder_round_trips_to_pcm() {
+        // A Model 1 driven encode produces a decodable Layer I frame
+        // whose loud subband carries data and whose distant silent
+        // subbands draw no bits (their SMR is −∞).
+        use crate::decode::decode_audio_data;
+        let params = EncodeParams::new(Bitrate::Fixed(192), 44_100, Mode::SingleChannel)
+            .with_psychoacoustic(true)
+            .with_psy_model(PsyModel::Model1);
+        let mut enc = Mp1FrameEncoder::new(params);
+        assert!(enc.is_psychoacoustic());
+        // A ~2,8 kHz tone (24 cycles / 384 samples at 44,1 kHz —
+        // subband 4 of the 689 Hz grid).
+        let mut pcm = vec![0.0f64; 384];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = 0.6 * (2.0 * core::f64::consts::PI * 24.0 * i as f64 / 384.0).sin();
+        }
+        let mut bytes = Vec::new();
+        for _ in 0..3 {
+            bytes = enc.encode_frame(&pcm).expect("Model 1 encode ok");
+        }
+        let hdr = TestFrameHeader::parse(&bytes[..4]).expect("valid header");
+        assert_eq!(hdr.layer, crate::header::Layer::I);
+        let sb = decode_audio_data(&hdr, &bytes[4..]).expect("audio data decodes");
+        // The tone's subband was allocated…
+        let any_nonzero = sb.subbands[0]
+            .iter()
+            .any(|band| band.allocated && band.samples.iter().any(|&v| v != 0.0));
+        assert!(any_nonzero, "Model 1 frame carries the tone");
+        // …and the top subbands (fully masked / silent) were not.
+        assert!(
+            !sb.subbands[0][24].allocated && !sb.subbands[0][30].allocated,
+            "silent subbands must draw no bits under Model 1"
+        );
+    }
+
+    #[test]
+    fn model1_falls_back_at_lsf_rate_byte_identically() {
+        // 24 kHz has no Annex D tables: Model 1 selection falls back to
+        // the energy proxy and the output is byte-identical to the
+        // plain encoder.
+        let mk = |psy: bool| {
+            let mut params = EncodeParams::new(Bitrate::Fixed(96), 24_000, Mode::SingleChannel);
+            if psy {
+                params = params
+                    .with_psychoacoustic(true)
+                    .with_psy_model(PsyModel::Model1);
+            }
+            let mut enc = Mp1FrameEncoder::new(params);
+            assert_eq!(enc.active_psy_model(), None);
+            let mut pcm = vec![0.0f64; 384];
+            for (i, s) in pcm.iter_mut().enumerate() {
+                *s = 0.4 * (2.0 * core::f64::consts::PI * 7.0 * i as f64 / 384.0).sin();
+            }
+            (
+                enc.encode_frame(&pcm).unwrap(),
+                enc.encode_frame(&pcm).unwrap(),
+            )
+        };
+        assert_eq!(mk(false), mk(true), "LSF fallback must be byte-identical");
+    }
+
+    #[test]
+    fn model1_and_model2_produce_same_frame_envelope() {
+        // Both models fill the same §2.4.2.1 slot count at the same
+        // rate — only the allocation inside differs.
+        let mk = |model: PsyModel| {
+            let params = EncodeParams::new(Bitrate::Fixed(128), 48_000, Mode::SingleChannel)
+                .with_psychoacoustic(true)
+                .with_psy_model(model);
+            let mut enc = Mp1FrameEncoder::new(params);
+            let mut pcm = vec![0.0f64; 384];
+            for (i, s) in pcm.iter_mut().enumerate() {
+                *s = 0.3 * (2.0 * core::f64::consts::PI * 9.0 * i as f64 / 384.0).sin();
+            }
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out = enc.encode_frame(&pcm).unwrap();
+            }
+            out
+        };
+        let f1 = mk(PsyModel::Model1);
+        let f2 = mk(PsyModel::Model2);
+        assert_eq!(f1.len(), f2.len(), "same slot count");
+        assert_eq!(
+            f1[0..4],
+            f2[0..4],
+            "identical headers regardless of the model"
+        );
+    }
+
+    #[test]
+    fn model1_stereo_reset_restores_fresh_state() {
+        // After reset() a Model 1 stereo encoder reproduces a fresh
+        // encoder's bytes exactly (the sliding windows are zeroed; the
+        // driver itself is stateless).
+        let params = EncodeParams::new(Bitrate::Fixed(384), 44_100, Mode::Stereo)
+            .with_psychoacoustic(true)
+            .with_psy_model(PsyModel::Model1);
+        let mut pcm = vec![0.0f64; 384 * 2];
+        for i in 0..384 {
+            pcm[2 * i] = 0.5 * (2.0 * core::f64::consts::PI * 11.0 * i as f64 / 384.0).sin();
+            pcm[2 * i + 1] = 0.25 * (2.0 * core::f64::consts::PI * 30.0 * i as f64 / 384.0).sin();
+        }
+        let mut warm = Mp1FrameEncoder::new(params);
+        for _ in 0..3 {
+            warm.encode_frame(&pcm).unwrap();
+        }
+        warm.reset();
+        let after_reset = warm.encode_frame(&pcm).unwrap();
+        let mut fresh = Mp1FrameEncoder::new(params);
+        let first = fresh.encode_frame(&pcm).unwrap();
+        assert_eq!(after_reset, first, "reset must clear the Model 1 window");
     }
 }

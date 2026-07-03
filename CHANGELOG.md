@@ -31,6 +31,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 1 psychoacoustic allocation wired into the Layer I
+  encoder — selectable Annex D model (`PsyModel`).** New
+  `EncodeParams::psy_model` field / `with_psy_model(PsyModel)` builder
+  selects which Annex D example model drives psychoacoustic allocation
+  when `with_psychoacoustic(true)` is set: `PsyModel::Model1` (clause
+  D.1) or the default `PsyModel::Model2` (clause D.2, byte-identical
+  to the pre-switch behaviour). Under Model 1 the `Mp1FrameEncoder`
+  maintains a per-channel **512-sample** sliding window (Model 1's
+  Layer I FFT length, vs Model 2's 1024), feeds the Step 2
+  scalefactor term from the frame's actually-selected Table 3-B.1
+  multipliers, keys the Step 3 LTq offset on the per-channel bitrate,
+  and allocates via the same `allocate_bits_psy` MNR loop.
+  `Mp1FrameEncoder::active_psy_model()` reports which model runs;
+  the LSF half-rates fall back to the energy proxy byte-identically
+  (no Annex D tables). **+5 lib-tests**: the default/builder/inert
+  selection matrix, a Model 1 encode → decode round-trip asserting the
+  tone subband is coded while silent top subbands draw no bits, the
+  byte-identical LSF fallback, the Model 1 / Model 2 same-frame-
+  envelope check (identical slot count + header), and stereo
+  reset-restores-fresh-state.
 - **Annex D Model 1 per-frame driver — Steps 5–9 complete + the
   assembled `Model1` driver.** The clause D.1 chain now runs end to
   end. `decimate_maskers` performs Step 5: components below the

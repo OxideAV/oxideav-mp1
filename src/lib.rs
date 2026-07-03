@@ -129,7 +129,7 @@ pub use encode::{
     Layer2EncodeError, Layer2HeaderError, Layer2HeaderParams, Layer2SamplesFieldError,
     Layer2SamplesFieldInput, Layer2ScalefactorFieldError, Layer2ScalefactorFieldInput,
     Layer2ScalefactorIndices, Layer2SubbandPeaks, LayerSelect, Mp1FrameEncoder,
-    Mp1Layer2FrameEncoder,
+    Mp1Layer2FrameEncoder, PsyModel,
 };
 pub use encoder::{make_encoder_layer2, make_encoder_with_crc};
 pub use header::{
