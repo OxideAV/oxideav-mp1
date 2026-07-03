@@ -31,6 +31,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Model 1 end-to-end conformance integration tests**
+  (`tests/model1_psychoacoustic.rs`). Four public-surface contracts
+  for the clause D.1 encode paths: (1) a Model 1 Layer I **stereo**
+  multi-frame encode → decode loop with Goertzel single-bin
+  discrimination (each decoded channel dominated by its own tone by
+  ≥ 100×); (2) a Model 1 Layer II mono round-trip at 48 kHz where the
+  decoded spectrum stays tone-dominated by ≥ 1000× and the tone level
+  survives within ±3 dB; (3) byte-exact determinism of two identical
+  Model 1 encoders across frames on both layers; (4) a
+  model-has-effect guard — on a three-tone signal the Model 1 frames
+  differ from the energy-proxy frames inside the identical §2.4.2.1
+  envelope, and both streams decode cleanly.
 - **Model 1 psychoacoustic allocation wired into the Layer II
   encoder (+ VBR / top-level composition).**
   `Mp1Layer2FrameEncoder::with_psy_model(PsyModel)` selects the Annex
