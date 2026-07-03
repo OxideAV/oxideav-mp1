@@ -1,5 +1,7 @@
 # oxideav-mp1
 
+[![CI](https://github.com/OxideAV/oxideav-mp1/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mp1/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mp1.svg)](https://crates.io/crates/oxideav-mp1) [![docs.rs](https://docs.rs/oxideav-mp1/badge.svg)](https://docs.rs/oxideav-mp1) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust **MPEG-1 / MPEG-2 LSF Audio** codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 Decodes and encodes both **Layer I** and **Layer II** (MP2) frames,
