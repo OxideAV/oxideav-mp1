@@ -81,6 +81,22 @@ pub fn calibration_offset_db() -> f64 {
     96.0 - 10.0 * (1.0f64 / 6.0).log10()
 }
 
+/// Numerical squelch floor for the Step 1 spectrum, in dB.
+///
+/// In exact arithmetic a bin-centred sinusoid excites exactly three
+/// FFT lines through the Hann window and every other line is zero
+/// (`−∞` dB). Double-precision FFT round-off instead leaves crumbs
+/// around −190 dB and below, which would otherwise register as
+/// spurious Step 4 "local maxima" (they beat their neighbours by
+/// far more than 7 dB). Lines below this floor are therefore reported
+/// as `−∞`, restoring the exact-arithmetic picture. The floor is
+/// semantically inert: it sits 30 dB below 16-bit quantization
+/// silence (1 LSB ≈ −90 dB against the 96 dB reference) and more than
+/// 100 dB below the lowest Annex D threshold-in-quiet value
+/// (−4,97 dB pre-offset), so no representable signal or threshold
+/// interaction is affected.
+pub const SPECTRUM_SQUELCH_DB: f64 = -120.0;
+
 /// Clause D.1 Step 1 — Hann-windowed power density spectrum `X(k)` in
 /// dB, `k = 0…N/2`, normalized to the 96 dB SPL reference.
 ///
@@ -114,8 +130,14 @@ pub fn power_spectrum(samples: &[f64], layer: Layer) -> Option<Vec<f64>> {
         let (re, im) = (buf[2 * k], buf[2 * k + 1]);
         let power = re * re + im * im;
         // log10(0) is -inf in IEEE-754; -inf + offset stays -inf, so a
-        // silent line needs no special casing.
-        x.push(10.0 * power.log10() + offset);
+        // silent line needs no special casing. Sub-squelch numerical
+        // crumbs are reported as -inf too (see SPECTRUM_SQUELCH_DB).
+        let v = 10.0 * power.log10() + offset;
+        x.push(if v < SPECTRUM_SQUELCH_DB {
+            f64::NEG_INFINITY
+        } else {
+            v
+        });
     }
     Some(x)
 }
@@ -189,6 +211,199 @@ fn spl_per_subband_impl(
         // never wins the MAX.
         let scf_term = 20.0 * (scf_max[sb] * 32768.0).log10() - 10.0;
         *o = x_term.max(scf_term);
+    }
+    Some(out)
+}
+
+// -----------------------------------------------------------------
+// Clause D.1 Step 4 — Finding of tonal and non-tonal components
+// -----------------------------------------------------------------
+
+/// A Step 4 **tonal** (sinusoid-like) masking component: a local
+/// spectral maximum that beats every examined neighbour by at least
+/// 7 dB, carrying the three-line power sum
+/// `X_tm(k) = 10·log10(10^(X(k−1)/10) + 10^(X(k)/10) + 10^(X(k+1)/10))`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TonalComponent {
+    /// FFT-line index `k` of the local maximum (0-based DC..Nyquist,
+    /// matching [`power_spectrum`]'s indexing).
+    pub k: usize,
+    /// Sound pressure level `X_tm(k)` in dB.
+    pub spl_db: f64,
+}
+
+/// A Step 4 **non-tonal** (noise-like) masking component: the power
+/// sum of one critical band's remaining spectral lines, placed at the
+/// line nearest the band's geometric mean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NonTonalComponent {
+    /// Representative FFT-line index `k` — the line nearest the
+    /// geometric mean of the critical band.
+    pub k: usize,
+    /// Sound pressure level `X_nm(k)` in dB (`−∞` for a band whose
+    /// every line was consumed by tonal extraction or silent).
+    pub spl_db: f64,
+    /// 0-based critical-band number (row of the matching Table D.2x).
+    pub band: usize,
+}
+
+// The examined-neighbour offset sets `j` of clause D.1 Step 4 b). The
+// spec lists them per layer and per FFT-line region; ±1 is never
+// listed because the local-maximum labelling (Step 4 a) already
+// covers the immediate neighbours.
+const J2: &[isize] = &[-2, 2];
+const J3: &[isize] = &[-3, -2, 2, 3];
+const J6: &[isize] = &[-6, -5, -4, -3, -2, 2, 3, 4, 5, 6];
+const J12: &[isize] = &[
+    -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+];
+
+/// Clause D.1 Step 4 b) — the examined-neighbour offsets `j` for a
+/// local maximum at FFT line `k`, or `None` when `k` lies outside the
+/// examinable region (no line there can be labelled tonal):
+///
+/// ```text
+/// Layer I:  j = −2, +2            for   2 < k < 63
+///           j = −3…−2, +2…+3      for  63 <= k < 127
+///           j = −6…−2, +2…+6      for 127 <= k <= 250
+/// Layer II: (same first three regions, region 3 ending at k < 255)
+///           j = −12…−2, +2…+12    for 255 <= k <= 500
+/// ```
+pub fn tonal_search_offsets(layer: Layer, k: usize) -> Option<&'static [isize]> {
+    match layer {
+        Layer::I => match k {
+            3..=62 => Some(J2),
+            63..=126 => Some(J3),
+            127..=250 => Some(J6),
+            _ => None,
+        },
+        Layer::II => match k {
+            3..=62 => Some(J2),
+            63..=126 => Some(J3),
+            127..=254 => Some(J6),
+            255..=500 => Some(J12),
+            _ => None,
+        },
+    }
+}
+
+/// Clause D.1 Step 4 a)+b) — label the local maxima of `x_db` and
+/// extract the **tonal** components.
+///
+/// Returns the tonal list plus the *residual* spectrum the Step 4 c)
+/// non-tonal accumulation consumes: for every extracted tonal
+/// component, all lines within the examined frequency range
+/// (`k ± max|j|`, which covers the three lines summed into `X_tm`)
+/// are set to `−∞` dB, per the spec's "all spectral lines within the
+/// examined frequency range are set to −∞ dB". Local-maximum
+/// labelling and the 7 dB criterion are evaluated on the *input*
+/// spectrum (the spec presents Step 4 as list operations over the
+/// computed spectrum; the close-tonal interactions this leaves are
+/// resolved by the Step 5 b) 0,5-Bark decimation). Returns `None` on
+/// a spectrum-length mismatch.
+pub fn find_tonal_components(
+    x_db: &[f64],
+    layer: Layer,
+) -> Option<(Vec<TonalComponent>, Vec<f64>)> {
+    let len = num_lines(layer);
+    if x_db.len() != len {
+        return None;
+    }
+    let mut residual = x_db.to_vec();
+    let mut tonal = Vec::new();
+    for k in 1..len - 1 {
+        // Step 4 a): X(k) > X(k−1) and X(k) >= X(k+1).
+        if !(x_db[k] > x_db[k - 1] && x_db[k] >= x_db[k + 1]) {
+            continue;
+        }
+        let Some(offsets) = tonal_search_offsets(layer, k) else {
+            continue;
+        };
+        // Step 4 b): X(k) − X(k+j) >= 7 dB for every examined j.
+        let is_tonal = offsets.iter().all(|&j| {
+            let idx = k as isize + j;
+            match usize::try_from(idx).ok().and_then(|i| x_db.get(i)) {
+                Some(&neighbor) => x_db[k] - neighbor >= 7.0,
+                // Beyond the spectrum edge there is no neighbour to
+                // out-mask; treat as satisfied.
+                None => true,
+            }
+        });
+        if !is_tonal {
+            continue;
+        }
+        // X_tm(k): power sum of the maximum and its two neighbours.
+        let p = 10f64.powf(x_db[k - 1] / 10.0)
+            + 10f64.powf(x_db[k] / 10.0)
+            + 10f64.powf(x_db[k + 1] / 10.0);
+        tonal.push(TonalComponent {
+            k,
+            spl_db: 10.0 * p.log10(),
+        });
+        // Zero the examined frequency range in the residual.
+        let jmax = offsets.iter().map(|j| j.unsigned_abs()).max().unwrap_or(2);
+        let lo = k.saturating_sub(jmax);
+        let hi = (k + jmax).min(len - 1);
+        for r in &mut residual[lo..=hi] {
+            *r = f64::NEG_INFINITY;
+        }
+    }
+    Some((tonal, residual))
+}
+
+/// Clause D.1 Step 4 c) — accumulate the **non-tonal** components
+/// from the residual spectrum ([`find_tonal_components`]'s second
+/// return): within each critical band of the matching Table D.2x, the
+/// powers of the remaining spectral lines are summed to one non-tonal
+/// component `X_nm(k)`, listed at the index `k` of the spectral line
+/// nearest to the geometric mean of the critical band.
+///
+/// Lines above the last critical-band boundary (beyond the Table D.1x
+/// / D.2x coverage, e.g. above 15 kHz at 32 kHz Layer I) belong to no
+/// band and are ignored — the Annex D tables define no threshold
+/// there. Returns `None` for a `(layer, sampling_frequency)` pair
+/// without a Table D.2x (the MPEG-2 LSF rates) or on a length
+/// mismatch.
+pub fn find_non_tonal_components(
+    residual: &[f64],
+    layer: Layer,
+    sampling_frequency_hz: u32,
+) -> Option<Vec<NonTonalComponent>> {
+    let len = num_lines(layer);
+    if residual.len() != len {
+        return None;
+    }
+    let bands = crate::psy::critical_band_table(layer, sampling_frequency_hz)?;
+    let n = fft_size(layer) as f64;
+    let fs = sampling_frequency_hz as f64;
+    let mut out = Vec::with_capacity(bands.len());
+    let mut prev_top_hz = 0.0f64;
+    for (b, band) in bands.iter().enumerate() {
+        // Lines with prev_top < k·Fs/N <= top. The D.2x tops sit
+        // exactly on the line grid but are printed truncated to three
+        // decimals (e.g. 258,398 Hz for the exact 3·Fs/512 =
+        // 258,3984375 Hz at 44,1 kHz), so the boundary can land up to
+        // ~1e-5 line units *below* its integer; the +1e-3 epsilon
+        // absorbs that print truncation (the next line is a full 1,0
+        // away, so it can never overshoot).
+        let k_lo = ((prev_top_hz * n / fs) + 1e-3).floor() as usize + 1;
+        let k_hi = (((band.top_freq_hz * n / fs) + 1e-3).floor() as usize).min(len - 1);
+        prev_top_hz = band.top_freq_hz;
+        if k_lo > k_hi {
+            continue;
+        }
+        let power: f64 = residual[k_lo..=k_hi]
+            .iter()
+            .map(|&v| 10f64.powf(v / 10.0))
+            .sum();
+        // Geometric mean of the band, expressed on the line grid
+        // (frequency is proportional to line index).
+        let k_gm = ((k_lo as f64 * k_hi as f64).sqrt().round() as usize).clamp(k_lo, k_hi);
+        out.push(NonTonalComponent {
+            k: k_gm,
+            spl_db: 10.0 * power.log10(),
+            band: b,
+        });
     }
     Some(out)
 }
@@ -384,5 +599,172 @@ mod tests {
         let x1 = power_spectrum(&s1, Layer::I).unwrap();
         let x2 = power_spectrum(&s2, Layer::II).unwrap();
         assert!((x1[k1] - x2[2 * k1]).abs() < 1e-6);
+    }
+
+    // ------------------------- Step 4 -------------------------
+
+    #[test]
+    fn tonal_offsets_follow_step4_regions() {
+        // Region boundaries, Layer I: 2 < k < 63 / 63..127 / 127..=250.
+        assert_eq!(tonal_search_offsets(Layer::I, 2), None);
+        assert_eq!(tonal_search_offsets(Layer::I, 3), Some(J2));
+        assert_eq!(tonal_search_offsets(Layer::I, 62), Some(J2));
+        assert_eq!(tonal_search_offsets(Layer::I, 63), Some(J3));
+        assert_eq!(tonal_search_offsets(Layer::I, 126), Some(J3));
+        assert_eq!(tonal_search_offsets(Layer::I, 127), Some(J6));
+        assert_eq!(tonal_search_offsets(Layer::I, 250), Some(J6));
+        assert_eq!(tonal_search_offsets(Layer::I, 251), None);
+        // Layer II adds the fourth region 255..=500 with j to ±12.
+        assert_eq!(tonal_search_offsets(Layer::II, 127), Some(J6));
+        assert_eq!(tonal_search_offsets(Layer::II, 254), Some(J6));
+        assert_eq!(tonal_search_offsets(Layer::II, 255), Some(J12));
+        assert_eq!(tonal_search_offsets(Layer::II, 500), Some(J12));
+        assert_eq!(tonal_search_offsets(Layer::II, 501), None);
+        // ±1 is never an examined offset; every set is symmetric.
+        for set in [J2, J3, J6, J12] {
+            assert!(!set.contains(&1) && !set.contains(&-1));
+            assert!(set.iter().all(|&j| set.contains(&-j)));
+        }
+    }
+
+    #[test]
+    fn single_sine_yields_one_tonal_component() {
+        let k0 = 44;
+        let s = sine(512, k0, 1.0);
+        let x = power_spectrum(&s, Layer::I).unwrap();
+        let (tonal, residual) = find_tonal_components(&x, Layer::I).unwrap();
+        assert_eq!(tonal.len(), 1, "{tonal:?}");
+        assert_eq!(tonal[0].k, k0);
+        // X_tm = the 96 dB peak plus its two −6,02 dB Hann skirts:
+        // 96 + 10·log10(1 + 2·0,25) ≈ 97,76 dB.
+        assert!(
+            (tonal[0].spl_db - (96.0 + 10.0 * 1.5f64.log10())).abs() < 0.05,
+            "X_tm = {}",
+            tonal[0].spl_db
+        );
+        // The examined range (±2 in this region) is erased from the
+        // residual; lines beyond it are untouched (here already −∞:
+        // a bin-centred sine excites exactly three Hann lines and the
+        // squelch restores the exact-arithmetic zeros elsewhere).
+        for (k, &r) in residual.iter().enumerate().skip(k0 - 2).take(5) {
+            assert_eq!(r, f64::NEG_INFINITY, "line {k}");
+        }
+        assert_eq!(residual[k0 + 3], x[k0 + 3]);
+        assert_eq!(x[k0 + 3], f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn two_distant_sines_yield_two_tonal_components() {
+        let (ka, kb) = (44, 200);
+        let mut s = sine(512, ka, 0.5);
+        for (a, b) in s.iter_mut().zip(sine(512, kb, 0.25)) {
+            *a += b;
+        }
+        let x = power_spectrum(&s, Layer::I).unwrap();
+        let (tonal, _) = find_tonal_components(&x, Layer::I).unwrap();
+        let lines: Vec<usize> = tonal.iter().map(|t| t.k).collect();
+        assert_eq!(lines, vec![ka, kb]);
+    }
+
+    #[test]
+    fn adjacent_equal_partials_are_not_tonal() {
+        // Two equal-amplitude sines two lines apart: each local maximum
+        // fails the 7 dB criterion against the other (X(k) − X(k±2) ≈ 0).
+        let k0 = 100;
+        let mut s = sine(512, k0, 0.5);
+        for (a, b) in s.iter_mut().zip(sine(512, k0 + 2, 0.5)) {
+            *a += b;
+        }
+        let x = power_spectrum(&s, Layer::I).unwrap();
+        let (tonal, _) = find_tonal_components(&x, Layer::I).unwrap();
+        assert!(
+            !tonal
+                .iter()
+                .any(|t| (t.k as isize - k0 as isize).abs() <= 2),
+            "{tonal:?}"
+        );
+    }
+
+    #[test]
+    fn tonal_rejects_wrong_length() {
+        assert!(find_tonal_components(&[0.0; 256], Layer::I).is_none());
+        assert!(find_tonal_components(&[0.0; 257], Layer::II).is_none());
+    }
+
+    #[test]
+    fn non_tonal_components_cover_every_band_once() {
+        // Property check at every supported (layer, rate): the per-band
+        // line ranges tile lines 1..=top contiguously and each geometric
+        // mean lands inside its own band.
+        for layer in [Layer::I, Layer::II] {
+            for fs in [32_000u32, 44_100, 48_000] {
+                let x = vec![20.0; num_lines(layer)];
+                let nt = find_non_tonal_components(&x, layer, fs).unwrap();
+                let bands = crate::psy::critical_band_table(layer, fs).unwrap();
+                assert_eq!(nt.len(), bands.len(), "{layer:?} {fs}");
+                for (b, c) in nt.iter().enumerate() {
+                    assert_eq!(c.band, b);
+                    assert!(c.spl_db.is_finite());
+                }
+                // Representative lines are strictly increasing.
+                for w in nt.windows(2) {
+                    assert!(w[0].k < w[1].k);
+                }
+                // Reconstruct the total power: the band power sums must
+                // add up to the power of all covered lines exactly.
+                let n = fft_size(layer) as f64;
+                let top_line =
+                    ((bands.last().unwrap().top_freq_hz * n / fs as f64) + 1e-9).floor() as usize;
+                let covered = top_line.min(num_lines(layer) - 1);
+                let want: f64 = covered as f64 * 10f64.powf(2.0);
+                let got: f64 = nt.iter().map(|c| 10f64.powf(c.spl_db / 10.0)).sum();
+                assert!(
+                    (got - want).abs() < 1e-6 * want,
+                    "{layer:?} {fs}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_tonal_geometric_mean_placement() {
+        // Layer I / 32 kHz band 8 spans lines 16..18 (Table D.2a: tops
+        // at index 15 and 18); the geometric mean sqrt(16·18) ≈ 16,97
+        // rounds to line 17.
+        let x = vec![30.0; 257];
+        let nt = find_non_tonal_components(&x, Layer::I, 32_000).unwrap();
+        assert_eq!(nt[8].k, 17);
+        // Band 0 is the single line 1.
+        assert_eq!(nt[0].k, 1);
+        // Its power is that one line's power.
+        assert!((nt[0].spl_db - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_tonal_ignores_tonal_extracted_lines() {
+        // A pure tone: after tonal extraction its band's remaining
+        // power is only the far Hann-leakage crumbs, way below X_tm.
+        let k0 = 44;
+        let s = sine(512, k0, 1.0);
+        let x = power_spectrum(&s, Layer::I).unwrap();
+        let (tonal, residual) = find_tonal_components(&x, Layer::I).unwrap();
+        let nt = find_non_tonal_components(&residual, Layer::I, 32_000).unwrap();
+        // Line 44 at 32 kHz is 2750 Hz — band 14 of Table D.2a.
+        let band14 = nt.iter().find(|c| c.band == 14).unwrap();
+        assert!(
+            band14.spl_db < tonal[0].spl_db - 60.0,
+            "non-tonal {} vs tonal {}",
+            band14.spl_db,
+            tonal[0].spl_db
+        );
+    }
+
+    #[test]
+    fn non_tonal_rejects_lsf_rates_and_bad_lengths() {
+        let x = vec![0.0; 257];
+        assert!(find_non_tonal_components(&x, Layer::I, 24_000).is_none());
+        assert!(find_non_tonal_components(&x, Layer::I, 22_050).is_none());
+        assert!(find_non_tonal_components(&x, Layer::I, 16_000).is_none());
+        assert!(find_non_tonal_components(&x, Layer::II, 32_000).is_none());
     }
 }

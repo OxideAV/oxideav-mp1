@@ -31,6 +31,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Annex D Model 1 per-frame driver — Step 4 (tonal / non-tonal
+  component identification).** `find_tonal_components` labels the
+  clause D.1 Step 4 a) local maxima (`X(k) > X(k−1)` and
+  `X(k) >= X(k+1)`), applies the Step 4 b) 7 dB criterion over the
+  per-layer / per-region examined-neighbour sets (`tonal_search_offsets`:
+  `±2` for `2 < k < 63`, `±2…±3` for `63 <= k < 127`, `±2…±6` up to
+  k = 250 / 254 for Layer I / II, and the Layer-II-only `±2…±12` for
+  `255 <= k <= 500`), forms the three-line power sum `X_tm(k)`, and
+  erases each extracted component's examined frequency range to `−∞`
+  in the residual spectrum. `find_non_tonal_components` then sums each
+  Table D.2x critical band's remaining line powers into one `X_nm(k)`
+  placed at the line nearest the band's geometric mean (Step 4 c),
+  rejecting the MPEG-2 LSF rates (no Table D.2x). A documented
+  numerical **squelch floor** (`SPECTRUM_SQUELCH_DB = −120 dB`, 30 dB
+  below 16-bit quantization silence and 100+ dB below every Annex D
+  threshold) maps double-precision FFT round-off crumbs to `−∞` so
+  they cannot register as spurious local maxima — restoring the
+  exact-arithmetic picture in which a bin-centred sinusoid excites
+  exactly three Hann lines. The Step 4 c) band ranges absorb the D.2x
+  print truncation (tops printed to three decimals, e.g. 258,398 Hz
+  for the exact 3·Fs/512 at 44,1 kHz) with a 1e-3-line epsilon.
+  **+9 lib-tests**: the four offset-region boundaries per layer
+  (including the ±1-never-examined and symmetry invariants), the
+  single-sine one-component extraction with the ≈97,76 dB `X_tm`
+  three-line sum and residual erasure, two-distant-sines, the
+  adjacent-equal-partials 7 dB rejection, wrong-length rejection,
+  the every-band-covered-once tiling + total-power-conservation
+  property at all six (layer, rate) pairs, the D.2a band-8 geometric
+  mean placement (`sqrt(16·18) → 17`), tonal-extraction leaving the
+  tone's own band non-tonal-empty, and LSF-rate rejection.
 - **Annex D Model 1 per-frame driver — Steps 1 + 2 (clause D.1
   spectral analysis + per-subband SPL).** New `model1` module opening
   the second Annex D example model: `power_spectrum` runs the printed
