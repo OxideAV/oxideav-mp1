@@ -149,10 +149,34 @@ fall back to the energy proxy under either model.
 
 ## Robustness
 
-A `cargo-fuzz` harness under `fuzz/` (a self-contained sub-crate) drives
-attacker-controlled bytes through the registered decoder trait object
-across both the Layer I and Layer II decode chains and the concealment
-paths; the contract under test is panic-freedom on arbitrary input.
+A `cargo-fuzz` harness under `fuzz/` (a self-contained sub-crate)
+carries five targets, run on a daily schedule by the `Fuzz` workflow:
+
+- **`decode`** — attacker-controlled bytes through the registered
+  decoder trait object across both the Layer I and Layer II decode
+  chains (MPEG-1 + 13818-3 LSF ladders) and the concealment paths;
+  panic-freedom on arbitrary input.
+- **`header_parse`** — invariant oracles on `FrameHeader::parse`,
+  `find_sync` (first-match contract), the §2.4.2.1 frame-length ↔
+  slot-count arithmetic, and the §2.4.3.1 free-format next-syncword
+  probe, including a planted-distance oracle that must recover exactly
+  the synthesized slot geometry.
+- **`crc`** — §2.4.1.4 error_check() oracles for both layers:
+  compute→plant→verify round-trip, guaranteed single-bit-error
+  detection inside the Table 3-B.5 protected span, `Absent` on
+  unprotected headers.
+- **`decode_layer2_steered`** — a fixed combo list pins every
+  §2.4.3.3.1 allocation-table selection (3-B.2a/b/c/d + the 13818-3
+  Table B.1 LSF substitute, plus a free-format rejection row) on every
+  campaign, driving both the registered decoder and the library-level
+  `decode_layer2_audio_data` / `verify_layer2_crc` pair.
+- **`roundtrip`** — an encode→decode **conformance oracle**: in-band
+  sinusoid mixtures through Layer I / Layer II at fixed
+  high-per-channel-rate configs (incl. LSF rates and CRC emission)
+  must decode back within calibrated delay-compensated RMS bounds;
+  plus structural packet checks, the silence fixed point, and
+  free-format §2.4.3.1 geometry recovery over the encoder's own
+  output.
 
 ## License
 

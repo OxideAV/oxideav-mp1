@@ -1,0 +1,18 @@
+name: Fuzz
+
+# Daily scheduled run of the cargo-fuzz harnesses under fuzz/ via the
+# OxideAV org-level reusable workflow (see OxideAV/.github). The
+# 30-minute budget is split evenly across the five targets (decode,
+# header_parse, crc, decode_layer2_steered, roundtrip — ~6 min each).
+
+on:
+  schedule:
+    - cron: "43 5 * * *" # daily 05:43 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

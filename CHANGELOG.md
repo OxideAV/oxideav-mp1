@@ -6,6 +6,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Dedicated fuzz campaign — four new cargo-fuzz targets + a daily
+  scheduled `Fuzz` workflow.** The `fuzz/` sub-crate grows from the
+  single `decode` no-panic target to five:
+  - `header_parse` — invariant oracles over `FrameHeader::parse`,
+    `find_sync` (first-match contract), the §2.4.2.1 frame-length ↔
+    slot-count arithmetic, and the §2.4.3.1 free-format next-syncword
+    probe, including a planted-distance oracle (synthesized two-frame
+    free-format streams whose exact slot geometry the probe must
+    recover).
+  - `crc` — §2.4.1.4 / §2.4.3.1 error_check() oracles for both
+    layers: compute→plant→verify must report `Ok`, any single-bit
+    error inside the Table 3-B.5 protected span (with a
+    header-derived covered length) must report `Mismatch`, and
+    unprotected headers must report `Absent`.
+  - `decode_layer2_steered` — a fixed 16-row combo list pins every
+    §2.4.3.3.1 bit-allocation-table selection (Tables 3-B.2a/b/c/d +
+    the 13818-3 Annex B Table B.1 LSF substitute + a free-format
+    rejection row) on every campaign, driving both the registered
+    decoder session and the library-level `decode_layer2_audio_data`
+    / `verify_layer2_crc` pair per crafted frame.
+  - `roundtrip` — an encode→decode **conformance oracle** (not just
+    no-panic): fuzzer-controlled in-band sinusoid mixtures through
+    Layer I (44.1/48/32 kHz + 24/22.05 kHz LSF, with and without CRC
+    emission) and Layer II (48 kHz mono / 44.1 kHz stereo) at fixed
+    high-per-channel-rate configs must decode back within calibrated
+    delay-compensated RMS bounds (Layer I 0.05, Layer II 0.15, versus
+    measured worsts of ≤0.0001 / ≤0.03 at ≤0.3 amplitude); plus
+    per-packet §2.4.2.1 structural checks, emitted-CRC verification,
+    the all-zero silence fixed point, and free-format §2.4.3.1 slot
+    geometry recovery over the encoder's own two-frame output. The
+    input mixture is confined to the *transmitted* band because the
+    Layer II Tables 3-B.2x carry only `sblimit` (27/30) of the 32
+    subbands — a conformant codec discards out-of-band content by
+    design, so a raw arbitrary-spectrum RMS oracle would flag that
+    spec-mandated truncation as a failure.
+  A `.github/workflows/fuzz.yml` shim schedules a daily 30-minute run
+  via the org-level reusable crate-fuzz workflow. Round-429 campaign
+  result: ~609 M executions across the five targets (~2 h wall, ASan
+  on, corpora grown 868 → 6.2 k entries): **zero panics, zero
+  overflows, zero OOM, zero oracle divergences**; decoder and encoder
+  outputs over the pinned fixture/tone baselines byte-identical
+  before and after.
+
 ### Changed
 
 - **Layer II intensity_stereo encode quality — shared upper-band stream
