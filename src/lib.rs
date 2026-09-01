@@ -107,11 +107,19 @@ pub mod decoder;
 pub mod encode;
 pub mod encoder;
 pub mod header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod model1;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod model2;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod psy;
 pub mod synthesis;
 pub mod tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tables_layer2;
 
 pub use codec::{register_codecs, ConcealmentMode, Mp1Decoder, Mp1Encoder};
