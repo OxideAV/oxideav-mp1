@@ -91,9 +91,7 @@ impl AnalysisFilter {
 
     /// Zero the input FIFO (startup state).
     pub fn reset(&mut self) {
-        for v in &mut self.x {
-            *v = 0.0;
-        }
+        self.x.fill(0.0);
     }
 
     /// Run one slot of the analysis filter (figure C.4): consume the 32

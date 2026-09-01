@@ -87,9 +87,7 @@ impl SynthesisFilter {
     /// [`synthesize`](Self::synthesize) starts as if from a fresh
     /// stream (used after a container seek).
     pub fn reset(&mut self) {
-        for x in &mut self.v {
-            *x = 0.0;
-        }
+        self.v.fill(0.0);
     }
 
     /// Run one slot of the synthesis filter: consume 32 subband
