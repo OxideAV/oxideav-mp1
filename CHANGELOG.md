@@ -6,6 +6,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-mp1/compare/v0.0.7...v0.0.8) - 2026-09-01
+
+### Other
+
+- clippy 1.98: manual_slice_fill — reset() uses slice::fill on the analysis/synthesis FIFOs
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- daily scheduled Fuzz workflow + robustness docs for the five-target harness
+
 ### Added
 
 - **Dedicated fuzz campaign — four new cargo-fuzz targets + a daily
