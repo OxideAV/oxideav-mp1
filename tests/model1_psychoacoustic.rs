@@ -30,7 +30,7 @@ fn pkt(fs: u32, data: Vec<u8>) -> Packet {
 /// Interleaved S16 PCM bytes → per-channel f64 in [-1, 1).
 fn deinterleave_s16(bytes: &[u8], nch: usize) -> Vec<Vec<f64>> {
     let mut out = vec![Vec::new(); nch];
-    for (i, half) in bytes.chunks_exact(2).enumerate() {
+    for (i, half) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let s = i16::from_le_bytes([half[0], half[1]]);
         out[i % nch].push(s as f64 / 32768.0);
     }

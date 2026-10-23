@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-mp1"
 version = "0.0.7"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust MPEG-1 Audio Layer I codec — decoder + encoder"

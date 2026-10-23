@@ -55,8 +55,8 @@
 //! prediction the spec's step c requires.
 
 use crate::psy::{
-    absthr_for_line_32k, absthr_for_line_44k1, absthr_for_line_48k, CalcPartition,
-    CALC_PARTITION_32K, CODER_PARTITIONS,
+    CALC_PARTITION_32K, CODER_PARTITIONS, CalcPartition, absthr_for_line_32k, absthr_for_line_44k1,
+    absthr_for_line_48k,
 };
 use crate::psy::{calc_partition_44k1, calc_partition_48k};
 
@@ -349,11 +349,7 @@ impl PartitionTables {
             .iter()
             .map(|row| {
                 let s: f64 = row.iter().sum();
-                if s > 0.0 {
-                    1.0 / s
-                } else {
-                    0.0
-                }
+                if s > 0.0 { 1.0 / s } else { 0.0 }
             })
             .collect();
         PartitionTables {

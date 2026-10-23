@@ -53,6 +53,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - **Layer II intensity_stereo encode quality — shared upper-band stream
   is now the per-slot channel average `(L+R)/2`.** Per §2.4.1.6 / Annex
   B ("Requantization of subband samples"), the joint_stereo upper band

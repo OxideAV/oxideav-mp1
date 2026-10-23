@@ -35,8 +35,8 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame};
 use oxideav_mp1::{
-    detect_free_format_frame_length, encode::EncodeParams, encode::LayerSelect,
-    encode::Mp1FrameEncoder, encode::PsyModel, Bitrate, CrcStatus, FrameHeader, Layer, Mode,
+    Bitrate, CrcStatus, FrameHeader, Layer, Mode, detect_free_format_frame_length,
+    encode::EncodeParams, encode::LayerSelect, encode::Mp1FrameEncoder, encode::PsyModel,
 };
 
 struct Cfg {

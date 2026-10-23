@@ -32,7 +32,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Packet, Rational, TimeBase};
-use oxideav_mp1::{decode_layer2_audio_data, verify_layer2_crc, FrameHeader};
+use oxideav_mp1::{FrameHeader, decode_layer2_audio_data, verify_layer2_crc};
 
 const MAX_FRAME_BYTES: usize = 2048;
 const MAX_FRAMES_PER_ITER: usize = 6;

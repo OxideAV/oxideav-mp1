@@ -35,7 +35,7 @@ fn pkt(data: Vec<u8>) -> Packet {
 fn deinterleave_s16(bytes: &[u8]) -> (Vec<f64>, Vec<f64>) {
     let mut l = Vec::new();
     let mut r = Vec::new();
-    for frame in bytes.chunks_exact(4) {
+    for frame in bytes.as_chunks::<4>().0 {
         let sl = i16::from_le_bytes([frame[0], frame[1]]);
         let sr = i16::from_le_bytes([frame[2], frame[3]]);
         l.push(sl as f64 / 32768.0);

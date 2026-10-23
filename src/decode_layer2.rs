@@ -42,9 +42,9 @@
 //! is valid for both channels").
 
 use crate::decode::{BitReader, DecodeError, SUBBANDS};
-use crate::header::{crc16_update_bits, CrcStatus, FrameHeader, Mode, CRC16_INIT};
+use crate::header::{CRC16_INIT, CrcStatus, FrameHeader, Mode, crc16_update_bits};
 use crate::tables::SCALEFACTORS;
-use crate::tables_layer2::{layer2_bit_allocation_table, AllocationTable, QuantClass};
+use crate::tables_layer2::{AllocationTable, QuantClass, layer2_bit_allocation_table};
 
 /// Number of *syntax-level* granules in a Layer II `audio_data()` —
 /// the outer `for (gr=0; gr<12; gr++)` loop runs twelve times per

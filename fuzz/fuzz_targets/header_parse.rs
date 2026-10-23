@@ -32,7 +32,7 @@
 //! ISO/IEC 13818-3 §2.4.2.3 (LSF ladders).
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mp1::{detect_free_format_frame_length, find_sync, Bitrate, FrameHeader, Layer};
+use oxideav_mp1::{Bitrate, FrameHeader, Layer, detect_free_format_frame_length, find_sync};
 
 /// Assemble a syntactically valid 4-byte header from attacker-chosen
 /// fields. `br_sel == None` forces free format (`bitrate_index 0000`).

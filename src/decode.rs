@@ -727,7 +727,7 @@ mod tests {
         // scalefactor per channel for sb4 -> two reads.
         push(20, 6, &mut bits, &mut acc, &mut nbits_acc); // sb4 ch0
         push(21, 6, &mut bits, &mut acc, &mut nbits_acc); // sb4 ch1
-                                                          // samples: 12 samples, sb4 read once (shared), 2 bits each.
+        // samples: 12 samples, sb4 read once (shared), 2 bits each.
         let sample_codes: [u32; 12] = [3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0];
         for &c in &sample_codes {
             push(c, 2, &mut bits, &mut acc, &mut nbits_acc);
@@ -790,7 +790,7 @@ mod tests {
         // scalefactors: sb0 ch0, then sb0 ch1.
         push(5, 6, &mut bits, &mut acc, &mut nbits_acc); // ch0
         push(9, 6, &mut bits, &mut acc, &mut nbits_acc); // ch1
-                                                         // samples: for each s, sb0 ch0 (2 bits) then sb0 ch1 (3 bits).
+        // samples: for each s, sb0 ch0 (2 bits) then sb0 ch1 (3 bits).
         let codes_ch0: [u32; 12] = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
         let codes_ch1: [u32; 12] = [7, 6, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4];
         for s in 0..12 {

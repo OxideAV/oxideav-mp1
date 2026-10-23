@@ -17,7 +17,7 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, CodecRegistry, Encoder, Frame, MediaType, Packet,
 };
 
-use oxideav_mp1::{register_codecs, Mp1Decoder, Mp1Encoder};
+use oxideav_mp1::{Mp1Decoder, Mp1Encoder, register_codecs};
 
 const SAMPLES_PER_FRAME: u32 = 384;
 

@@ -159,10 +159,11 @@ mod tests {
             h.has_crc(),
             "make_encoder_with_crc must clear protection_bit"
         );
-        assert!(h
-            .verify_crc(&crc_pkt.data[..4], &crc_pkt.data[4..])
-            .expect("CRC region present")
-            .is_good());
+        assert!(
+            h.verify_crc(&crc_pkt.data[..4], &crc_pkt.data[4..])
+                .expect("CRC region present")
+                .is_good()
+        );
 
         // The plain factory keeps the no-CRC default.
         let mut plain_enc = make_encoder(&params).expect("make_encoder");

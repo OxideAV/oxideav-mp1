@@ -484,11 +484,7 @@ pub fn allocate_bits_psy(smr: &[[f64; SUBBANDS]; 2], nch: usize, budget_bits: us
 /// 15→14). `nb == 1` is not a legal Layer I allocation and never
 /// produced by [`allocate_bits`].
 fn allocation_code(nb: u8) -> u8 {
-    if nb == 0 {
-        0
-    } else {
-        nb - 1
-    }
+    if nb == 0 { 0 } else { nb - 1 }
 }
 
 // ---- Layer II scalefactor extraction (§C.1.5.1.4 per part) -----
@@ -685,7 +681,7 @@ const LAYER2_SCFSI_TABLE_C4: [[Layer2ScfsiPattern; 5]; 5] = {
     // Helper to keep the rows readable; const fn closures are not
     // available, so spell each entry out.
     macro_rules! p {
-        ($a:expr, $b:expr, $c:expr, $s:expr) => {
+        ($a:expr_2021, $b:expr_2021, $c:expr_2021, $s:expr_2021) => {
             Layer2ScfsiPattern {
                 pick: [$a, $b, $c],
                 scfsi: $s,
@@ -783,7 +779,7 @@ pub fn select_layer2_scfsi(scf: [u8; 3]) -> (u8, [u8; 3]) {
 // ---- Layer II bit allocation (§C.1.5.2.7) ----------------------
 
 use crate::header::{Emphasis, ModeExtension};
-use crate::tables_layer2::{layer2_snr_db, AllocationTable, QuantClass};
+use crate::tables_layer2::{AllocationTable, QuantClass, layer2_snr_db};
 
 /// Per-frame, per-channel, per-subband **Layer II** allocation indices.
 ///
@@ -1099,11 +1095,7 @@ pub fn layer2_bitrate_ladder(id_bit: u8) -> &'static [u16] {
         32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
     ];
     const L2_LSF: [u16; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
-    if id_bit == 1 {
-        &L2_MPEG1
-    } else {
-        &L2_LSF
-    }
+    if id_bit == 1 { &L2_MPEG1 } else { &L2_LSF }
 }
 
 /// The worst (smallest) per-subband mask-to-noise ratio (MNR, dB) left
@@ -3642,8 +3634,8 @@ impl Mp1FrameEncoder {
             }
             Some(PsyDriver::Model1(model)) => {
                 let fft_size = model.fft_size(); // 512 for Layer I
-                                                 // The clause D.1 Step 3 LTq offset keys on the bit rate
-                                                 // *per channel*.
+                // The clause D.1 Step 3 LTq offset keys on the bit rate
+                // *per channel*.
                 let kbps_per_ch = bitrate_kbps as u32 / nch as u32;
                 let mut smr = [[0.0f64; SUBBANDS]; 2];
                 for ch in 0..nch {
@@ -3678,9 +3670,9 @@ impl Mp1FrameEncoder {
         bw.put(0xFFF, 12); // syncword
         bw.put(id_bit as u32, 1); // ID: 1 = MPEG-1, 0 = MPEG-2 LSF (13818-3 §2.4.2.3)
         bw.put(0b11, 2); // layer I
-                         // §2.4.2.3: protection_bit '0' indicates redundancy (CRC)
-                         // *has* been added; '1' indicates no redundancy. The encoder
-                         // writes '0' iff `emit_crc` was requested.
+        // §2.4.2.3: protection_bit '0' indicates redundancy (CRC)
+        // *has* been added; '1' indicates no redundancy. The encoder
+        // writes '0' iff `emit_crc` was requested.
         bw.put(if has_crc { 0 } else { 1 }, 1);
         bw.put(brate_idx as u32, 4); // bitrate_index
         bw.put(samp_code as u32, 2); // sampling_frequency
@@ -4119,20 +4111,20 @@ impl Mp1Layer2FrameEncoder {
         // width. `base_params` is the per-frame header the encode dispatch
         // uses (the VBR path layers `bitrate_kbps` on top of it).
         let mut base_params = self.params;
-        if self.params.mode == Mode::JointStereo {
-            if let Some(thresh) = self.auto_intensity_threshold {
-                let sblimit = {
-                    let header_bytes = pack_layer2_header(&self.params)?;
-                    let header = FrameHeader::parse(&header_bytes).map_err(|_| {
-                        Layer2EncodeError::Header(Layer2HeaderError::UnsupportedSamplingFrequency(
-                            self.params.sampling_frequency,
-                        ))
-                    })?;
-                    crate::tables_layer2::layer2_bit_allocation_table(&header).sblimit()
-                };
-                let me = select_layer2_intensity_bound(&subbands, sblimit, thresh);
-                base_params.mode_extension = crate::header::ModeExtension(me);
-            }
+        if self.params.mode == Mode::JointStereo
+            && let Some(thresh) = self.auto_intensity_threshold
+        {
+            let sblimit = {
+                let header_bytes = pack_layer2_header(&self.params)?;
+                let header = FrameHeader::parse(&header_bytes).map_err(|_| {
+                    Layer2EncodeError::Header(Layer2HeaderError::UnsupportedSamplingFrequency(
+                        self.params.sampling_frequency,
+                    ))
+                })?;
+                crate::tables_layer2::layer2_bit_allocation_table(&header).sblimit()
+            };
+            let me = select_layer2_intensity_bound(&subbands, sblimit, thresh);
+            base_params.mode_extension = crate::header::ModeExtension(me);
         }
 
         let pending = self.pending_ancillary.take().unwrap_or_default();
@@ -4197,12 +4189,12 @@ impl Mp1Layer2FrameEncoder {
                 // (the decoder re-reads it each frame); a selection error
                 // (e.g. an unsupported rate) falls through to the fixed
                 // `params.bitrate_kbps`.
-                if let Some(target) = vbr_target {
-                    if let Ok(kbps) = select_layer2_vbr_bitrate(&base_params, &smr, target) {
-                        let mut frame_params = base_params;
-                        frame_params.bitrate_kbps = kbps;
-                        return encode_layer2_frame_psy(&frame_params, &subbands, &smr);
-                    }
+                if let Some(target) = vbr_target
+                    && let Ok(kbps) = select_layer2_vbr_bitrate(&base_params, &smr, target)
+                {
+                    let mut frame_params = base_params;
+                    frame_params.bitrate_kbps = kbps;
+                    return encode_layer2_frame_psy(&frame_params, &subbands, &smr);
                 }
                 return encode_layer2_frame_psy(&base_params, &subbands, &smr);
             }
@@ -4211,17 +4203,17 @@ impl Mp1Layer2FrameEncoder {
             // the ancillary bytes fill the frame tail), so a single
             // assembly applies both. VBR also composes: pick the per-frame
             // rung from the SMR, then pack the ancillary tail.
-            if let Some(target) = vbr_target {
-                if let Ok(kbps) = select_layer2_vbr_bitrate(&base_params, &smr, target) {
-                    let mut frame_params = base_params;
-                    frame_params.bitrate_kbps = kbps;
-                    return encode_layer2_frame_psy_with_ancillary(
-                        &frame_params,
-                        &subbands,
-                        &smr,
-                        &pending,
-                    );
-                }
+            if let Some(target) = vbr_target
+                && let Ok(kbps) = select_layer2_vbr_bitrate(&base_params, &smr, target)
+            {
+                let mut frame_params = base_params;
+                frame_params.bitrate_kbps = kbps;
+                return encode_layer2_frame_psy_with_ancillary(
+                    &frame_params,
+                    &subbands,
+                    &smr,
+                    &pending,
+                );
             }
             return encode_layer2_frame_psy_with_ancillary(&base_params, &subbands, &smr, &pending);
         }
@@ -6513,7 +6505,7 @@ mod tests {
         // `decode_layer2_audio_data` (after a fresh allocation+scfsi+scf
         // prefix). Recovered samples must match the expected
         // requantization of the codes we wrote.
-        use crate::decode_layer2::{decode_layer2_audio_data, SYNTAX_GRANULES};
+        use crate::decode_layer2::{SYNTAX_GRANULES, decode_layer2_audio_data};
         use crate::tables_layer2::layer2_bit_allocation_table;
 
         // 192 kbit/s stereo at 48 kHz selects B.2a (sblimit=27). We use
@@ -6611,7 +6603,7 @@ mod tests {
         // mode_extension=0b01 → bound=8 clamped to sblimit=8. To exercise
         // the shared upper band, force bound below sblimit by raw header
         // value. Use mode_extension=0b00 → bound=4.
-        use crate::decode_layer2::{decode_layer2_audio_data, SYNTAX_GRANULES};
+        use crate::decode_layer2::{SYNTAX_GRANULES, decode_layer2_audio_data};
         use crate::tables_layer2::layer2_bit_allocation_table;
 
         let header = header_l2_joint(44_100, 64, 0b00); // raw bound = 4
@@ -6963,7 +6955,7 @@ mod tests {
     /// step of the analysed input).
     #[test]
     fn encode_layer2_frame_round_trip_mono() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_SUBBAND};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_SUBBAND, decode_layer2_audio_data};
         use crate::tables_layer2::layer2_bit_allocation_table;
         // 48 kHz / 128 kbit/s mono — selects Table 3-B.2c (sblimit = 8,
         // matching Annex B for that bitrate/Fs cell).
@@ -7075,7 +7067,7 @@ mod tests {
     /// independent of the chosen quantizer.
     #[test]
     fn encode_layer2_frame_round_trip_joint_stereo() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_SUBBAND};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_SUBBAND, decode_layer2_audio_data};
         use crate::tables_layer2::layer2_bit_allocation_table;
         let mut params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
         // mode_extension == 0b01 → bound subband index = 8 (per
@@ -7157,7 +7149,7 @@ mod tests {
     /// guard for the joint-stereo encode-quality milestone.
     #[test]
     fn encode_layer2_joint_stereo_shared_stream_is_channel_average() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_SUBBAND};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_SUBBAND, decode_layer2_audio_data};
         use crate::tables_layer2::layer2_bit_allocation_table;
         let mut params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
         // bound subband index 8; shared upper band [8, 27).
@@ -7290,7 +7282,7 @@ mod tests {
     /// the §2.4.1.3 header re-parses to Layer II / `ID == 1`.
     #[test]
     fn mp1_layer2_frame_encoder_round_trip_mono() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_FRAME, decode_layer2_audio_data};
 
         let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
         let mut enc = Mp1Layer2FrameEncoder::new(params);
@@ -7322,7 +7314,7 @@ mod tests {
     /// channels.
     #[test]
     fn mp1_layer2_frame_encoder_round_trip_joint_stereo() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_FRAME, decode_layer2_audio_data};
 
         let params = Layer2HeaderParams::new(44_100, 192, Mode::JointStereo);
         let mut enc = Mp1Layer2FrameEncoder::new(params);
@@ -7409,7 +7401,7 @@ mod tests {
     /// produces a parseable, decodable, non-silent Layer II frame.
     #[test]
     fn mp1_layer2_frame_encoder_psychoacoustic_round_trips() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_FRAME, decode_layer2_audio_data};
         let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
         let mut enc = Mp1Layer2FrameEncoder::new(params).with_psychoacoustic(true);
         assert!(enc.is_psychoacoustic(), "48 kHz has an Annex D table");
@@ -7455,7 +7447,7 @@ mod tests {
     /// the builder is order-independent.
     #[test]
     fn mp1_layer2_frame_encoder_model1_round_trips() {
-        use crate::decode_layer2::{decode_layer2_audio_data, LAYER2_SAMPLES_PER_FRAME};
+        use crate::decode_layer2::{LAYER2_SAMPLES_PER_FRAME, decode_layer2_audio_data};
         let params = Layer2HeaderParams::new(48_000, 128, Mode::SingleChannel);
         let mut enc = Mp1Layer2FrameEncoder::new(params)
             .with_psy_model(PsyModel::Model1)
@@ -8302,7 +8294,7 @@ mod tests {
         let mut smr = [[0.0f64; SUBBANDS]; 2];
         smr[0][10] = 40.0; // most exposed
         smr[0][20] = 5.0; // barely exposed
-                          // Budget for exactly one 0→2 step (30 bits).
+        // Budget for exactly one 0→2 step (30 bits).
         let alloc = allocate_bits_psy(&smr, 1, 30);
         assert!(alloc[0][10] >= 2, "highest-SMR subband served first");
         assert_eq!(alloc[0][20], 0, "low-SMR subband waits");

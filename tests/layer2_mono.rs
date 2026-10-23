@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 
 use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase};
-use oxideav_mp1::{find_sync, FrameHeader, Layer, Mode, Mp1Decoder};
+use oxideav_mp1::{FrameHeader, Layer, Mode, Mp1Decoder, find_sync};
 
 /// Build a Packet wrapping the given compressed Layer II frame bytes.
 fn pkt(data: Vec<u8>) -> Packet {
@@ -54,7 +54,9 @@ fn read_fixture(name: &str) -> Vec<u8> {
 
 fn decode_s16_samples(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|w| i16::from_le_bytes([w[0], w[1]]))
         .collect()
 }

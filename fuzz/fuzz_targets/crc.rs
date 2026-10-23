@@ -29,7 +29,7 @@
 //! error_check() definition).
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_mp1::{compute_layer2_crc, verify_layer2_crc, CrcStatus, FrameHeader};
+use oxideav_mp1::{CrcStatus, FrameHeader, compute_layer2_crc, verify_layer2_crc};
 
 /// Build a syntactically valid, CRC-protected (or not) header.
 fn build_header(id: u8, layer: u8, sr: u8, br: u8, mode: u8, ext: u8, protected: bool) -> [u8; 4] {

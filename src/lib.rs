@@ -122,37 +122,37 @@ pub mod tables;
 #[doc(hidden)]
 pub mod tables_layer2;
 
-pub use codec::{register_codecs, ConcealmentMode, Mp1Decoder, Mp1Encoder};
+pub use codec::{ConcealmentMode, Mp1Decoder, Mp1Encoder, register_codecs};
 pub use decode::{
-    allocation_bits, decode_audio_data, requantize, BitReader, DecodeError, Subband,
-    SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS,
+    BitReader, DecodeError, SAMPLES_PER_SUBBAND, SUBBANDS, Subband, SubbandSamples,
+    allocation_bits, decode_audio_data, requantize,
 };
 pub use decode_layer2::{
-    compute_layer2_crc, decode_layer2_audio_data, verify_layer2_crc, Layer2Subband, Layer2Subbands,
-    LAYER2_SAMPLES_PER_FRAME, LAYER2_SAMPLES_PER_SUBBAND,
+    LAYER2_SAMPLES_PER_FRAME, LAYER2_SAMPLES_PER_SUBBAND, Layer2Subband, Layer2Subbands,
+    compute_layer2_crc, decode_layer2_audio_data, verify_layer2_crc,
 };
 pub use decoder::make_decoder_with_concealment;
 pub use encode::{
-    allocate_bits, allocate_bits_layer2, allocate_bits_layer2_psy, allocate_bits_psy,
-    bitrate_index_layer2, encode_layer2_frame, encode_layer2_frame_psy,
-    encode_layer2_frame_psy_with_ancillary, encode_layer2_frame_with_ancillary,
-    layer2_bitrate_ladder, layer2_frame_payload_bits, layer2_min_mnr_db, layer2_stereo_bound,
-    layer2_subband_peak_per_part, pack_layer2_header, quantize, quantize_layer2_sample,
-    select_layer2_intensity_bound, select_layer2_scalefactors, select_layer2_vbr_bitrate,
-    select_scalefactor, sum_nbal_per_channel, write_layer2_allocation_field, write_layer2_header,
-    write_layer2_samples_field, write_layer2_scalefactor_field, Allocation, AnalysisFilter,
-    BitWriter, EncodeError, EncodeParams, Layer2Allocation, Layer2AllocationFieldError,
-    Layer2EncodeError, Layer2HeaderError, Layer2HeaderParams, Layer2SamplesFieldError,
-    Layer2SamplesFieldInput, Layer2ScalefactorFieldError, Layer2ScalefactorFieldInput,
-    Layer2ScalefactorIndices, Layer2SubbandPeaks, LayerSelect, Mp1FrameEncoder,
-    Mp1Layer2FrameEncoder, PsyModel,
+    Allocation, AnalysisFilter, BitWriter, EncodeError, EncodeParams, Layer2Allocation,
+    Layer2AllocationFieldError, Layer2EncodeError, Layer2HeaderError, Layer2HeaderParams,
+    Layer2SamplesFieldError, Layer2SamplesFieldInput, Layer2ScalefactorFieldError,
+    Layer2ScalefactorFieldInput, Layer2ScalefactorIndices, Layer2SubbandPeaks, LayerSelect,
+    Mp1FrameEncoder, Mp1Layer2FrameEncoder, PsyModel, allocate_bits, allocate_bits_layer2,
+    allocate_bits_layer2_psy, allocate_bits_psy, bitrate_index_layer2, encode_layer2_frame,
+    encode_layer2_frame_psy, encode_layer2_frame_psy_with_ancillary,
+    encode_layer2_frame_with_ancillary, layer2_bitrate_ladder, layer2_frame_payload_bits,
+    layer2_min_mnr_db, layer2_stereo_bound, layer2_subband_peak_per_part, pack_layer2_header,
+    quantize, quantize_layer2_sample, select_layer2_intensity_bound, select_layer2_scalefactors,
+    select_layer2_vbr_bitrate, select_scalefactor, sum_nbal_per_channel,
+    write_layer2_allocation_field, write_layer2_header, write_layer2_samples_field,
+    write_layer2_scalefactor_field,
 };
 pub use encoder::{make_encoder_layer2, make_encoder_with_crc};
 pub use header::{
-    detect_free_format_frame_length, find_sync, Bitrate, CrcStatus, Emphasis, FrameHeader,
-    FreeFormatFrameLength, FreeFormatProbeError, HeaderError, Id, Layer, Mode, ModeExtension,
+    Bitrate, CrcStatus, Emphasis, FrameHeader, FreeFormatFrameLength, FreeFormatProbeError,
+    HeaderError, Id, Layer, Mode, ModeExtension, detect_free_format_frame_length, find_sync,
 };
-pub use synthesis::{to_s16, SynthesisFilter};
+pub use synthesis::{SynthesisFilter, to_s16};
 pub use tables::{ANALYSIS_WINDOW, QUANT_A, QUANT_B, SCALEFACTORS, SNR_DB, SYNTHESIS_WINDOW};
 
 /// Install the MPEG-1 Audio Layer I decoder into `ctx`'s codec

@@ -1163,8 +1163,8 @@ mod tests {
         ];
         for (i, &kbps) in expected.iter().enumerate() {
             let idx = (i + 1) as u32; // 0b0001..0b1110
-                                      // Use 24 kHz (sampling 0b01 with ID==0) so every ladder
-                                      // entry yields a non-zero slot count.
+            // Use 24 kHz (sampling 0b01 with ID==0) so every ladder
+            // entry yields a non-zero slot count.
             let bytes = build_header(0, 0b11, 1, idx, 0b01, 0, 0, 0, 0, 0, 1, 0);
             let h = FrameHeader::parse(&bytes).unwrap();
             assert_eq!(h.bitrate, Bitrate::Fixed(kbps), "LSF index 0b{idx:04b}");

@@ -28,16 +28,16 @@ use oxideav_core::{
     Decoder, Encoder, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::decode::{decode_audio_data, SubbandSamples, SAMPLES_PER_SUBBAND, SUBBANDS};
+use crate::decode::{SAMPLES_PER_SUBBAND, SUBBANDS, SubbandSamples, decode_audio_data};
 use crate::decode_layer2::{
-    decode_layer2_audio_data, verify_layer2_crc, Layer2Subbands, LAYER2_SAMPLES_PER_FRAME,
-    LAYER2_SAMPLES_PER_SUBBAND,
+    LAYER2_SAMPLES_PER_FRAME, LAYER2_SAMPLES_PER_SUBBAND, Layer2Subbands, decode_layer2_audio_data,
+    verify_layer2_crc,
 };
 use crate::encode::{
     EncodeParams, Layer2HeaderParams, LayerSelect, Mp1FrameEncoder, Mp1Layer2FrameEncoder,
 };
-use crate::header::{find_sync, Bitrate, CrcStatus, FrameHeader, Layer, Mode};
-use crate::synthesis::{to_s16, SynthesisFilter};
+use crate::header::{Bitrate, CrcStatus, FrameHeader, Layer, Mode, find_sync};
+use crate::synthesis::{SynthesisFilter, to_s16};
 
 /// The canonical codec id for MPEG-1 Audio Layer I.
 const CODEC_ID: &str = "mp1";
@@ -530,7 +530,7 @@ fn make_encoder_inner(
         n => {
             return Err(Error::invalid(format!(
                 "oxideav-mp1: unsupported channel count {n}",
-            )))
+            )));
         }
     };
     // Whether the requested sample rate is an MPEG-2 LSF rate

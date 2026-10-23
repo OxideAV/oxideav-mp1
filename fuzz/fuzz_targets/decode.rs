@@ -99,8 +99,8 @@ fn build_header(id: u8, layer: u8, sr: u8, br: u8, mode: u8, ext: u8, flags: u8)
     // protection_bit: '0' = CRC present, '1' = none.
     let crc = flags & 0b0000_0001;
     raw |= u32::from(crc ^ 1) << 16; // store '0' when CRC present
-                                     // bitrate index 1..=14 (avoid 0 free-format and 15 forbidden so the
-                                     // header-implied frame length is determinable).
+    // bitrate index 1..=14 (avoid 0 free-format and 15 forbidden so the
+    // header-implied frame length is determinable).
     let br_idx = (br % 14) + 1;
     raw |= u32::from(br_idx) << 12;
     // sample-rate index 0..=2 (3 is reserved/rejected).
